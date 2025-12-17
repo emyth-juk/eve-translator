@@ -284,11 +284,11 @@ class SettingsDialog(QDialog):
 
         self.config['shared']['log_dir'] = self.edit_log_dir.text()
 
-        if self.session_id_context == 'fleet':
-             self.config['shared']['fleet_inactive_threshold'] = self.spin_fleet_threshold.value() * 60
-             self.config['shared']['fleet_auto_switch'] = self.chk_fleet_autoswitch.isChecked()
-             self.config['shared']['fleet_scan_interval'] = self.spin_fleet_interval.value()
-             self.config['shared']['fleet_history_lines'] = self.spin_fleet_history.value()
+        # Fleet Chat Settings (Always available as Global Settings)
+        self.config['shared']['fleet_inactive_threshold'] = self.spin_fleet_threshold.value() * 60
+        self.config['shared']['fleet_auto_switch'] = self.chk_fleet_autoswitch.isChecked()
+        self.config['shared']['fleet_scan_interval'] = self.spin_fleet_interval.value()
+        self.config['shared']['fleet_history_lines'] = self.spin_fleet_history.value()
              
         # Save Performance Settings
         self.config['shared']['polling_interval'] = self.spin_poll.value()
