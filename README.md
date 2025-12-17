@@ -26,7 +26,7 @@ A real-time, overlay-based chat translator for EVE Online, specifically designed
 
 1.  Download the latest release from the [Releases Page](https://github.com/emyth-juk/eve-translator/releases).
 2.  Extract the `.zip` archive.
-3.  Run `EVE Fleet Chat Translator.exe`.
+3.  Run `EVETranslator_vX.X.X.exe`.
 4.  Optional: Configure your DeepL API key in `translator_config.json` (created on first run).
 
 ### Development Prerequisites
