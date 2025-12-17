@@ -1,0 +1,83 @@
+
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build Release
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+        cache: 'pip'
+
+    - name: Install Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Build Executable
+      run: |
+        pyinstaller --clean --noconfirm --onefile --windowed --name "EVETranslator_${{ github.ref_name }}" --icon="src\assets\icon.ico" --add-data "src/assets;src/assets" --add-data "data;data" --collect-data "langdetect" --hidden-import "PySide6" src/main.py
+
+    - name: Create Source Archive
+      run: |
+        git archive --format=zip --output="source_${{ github.ref_name }}.zip" HEAD
+
+    - name: Extract Release Notes
+      id: extract_notes
+      shell: python
+      run: |
+        import re
+        import os
+        
+        tag = os.environ.get("GITHUB_REF_NAME", "")
+        version = tag.lstrip("v")
+        
+        changelog_file = "CHANGELOG.md"
+        output_file = "RELEASE_NOTES.md"
+        
+        if os.path.exists(changelog_file):
+            with open(changelog_file, "r", encoding="utf-8") as f:
+                content = f.read()
+            
+            # Regex to find the section for this version
+            # Matches "## [0.1.0] - DATE" until the next "## [" or End of File
+            pattern = re.compile(rf"## \[{re.escape(version)}\].*?\n(.*?)(?=\n## \[|$)", re.DOTALL)
+            match = pattern.search(content)
+            
+            notes = ""
+            if match:
+                notes = match.group(1).strip()
+            else:
+                notes = f"Release {tag}"
+                
+            with open(output_file, "w", encoding="utf-8") as f:
+                f.write(notes)
+        else:
+             with open(output_file, "w", encoding="utf-8") as f:
+                f.write(f"Release {tag}")
+
+    - name: Create Release
+      uses: softprops/action-gh-release@v2
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: |
+          dist/EVETranslator_${{ github.ref_name }}.exe
+          source_${{ github.ref_name }}.zip
+        body_path: RELEASE_NOTES.md

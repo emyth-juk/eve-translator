@@ -1,0 +1,46 @@
+# Python Standard
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+.env
+
+# Distribution / Build
+build/
+dist/
+*.spec
+*.egg-info/
+.installer/
+
+# IDE/AI
+.vscode/
+.idea/
+.claude/
+
+# Application Specific
+translator_config.json
+overlay_config.json
+*.log
+logs/
+.eve_translator/
+
+# EVE Logs (Test data)
+Fleet_*.txt
+Local_*.txt
+test_export.txt
+
+# Debug Scripts
+src/debug_*.py
+clean_config.py
+
+# Documentation (Internal)
+*.md
+!README.md
+!data/glossaries/README.md
+!CONTRIBUTING.md
+!CHANGELOG.md
+!.github/

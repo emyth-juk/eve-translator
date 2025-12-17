@@ -1,0 +1,36 @@
+{
+    "shared": {
+        "opacity": 0.8,
+        "font_size": 10,
+        "auto_scroll": true,
+        "ignored_languages": [
+            "en",
+            "de"
+        ],
+        "target_language": "en",
+        "deepl_api_key": "YOUR_DESCRIBED_DEEPL_API_KEY_HERE",
+        "color_default": "#e0e0e0",
+        "color_translated": "#00ffff",
+        "color_highlight": "yellow"
+    },
+    "sessions": {
+        "fleet": {
+            "x": 100,
+            "y": 100,
+            "w": 300,
+            "h": 400,
+            "background_color": "#33001a",
+            "title_prefix": "[FLEET]",
+            "enabled": true
+        },
+        "local": {
+            "x": 420,
+            "y": 100,
+            "w": 300,
+            "h": 400,
+            "background_color": "#001a33",
+            "title_prefix": "[LOCAL]",
+            "enabled": false
+        }
+    }
+}

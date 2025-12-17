@@ -1,0 +1,298 @@
+meta:
+  source_lang: zh
+  target_lang: en
+  version: "1.0"
+  description: "Chinese EVE Online slang to English terms. Organized for human readability."
+  last_updated: "2025-12-17"
+
+# ==========================================
+# SHIPS (Generic & Specific)
+# ==========================================
+ships:
+  # Classes
+  穿梭机: Shuttle
+  蛋: Pod
+  截击: Interceptor
+  隐轰: Bomber
+  战术驱逐: T3 Destroyer
+  巡洋: Cruiser
+  重突: HAC
+  战列: Battleship
+  无畏: Dreadnought
+  小航: Carrier
+  大航: Supercarrier
+  泰坦: Titan
+  后勤: Logistics/Logi # Ambiguous (Role or Ship), usually Ship in context of "Kill Logi"
+
+  # Specific Hulls (Common Slang)
+  佩刀: Sabre
+  阿斯特罗: Astero
+  毒蜥: Gila
+  伊什塔: Ishtar
+  YST: Ishtar
+  海狂怒: VNI
+  奥萨斯: Orthrus
+  斯特拉修斯: Stratios
+  幼龙: Drake
+  金鹏: Tengu
+  洛基: Loki
+  军团: Legion
+  圣卒: Proteus
+  狂热: Zealot
+  戴莫斯: Deimos
+  戴默斯: Deimos
+  DMS: Deimos
+  虔诚: Devoter
+  福博斯: Phobos
+  奥内: Oneiros
+  奥内罗斯: Oneiros
+  守卫: Guardian
+  皇冠: Basilisk
+  曲剑: Scimitar
+  奥格: Augoror
+  奥格诺: Augoror
+  灾难: Apocalypse
+  地狱天使: Abaddon
+  末日沙场: Armageddon
+  万王宝座: Megathron
+  万王: Megathron
+  马克瑞: Machariel
+  小马: Machariel
+  噩梦: Nightmare
+  巴格斯: Barghest
+  响尾蛇: Rattlesnake
+  复仇者: Vindicator
+  乌鸦: Raven
+  鹏鲲: Rokh
+  台风: Typhoon
+  多米: Dominix
+  神使: Avatar
+  夜魔: Nyx
+  归魂: Hel
+  拉格: Ragnarok
+  勒维: Leviathan
+  俄洛巴: Erebus
+  大鲸鱼: Rorqual
+  大鱼: Rorqual
+  涅斯托: Nestor
+  大白: Nestor
+  小希: Hic
+  重拦: HIC
+  轻拦: Dictor
+  特勤: T3C/Links
+
+# ==========================================
+# MODULES & FITTING
+# ==========================================
+modules:
+  # Slots
+  中槽: Mid Slot
+  低槽: Low Slot
+  高槽: High Slot
+  改装: Rig Slot
+
+  # Propulsion
+  推子: MWD (Prop)
+  微曲: MWD
+  加力: AB (Afterburner)
+  跳刀: Micro Jump Drive / MJD
+
+  # Tank (Shield)
+  盾: Shield
+  扩展: Shield Extender
+  大扩: Large Shield Extender
+  中扩: Medium Shield Extender
+  注盾: Shield Booster
+  全抗: Multispectrum Hardener
+  皮球: Multispectrum Shield Hardener
+  主动抗: Active Hardener
+  被动抗: Passive Hardener
+
+  # Tank (Armor)
+  甲: Armor
+  钢板: Armor Plate
+  "1600": 1600mm Plate
+  "800": 800mm Plate
+  大修: Large Armor Repairer
+  中修: Medium Armor Repairer
+  小修: Small Armor Repairer
+  注甲: Ancillary Armor Repairer
+  反应堆: Reaction Control / Reactor
+
+  # Tank (Hull)
+  结构: Hull
+  损控: Damage Control / DCU
+  大结构: Bulkhead
+
+  # Engineering & Utility
+  电池: Cap Battery
+  注电: Cap Booster
+  回电: Cap Recharger
+  电容: Capacitor
+  CPU: CPU
+  栅格: Powergrid
+  诱导: Cyno
+  隐秘诱导: Covert Cyno
+  泡泡: Bubble
+  隐身: Cloak
+  安塞克斯: Ansiblex
+
+  # Weapon Upgrades
+  弹道: Ballistic Control
+  散热: Heat Sink
+  磁稳: Magnetic Stabilizer
+  回转: Gyrostabilizer
+  索敌: Tracking
+  计算机: Tracking Computer
+
+  # Electronic Warfare
+  反跳: Scram
+  长反: Point
+  网子: Web
+  毁电: Neut
+  吸电: Nos
+  导扰: Guidance Disruptor
+  炮扰: Tracking Disruptor
+  感应抑阻: Sensor Dampener
+  目标标记: Target Painter
+  ECM: ECM
+
+  # Weapons
+  炸弹: Smartbomb
+  末日: Doomsday
+
+  # Drones
+  无人机: Drone
+  岗哨: Sentry Drone
+
+# ==========================================
+# STRUCTURES & LOCATIONS
+# ==========================================
+structures:
+  铁壁: Keepstar
+  强袭: Fortizar
+  空堡: Astrahus
+  主权: IHub (Sovereignty Hub)
+  空间站: Station
+  跳桥: Jump Bridge
+
+locations:
+  吉他: Jita
+  底特: Delve
+  源泉: Fountain
+  纯盲: Pure Blind
+  维纳尔: Venal
+  特纳: Tenal
+  寂静谷: Vale of the Silent
+  特里布特: Tribute
+  布兰奇: Branch
+  费德: Fade
+  云环: Cloud Ring
+  辛迪加: Syndicate
+  外环: Outer Ring
+  卡彻: Catch
+  柯尔斯: Curse
+  绝地: Immensea
+  普罗: Providence
+  高安: Highsec
+  低安: Lowsec
+  "00": Nullsec
+  虫洞: Wormhole
+  死亡: DED/Deadspace
+  本地: Local
+  终点: Destination
+
+# ==========================================
+# COMMANDS & ACTIONS (Verbs)
+# ==========================================
+commands:
+  # Movement
+  对齐: Align to
+  跃迁: Warp to
+  跳: Jump
+  过门: Gate Jump
+  起跳: Warping
+  朝向: Aligning
+  进站: Dock
+  出站: Undock
+  接近: Approach
+  环绕: Orbit
+  停船: Stop Ship
+  不要过门: Do not jump
+  走跳桥: Take Jump Bridge
+  走星门: Take Gate
+  保持距离: Keep at Range
+  跟: Keep at Range/Follow
+  跟上: Keep at Range/Follow
+  跟走位: Anchor up
+  走位: Anchor
+  锚定: Anchor up
+  集合: Anchor up/Regroup
+  四散: Starburst
+  撒: Scatter
+  解散: Scatter/Disband
+  自由土: Free burn
+  土: Free burn
+
+  # Combat
+  集火: Primary
+  转火: Switch Primary
+  锁定: Lock
+  开火: Fire
+  停火: Cease Fire
+  超载: Overheat
+  火力: DPS # As in "Need more DPS"
+  亮诱导: Lighting Cyno
+  打泡泡: Shoot Bubble
+  拉泡泡: Bubble Up
+  下泡泡: Bubble Up
+  收泡泡: Bubble Down
+  开推子: Prop On
+  关推子: Prop Off
+  开推: Prop On
+  关推: Prop Off
+  开起推子: Prop On
+
+  # Logistics/Support
+  修: Repair/Logi
+  摇修: Rep me
+  给电: Cap me
+  注油: Cap me
+
+  # General Actions
+  收: WTB
+  出: WTS
+  刷怪: Ratting
+  挖矿: Mining
+  扫描: Scanning
+  收割: Roaming
+  蓝加: "+1"
+  救援: Help/Cyno
+  9命: Help!
+
+# ==========================================
+# ROLES & SLANG
+# ==========================================
+roles:
+  指挥: FC
+  舰队长: FC
+  抓: Tackle
+  抓人: Tackle
+  蹲: Camping
+  加成: Links
+  加成船: Link Ship
+  FAX: FAX (Force Auxiliary)
+
+slang:
+  打得不错: Good Fight
+  打得好: Good Fight
+  辛苦了: GF / Good Job
+  武运昌隆: Good Luck
+  "88": Bye
+  "886": Bye
+  "666": Awesome
+  牛逼: Awesome/Badass
+  nb: Awesome
+  GG: Good Game
+  红: Red/Stop
+  绿: Green/Go

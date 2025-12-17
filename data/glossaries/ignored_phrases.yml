@@ -1,0 +1,68 @@
+meta:
+  version: "1.0"
+  description: "Phrases and patterns that should NOT be translated."
+  last_updated: "2025-12-16"
+
+# Forced Ignore Patterns (EVE Terms, Market, Spam)
+force_ignore:
+  - 'HyperNet'
+  - 'contract'
+  - 'WTS'
+  - 'WTB'
+  - 'WTT'
+  - 'zkillboard'
+  - 'blueprint'
+  - 'skin'
+  - 'skill extractor'
+  - 'skill injector'
+  - 'plex'
+  - 'abyssal'
+  - 'repairer'
+  - 'armor'
+  - 'shield'
+  - 'booster'
+  - 'hardener'
+  - 'stabilizer'
+  - 'bpo'
+  - 'bpc'
+
+# Internet Slang / Emotes (Regex supported)
+# Start/End anchors (^) ($) are redundant if checking full string match,
+# but useful if we loop over patterns.
+# The original code used re.search, so strict regex usage is important if we keep that behavior.
+slang:
+  - '^x+$'               # X up
+  - '^x\s*[a-zA-Z0-9\s]+$' # X with latin text only (e.g. "x loki", "x heavy") - allow "x 游击" to pass
+  - '^kill:.*'           # Kill messages
+  - '^br\?*$'            # Battle report?
+  - '^ty\s*.*$'          # Thank you variations
+  - '^no\s*agression$'
+  - '^fat\s*link\?*$'
+  - '^fleet\s*loc\?*$'
+  - '^logi\s*channel\?*$'
+  - '^move\s*move!*$'
+  - '^good\s*shit$'
+  - '^oh\s*sweet$'
+  - '^nice$'
+  - '^yeah$'
+  - '^yes\s*gogogo$'
+  - '^ok$'
+  - '^afax\+\d+$'
+  - '^[l1]+[o0]+[l1]+$'  # lol, l0l, loool
+  - '^lmao+$'            # lmao
+  - '^rofl+$'
+  - '^wtf+$'
+  - '^omg+$'
+  - '^tff+$'
+  - '^afk$'
+  - '^brb$'
+  - '^o7+$'              # Salute o7, o77
+  - '^gf+$'              # Good Fight
+  - '^gg+$'              # Good Game
+  - '^gj$'               # Good Job
+  - '^o/+$'              # Wave
+  - '^\\o/$'             # High five / wave
+  - '^7o$'               # Brave salute
+  - '^gf\s*o7$'          # Common combo
+  - '^o7\s*gf$'          # Common combo
+  - '^i\s*love\s*ahacs$'

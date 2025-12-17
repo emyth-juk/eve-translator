@@ -1,0 +1,179 @@
+meta:
+  source_lang: zh
+  target_lang: de
+  version: "1.0"
+  description: "Chinese EVE Online slang to German terms"
+  last_updated: "2025-12-16"
+
+# Placeholder structure
+ships:
+  frigates:
+    穿梭机: Shuttle
+    蛋: Kapsel
+    截击: Abfangjäger
+    隐轰: Bomber
+    战术驱逐: T3 Zerstörer
+    佩刀: Sabre
+    阿斯特罗: Astero
+
+  cruisers:
+    巡洋: Kreuzer
+    毒蜥: Gila
+    伊什塔: Ishtar
+    YST: Ishtar
+    海狂怒: VNI
+    奥萨斯: Orthrus
+    斯特拉修斯: Stratios
+    幼龙: Drake
+    金鹏: Tengu
+    洛基: Loki
+    军团: Legion
+    圣卒: Proteus
+    小希: HIC
+    重拦: HIC
+    轻拦: Interdictor
+
+  battleships:
+    战列: Schlachtschiff
+    灾难: Apocalypse
+    地狱天使: Abaddon
+    末日沙场: Armageddon
+    万王宝座: Megathron
+    万王: Megathron
+    马克瑞: Machariel
+    小马: Machariel
+    噩梦: Nightmare
+    巴格斯: Barghest
+    响尾蛇: Rattlesnake
+    复仇者: Vindicator
+    乌鸦: Raven
+    鹏鲲: Rokh
+    台风: Typhoon
+    多米: Dominix
+
+  capitals:
+    无畏: Dreadnought
+    小航: Träger
+    大航: Supercarrier
+    泰坦: Titan
+    神使: Avatar
+    夜魔: Nyx
+    归魂: Hel
+    拉格: Ragnarok
+    勒维: Leviathan
+    俄洛巴: Erebus
+    大鲸鱼: Rorqual
+
+modules:
+  propulsion:
+    推子: MWD
+    加力: AB
+
+  tackle:
+    反跳: Scram
+    长反: Point
+    网子: Netz
+
+  warfare:
+    诱导: Cyno
+    隐秘诱导: Covert Cyno
+    泡泡: Blase
+    隐身: Cloak
+    毁电: Neut
+    吸电: Nos
+    炸弹: Smartbomb
+    末日: Doomsday
+    安塞克斯: Ansiblex
+    跳桥: Sprungbrücke
+
+locations:
+  highsec:
+    吉他: Jita
+  
+  general:
+    高安: Highsec
+    低安: Lowsec
+    "00": Nullsec
+    虫洞: Wurmloch
+    死亡: DED
+    本地: Lokal
+    终点: Ziel
+
+actions:
+  trading:
+    收: WTB
+    出: WTS
+
+  pvp:
+    抓: Tackled
+    抓到了: Tackled
+    蹲: Campen
+
+  pve:
+    刷怪: Ratting
+    挖矿: Mining
+    扫描: Scannen
+
+commands:
+  movement:
+    对齐: Ausrichten
+    跃迁: Warpe zu
+    跳: Springe
+    过门: Springe
+    起跳: Warpen
+    朝向: Ausrichten
+    进站: Docken
+    出站: Undocken
+    接近: Annähern
+    环绕: Orbitana
+    停船: Stopp
+    不要过门: Nicht springen
+    走跳桥: Nimm Brücke
+    走星门: Nimm Gate
+    保持距离: Keep Range
+    跟: Keep Range
+    跟上: Keep Range
+
+  combat:
+    集火: Primärziel
+    转火: Ziel wechseln
+    锁定: Aufschalten
+    开火: Feuer
+    停火: Waffen stop
+    超载: Überhitzen
+    火力: DPS
+
+  fleet:
+    跟走位: Ankern
+    锚定: Ankern
+    集合: Sammeln
+    四散: Starburst
+    撒: Scatter
+    解散: Auflösen
+    舰队: Flotte
+    指挥: FC
+    红: Rot/Stop
+    绿: Grün/Go
+    亮诱导: Cyno up
+
+  logistics:
+    修: Reparieren
+    后勤: Logi
+    摇修: Rep mich
+    给电: Cap mich
+    注油: Cap mich
+
+slang:
+  phrases:
+    打得不错: Gutes Gefecht
+    打得好: Gutes Gefecht
+    辛苦了: GF
+    武运昌隆: Viel Glück
+  
+  abbreviations:
+    "88": Bye
+    "886": Bye
+    "666": Geil
+    牛逼: Geil
+    nb: Geil
+    GG: GG

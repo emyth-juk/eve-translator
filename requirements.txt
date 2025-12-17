@@ -1,0 +1,11 @@
+PySide6
+watchdog
+requests
+loguru
+langdetect
+googletrans==3.1.0a0
+deepl
+pillow
+PyYAML>=6.0.1
+deep-translator
+pyinstaller
