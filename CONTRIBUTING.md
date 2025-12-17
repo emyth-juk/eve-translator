@@ -13,8 +13,6 @@ The most common way to contribute is by adding or correcting EVE terms in the gl
     - `zh_de.yml`: Chinese to German
 - **Format**: See `data/glossaries/README.md` for detailed instructions on structure and categories.
 
-**Tip**: You can use the `debug_lang_items.py` script to test specific terms locally before submitting.
-
 ### 2. Code Contributions
 - **Bug Fixes**: Open an issue first describing the bug.
 - **New Features**: Please discuss in an issue before starting major work.

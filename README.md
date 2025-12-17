@@ -27,7 +27,9 @@ A real-time, overlay-based chat translator for EVE Online, specifically designed
 1.  Download the latest release from the [Releases Page](https://github.com/emyth-juk/eve-translator/releases).
 2.  Extract the `.zip` archive.
 3.  Run `EVETranslator_vX.X.X.exe`.
-4.  Optional: Configure your DeepL API key in `translator_config.json` (created on first run).
+
+> [!NOTE]
+> The configuration file `translator_config.json` is **automatically generated** in the application folder on the first run. Open it to configure your DeepL API key.
 
 ### Development Prerequisites
 
@@ -54,7 +56,8 @@ A real-time, overlay-based chat translator for EVE Online, specifically designed
     *   Copy your key (it usually ends in `:fx` for free tier).
 
 4.  **Configuration**:
-    *   Copy `translator_config.example.json` to `translator_config.json`.
+    *   Run the application once to automatically generate `translator_config.json`.
+    *   Alternatively, copy `translator_config.example.json` to `translator_config.json`.
     *   Open `translator_config.json` and paste your API key into `"deepl_api_key"`.
 
 ## Usage
