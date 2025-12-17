@@ -5,7 +5,7 @@ import re
 import html
 
 from PySide6.QtWidgets import (QMainWindow, QLabel, QVBoxLayout, QWidget, QApplication, 
-                               QTextBrowser, QFrame, QMenu, QFileDialog, QMessageBox)
+                               QTextBrowser, QFrame, QMenu, QFileDialog, QMessageBox, QSizeGrip)
 from PySide6.QtCore import Qt, QTimer, Slot, Signal, QPoint, QRect, QEvent
 from PySide6.QtGui import QColor, QPalette, QFont, QCursor, QMouseEvent, QAction, QTextCursor
 
@@ -49,8 +49,12 @@ class OverlayWindow(QMainWindow):
         self.is_resizing = False
         self.resize_edge = None
         self.resize_margin = 10
-        self.min_width = 300
-        self.min_height = 200
+        self.min_width = 120
+        self.min_height = 80
+
+        # Resize Handle (Visual Grip)
+        self.grip = QSizeGrip(self)
+        self.grip.setStyleSheet("background-color: transparent;") # Optional: styling
 
         # Text Browser Setup (Replaces ScrollArea + Widgets)
         self.text_browser = QTextBrowser()
@@ -162,6 +166,12 @@ class OverlayWindow(QMainWindow):
         super().showEvent(event)
         # Refresh UI when shown to catch up on any messages missed while hidden
         self.refresh_ui()
+
+    def resizeEvent(self, event):
+        rect = self.rect()
+        # Position grip at bottom right
+        self.grip.move(rect.right() - self.grip.width(), rect.bottom() - self.grip.height())
+        super().resizeEvent(event)
 
     def check_edge(self, pos):
         """Returns string identifier of edge/corner or None"""

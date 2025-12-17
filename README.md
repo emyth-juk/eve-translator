@@ -44,11 +44,25 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 - Glossaries: built-in slang/ship terms; user overrides go in `%USERPROFILE%\.eve_translator\glossaries\` (same keys as the bundled YAML files).  
 - Logs: app logs live in `%USERPROFILE%\.eve_translator\logs\`.
 
-## Using the Overlays
-- Drag to move, resize from edges.  
-- Right-click overlay: Settings, Export Logs, Toggle Fleet/Local sessions.  
-- Local overlay will switch systems automatically when your character changes logs.  
-- Text highlighting: glossary hits are highlighted; original text is viewable on translated messages.
+## Controls & Interactions
+
+### Moving & Resizing
+- **Move**: **Right-Click and Drag** anywhere on the overlay to move it.
+- **Resize**: 
+    - Drag any **edge** or **corner** of the window.
+    - Use the **Resize Grip** in the bottom-right corner.
+    - Windows can be resized down to very compact dimensions (120x80px).
+
+### Context Menu
+- **Right-Click** (release without dragging) to open the menu:
+    - **Settings**: Configure API keys, colors, fonts, and opacity.
+    - **Toggle Chat**: Switch between Fleet and Local overlays.
+    - **Export Logs**: Save the current session's translations to a file.
+    - **Switch Character/Fleet**: Manually override auto-detection if needed.
+
+### Features
+- **Auto-Switching**: Local overlay detects system changes and updates automatically.
+- **Highlighting**: Glossary terms are highlighted; original text is preserved in parentheses for reference.
 
 ## Troubleshooting
 - No translations? Check your DeepL key and ensure EVE chat logging is on.  

@@ -6,6 +6,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 
+## [0.2.2] - 2025-12-17
+
+### Added
+- **Overlay Enhancements**: 
+    - Added a visual resize grip to the bottom-right corner.
+    - Lowered minimum window size to 120x80 for more compact layouts.
+
+### Fixed
+- **Settings**: Fixed a crash preventing the DeepL API key from being saved via the GUI (`AttributeError`).
+
+### Documentation
+- **README**: Updated "Controls & Interactions" section to clarify moving/resizing and context menu options.
+
 ## [0.2.1] - 2025-12-17
 
 ### Fixed
