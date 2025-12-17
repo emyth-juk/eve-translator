@@ -234,6 +234,7 @@ class OverlayWindow(QMainWindow):
                     return True
                     
                 # Cursor Update
+                # Cursor Update
                 edge = self.check_edge(local_pos)
                 if edge:
                     if edge in ['TopLeft', 'BottomRight']:
@@ -244,8 +245,9 @@ class OverlayWindow(QMainWindow):
                         self.setCursor(Qt.CursorShape.SizeVerCursor)
                     elif edge in ['Left', 'Right']:
                         self.setCursor(Qt.CursorShape.SizeHorCursor)
+                    return True  # Consume event to prevent child widget from overriding cursor
                 else:
-                    self.setCursor(Qt.CursorShape.ArrowCursor)
+                    self.unsetCursor()  # Let child widget (TextBrowser) handle cursor (e.g. IBeam)
                     
         elif event.type() == QEvent.Type.MouseButtonRelease:
             if self.is_moving:
@@ -496,7 +498,7 @@ class OverlayWindow(QMainWindow):
             
             # Auto-scroll
             if self.config.get('auto_scroll', True):
-                 self.text_browser.moveCursor(QCursor.MoveOperation.End)
+                 self.text_browser.moveCursor(QTextCursor.MoveOperation.End)
 
     def update_status(self, text):
         pass

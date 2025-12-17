@@ -35,9 +35,7 @@ jobs:
       run: |
         pyinstaller --clean --noconfirm --onefile --windowed --name "EVETranslator_${{ github.ref_name }}" --icon="src\assets\icon.ico" --add-data "src/assets;src/assets" --add-data "data;data" --collect-data "langdetect" --hidden-import "PySide6" src/main.py
 
-    - name: Create Source Archive
-      run: |
-        git archive --format=zip --output="source_${{ github.ref_name }}.zip" HEAD
+
 
     - name: Extract Release Notes
       id: extract_notes
@@ -79,5 +77,5 @@ jobs:
       with:
         files: |
           dist/EVETranslator_${{ github.ref_name }}.exe
-          source_${{ github.ref_name }}.zip
+
         body_path: RELEASE_NOTES.md
