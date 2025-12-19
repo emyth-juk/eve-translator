@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.3] - 2025-12-19
+
+### Changed
+- **Overlay Resizing**: Improved resizing with native OS support (all edges/corners), better cursor feedback, and a subtle visual border.
+- **Ignored Phrases**: Added `omega` and `Triglavian` to default ignore list.
+
+### Fixed
+- **DeepL API**: Fixed `400 Bad Request` errors and reduced unnecessary translations for short text.
+- **Overlay Grip**: Fixed bottom-right grip being obscured by text.
 
 ## [0.2.2] - 2025-12-17
 
