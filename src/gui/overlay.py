@@ -44,10 +44,6 @@ class OverlayWindow(QMainWindow):
         self.setMouseTracking(True)
         
         # Interaction State
-        self.is_moving = False
-        self.drag_start_pos = QPoint()
-        self.is_resizing = False
-        self.resize_edge = None
         self.resize_margin = 10
         self.min_width = 120
         self.min_height = 80
@@ -55,7 +51,7 @@ class OverlayWindow(QMainWindow):
         # Resize Handle (Visual Grip)
         self.grip = QSizeGrip(self)
         self.grip.setStyleSheet("background-color: transparent;") # Optional: styling
-
+        
         # Text Browser Setup (Replaces ScrollArea + Widgets)
         self.text_browser = QTextBrowser()
         self.text_browser.setOpenExternalLinks(False) # Handle links manually if needed, or True
@@ -63,11 +59,16 @@ class OverlayWindow(QMainWindow):
         self.text_browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.text_browser.setFrameShape(QFrame.Shape.NoFrame)
         self.text_browser.setMouseTracking(True)
-        # Install event filter to capture mouse events
+        # Install event filter to capture mouse events if needed, 
+        # though native resize handles most of it, we still need to set cursors manually
+        # because the window is borderless.
         self.text_browser.installEventFilter(self)
         self.text_browser.viewport().installEventFilter(self)
         
         self.setCentralWidget(self.text_browser)
+        
+        # IMPORTANT: Raise grip to top so it's not covered by the text browser
+        self.grip.raise_()
 
         # Default Config
         default_config = {
@@ -133,7 +134,8 @@ class OverlayWindow(QMainWindow):
         self.setWindowOpacity(self.config.get('opacity', 0.8))
         
         bg_color = self.config.get('background_color', 'black')
-        self.text_browser.setStyleSheet(f"background-color: {bg_color};")
+        # Add subtle border to visualize edges
+        self.text_browser.setStyleSheet(f"background-color: {bg_color}; border: 1px solid #444;")
         
         # Apply Font
         font_size = self.config.get('font_size', 10)
@@ -171,10 +173,16 @@ class OverlayWindow(QMainWindow):
         rect = self.rect()
         # Position grip at bottom right
         self.grip.move(rect.right() - self.grip.width(), rect.bottom() - self.grip.height())
+        # Since we use native resize, we might want to update config occasionally or just on close
+        self._update_config_from_geometry()
         super().resizeEvent(event)
 
+    def moveEvent(self, event):
+        self._update_config_from_geometry()
+        super().moveEvent(event)
+
     def check_edge(self, pos):
-        """Returns string identifier of edge/corner or None"""
+        """Returns Qt.Edge identifier (combined for corners) or None"""
         r = self.rect()
         m = self.resize_margin
         
@@ -183,96 +191,73 @@ class OverlayWindow(QMainWindow):
         on_top = pos.y() < m
         on_bottom = pos.y() > r.height() - m
         
-        if on_top and on_left: return 'TopLeft'
-        if on_top and on_right: return 'TopRight'
-        if on_bottom and on_right: return 'BottomRight'
-        if on_bottom and on_left: return 'BottomLeft'
-        if on_top: return 'Top'
-        if on_bottom: return 'Bottom'
-        if on_left: return 'Left'
-        if on_right: return 'Right'
+        if on_top and on_left: return Qt.Edge.TopEdge | Qt.Edge.LeftEdge
+        if on_top and on_right: return Qt.Edge.TopEdge | Qt.Edge.RightEdge
+        if on_bottom and on_right: return Qt.Edge.BottomEdge | Qt.Edge.RightEdge
+        if on_bottom and on_left: return Qt.Edge.BottomEdge | Qt.Edge.LeftEdge
+        if on_top: return Qt.Edge.TopEdge
+        if on_bottom: return Qt.Edge.BottomEdge
+        if on_left: return Qt.Edge.LeftEdge
+        if on_right: return Qt.Edge.RightEdge
         return None
 
     def eventFilter(self, source, event):
         if event.type() == QEvent.Type.MouseButtonPress:
             if isinstance(event, QMouseEvent):
-                global_pos = event.globalPosition().toPoint()
-                local_pos = self.mapFromGlobal(global_pos)
-                
-                # Right Click: Move
-                if event.button() == Qt.MouseButton.RightButton:
-                    self.is_moving = True
-                    self.has_moved = False # Track if we actually dragged
-                    self.drag_start_pos = local_pos
-                    return True 
-                
-                # Left Click: Resize check
                 if event.button() == Qt.MouseButton.LeftButton:
+                    # Check for resize
+                    local_pos = event.position().toPoint()
                     edge = self.check_edge(local_pos)
                     if edge:
-                        self.is_resizing = True
-                        self.resize_edge = edge
-                        self.drag_start_pos = global_pos
-                        return True 
+                        self.windowHandle().startSystemResize(edge)
+                        return True
+                
+                # Right Click: Manual Move (to preserve Context Menu on Release)
+                if event.button() == Qt.MouseButton.RightButton:
+                    self.is_moving = True
+                    self.drag_start_pos = event.globalPosition().toPoint()
+                    self.has_moved = False
+                    return True # Consume
 
         elif event.type() == QEvent.Type.MouseMove:
             if isinstance(event, QMouseEvent):
-                global_pos = event.globalPosition().toPoint()
-                local_pos = self.mapFromGlobal(global_pos)
-                
-                if self.is_moving:
-                    # Check threshold to avoid jitter opening menu
-                    if (global_pos - self.mapToGlobal(self.drag_start_pos)).manhattanLength() > 5:
-                         self.has_moved = True
-                         self.move(global_pos - self.drag_start_pos)
-                    return True
-                
-                if self.is_resizing:
-                    rect = self.geometry()
-                    dx = global_pos.x() - self.drag_start_pos.x()
-                    dy = global_pos.y() - self.drag_start_pos.y()
-                    
-                    if 'Right' in self.resize_edge:
-                        new_w = max(self.min_width, rect.width() + dx)
-                        rect.setWidth(new_w)
-                    if 'Bottom' in self.resize_edge:
-                        new_h = max(self.min_height, rect.height() + dy)
-                        rect.setHeight(new_h)
-                    
-                    self.setGeometry(rect)
-                    self.drag_start_pos = global_pos
-                    return True
-                    
-                # Cursor Update
-                # Cursor Update
+                # Handle Cursor Shape
+                local_pos = event.position().toPoint()
                 edge = self.check_edge(local_pos)
-                if edge:
-                    if edge in ['TopLeft', 'BottomRight']:
-                        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-                    elif edge in ['TopRight', 'BottomLeft']:
-                        self.setCursor(Qt.CursorShape.SizeBDiagCursor)
-                    elif edge in ['Top', 'Bottom']:
-                        self.setCursor(Qt.CursorShape.SizeVerCursor)
-                    elif edge in ['Left', 'Right']:
-                        self.setCursor(Qt.CursorShape.SizeHorCursor)
-                    return True  # Consume event to prevent child widget from overriding cursor
-                else:
-                    self.unsetCursor()  # Let child widget (TextBrowser) handle cursor (e.g. IBeam)
-                    
-        elif event.type() == QEvent.Type.MouseButtonRelease:
-            if self.is_moving:
-                self.is_moving = False
-                if not self.has_moved:
-                    self.show_context_menu()
-                else:
-                    self.save_config()
-                return True
-            
-            if self.is_resizing:
-                self.is_resizing = False
-                self.save_config()
-                return True
                 
+                if edge:
+                    if edge == (Qt.Edge.TopEdge | Qt.Edge.LeftEdge) or edge == (Qt.Edge.BottomEdge | Qt.Edge.RightEdge):
+                        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                    elif edge == (Qt.Edge.TopEdge | Qt.Edge.RightEdge) or edge == (Qt.Edge.BottomEdge | Qt.Edge.LeftEdge):
+                        self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+                    elif edge == Qt.Edge.TopEdge or edge == Qt.Edge.BottomEdge:
+                        self.setCursor(Qt.CursorShape.SizeVerCursor)
+                    elif edge == Qt.Edge.LeftEdge or edge == Qt.Edge.RightEdge:
+                        self.setCursor(Qt.CursorShape.SizeHorCursor)
+                    return True # Consume event to keep cursor
+                else:
+                    self.unsetCursor()
+
+                # Handle Manual Move
+                if getattr(self, 'is_moving', False):
+                     global_pos = event.globalPosition().toPoint()
+                     diff = global_pos - self.drag_start_pos
+                     if diff.manhattanLength() > 5:
+                          self.has_moved = True
+                          self.move(self.pos() + diff)
+                          self.drag_start_pos = global_pos
+                     return True
+
+        elif event.type() == QEvent.Type.MouseButtonRelease:
+             if event.button() == Qt.MouseButton.RightButton:
+                  if getattr(self, 'is_moving', False):
+                       self.is_moving = False
+                       if not self.has_moved:
+                            self.show_context_menu()
+                       else:
+                            self.save_config()
+                       return True
+
         return super().eventFilter(source, event)
 
     def show_context_menu(self):
