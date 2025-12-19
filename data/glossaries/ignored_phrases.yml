@@ -25,6 +25,8 @@ force_ignore:
   - 'stabilizer'
   - 'bpo'
   - 'bpc'
+  - 'omega'
+  - 'Triglavian'
 
 # Internet Slang / Emotes (Regex supported)
 # Start/End anchors (^) ($) are redundant if checking full string match,
