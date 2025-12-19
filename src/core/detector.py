@@ -84,6 +84,11 @@ class LanguageDetector:
         """
         if not text.strip():
             return 'unknown'
+        
+        # Heuristic: Short ASCII usually English or Abbreviations
+        # Prevents "3x" -> 'so', "x" -> 'so'
+        if len(text) < 4 and text.isascii():
+            return 'en'
 
         detected = 'unknown'
         try:
@@ -138,7 +143,12 @@ class LanguageDetector:
                  
              return True, cjk_lang
 
-        # 2. General detection
+        # 2. Short text filter (if not CJK)
+        # E.g. "x", "o7", "??" shouldn't trigger translation costs or errors
+        if len(s_text) < 2:
+            return False, 'short_text'
+            
+        # 3. General detection
         lang = self.detect_language(text)
         
         # 3. Handle 'no' (Norwegian) false positives for English gaming terms
