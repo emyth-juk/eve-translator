@@ -43,6 +43,13 @@ class GoogleTransProvider(TranslationProvider):
             return None
 
 class DeepLProvider(TranslationProvider):
+    # List of supported source languages for DeepL (as of 2024)
+    # DeepL is strict about source_lang codes.
+    DEEPL_SOURCE_LANGS = {
+        'BG', 'CS', 'DA', 'DE', 'EL', 'EN', 'ES', 'ET', 'FI', 'FR', 'HU', 'ID', 'IT', 'JA', 
+        'KO', 'LT', 'LV', 'NB', 'NL', 'PL', 'PT', 'RO', 'RU', 'SK', 'SL', 'SV', 'TR', 'UK', 'ZH'
+    }
+
     def __init__(self, api_key: str):
         import deepl
         self.translator = deepl.Translator(api_key)
@@ -52,7 +59,7 @@ class DeepLProvider(TranslationProvider):
         return "DeepL"
 
     def translate(self, text: str, target_lang: str = 'en', source_lang: str = None) -> Optional[str]:
-        # Map languages usually 'en' -> 'EN-US' for DeepL logic
+        # Map target languages usually 'en' -> 'EN-US' for DeepL logic
         lang_map = {
             'en': 'EN-US',
             'gb': 'EN-GB',
@@ -62,13 +69,25 @@ class DeepLProvider(TranslationProvider):
         target = lang_map.get(target_lang.lower(), target_lang.upper())
         
         args = {'target_lang': target}
+        
         if source_lang and source_lang not in ['auto', 'unknown']:
-            # DeepL Source Lang usually requires 2-letter code (ZH, EN, PT)
-            # langdetect returns 'zh-cn', 'en', 'pt-br', etc.
+            # Normalize source lang
             sl = source_lang.upper()
             if '-' in sl:
                  sl = sl.split('-')[0]
-            args['source_lang'] = sl
+            
+            # Additional Mapping
+            if sl == 'NO': sl = 'NB' # Norwegian fix
+
+            # Validate against supported list
+            if sl in self.DEEPL_SOURCE_LANGS:
+                args['source_lang'] = sl
+            else:
+                # If detected language is not supported by DeepL (e.g. 'so', 'af'), 
+                # do NOT pass it. Let DeepL auto-detect. 
+                # DeepL might detect it as something else valid, or return error if really unsupported,
+                # but we avoid 400 "Value not supported" for the param itself.
+                pass
             
         try:
             result = self.translator.translate_text(text, **args)
