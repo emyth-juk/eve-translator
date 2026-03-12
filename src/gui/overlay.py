@@ -332,7 +332,6 @@ class OverlayWindow(QMainWindow):
 
                 for fleet_info in sorted_fleets:
                     # Format time ID
-                    import datetime
                     dt = datetime.datetime.fromtimestamp(fleet_info.created_time)
                     time_str = dt.strftime("%H:%M")
                     

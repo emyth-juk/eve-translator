@@ -1,14 +1,17 @@
 import os
 import glob
 import re
+import sys
 import time
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict
 from datetime import datetime
 from src.core.character_info import CharacterInfo
 import logging
-import ctypes
-from ctypes import wintypes
+
+if sys.platform == 'win32':
+    import ctypes
+    from ctypes import wintypes
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +61,7 @@ class LocalChatDetector:
         Check if an EVE Online window exists with title 'EVE - CharacterName'.
         Returns True if found.
         """
-        if not char_name:
+        if not char_name or sys.platform != 'win32':
             return False
 
         found = False

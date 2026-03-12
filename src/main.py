@@ -5,6 +5,7 @@ import logging.handlers
 import glob
 from pathlib import Path
 from datetime import datetime
+import copy
 import json
 import html
 import traceback
@@ -56,9 +57,14 @@ from src.core.character_info import CharacterInfo
 from src.core.fleet_info import FleetInfo
 from typing import Dict, Optional
 
-# Configuration
-# Configuration
-# LOG_DIR is now dynamic
+# Shared config keys (used for filtering session-specific vs shared config)
+SHARED_CONFIG_KEYS = frozenset({
+    'opacity', 'font_size', 'auto_scroll',
+    'ignored_languages', 'target_language', 'deepl_api_key',
+    'color_default', 'color_translated', 'color_highlight', 'log_dir',
+    'fleet_inactive_threshold', 'fleet_auto_switch', 'fleet_scan_interval',
+    'fleet_history_lines', 'polling_interval'
+})
 
 class WorkerSignals(QObject):
     # session_id, text, sender, timestamp, original_text, is_translated
@@ -92,11 +98,11 @@ class LogProcessingWorker(QObject):
 
         if deepl_key:
             if not isinstance(current_provider, DeepLProvider):
-                print("Switching to DeepL Provider")
+                logger.info("Switching to DeepL Provider")
                 self.translator_service.provider = DeepLProvider(deepl_key)
         else:
             if not isinstance(current_provider, GoogleTransProvider):
-                print("Switching to Google Provider")
+                logger.info("Switching to Google Provider")
                 self.translator_service.provider = GoogleTransProvider()
 
     @Slot(str, list)
@@ -108,7 +114,7 @@ class LogProcessingWorker(QObject):
             try:
                 self._process_single_line(session_id, line)
             except Exception as e:
-                print(f"[{session_id}] Error processing line: {e}")
+                logger.error(f"[{session_id}] Error processing line: {e}")
 
     def _process_single_line(self, session_id: str, line: str):
         """Process single line and emit result with session_id."""
@@ -143,7 +149,7 @@ class LogProcessingWorker(QObject):
         
         # Log
         status = "Success" if success else "Failed"
-        print(f"[{session_id.upper()}] [{provider}] {status}: '{tokenized.cleaned}' -> '{translated_text}'")
+        logger.info(f"[{session_id.upper()}] [{provider}] {status}: '{tokenized.cleaned}' -> '{translated_text}'")
 
         # Restore
         final_text = self._restore_with_highlight(translated_text, tokenized.tokens)
@@ -291,7 +297,8 @@ class TranslatorManager(QObject):
              try:
                  with open(legacy_path, 'r') as f:
                      legacy_data = json.load(f)
-             except: pass
+             except (IOError, json.JSONDecodeError, ValueError):
+                 pass
 
         default_config = {
             'shared': {
@@ -357,19 +364,13 @@ class TranslatorManager(QObject):
                 # Only update session-specific properties.
                 # Remove Shared Keys (handled by Shared config)
                 # 'enabled' MUST be allowed so it persists to JSON.
-                excluded_keys = {'opacity', 'font_size', 'auto_scroll',
-                                'ignored_languages', 'target_language', 'deepl_api_key',
-                                'color_default', 'color_translated', 'color_highlight', 'log_dir',
-                                'fleet_inactive_threshold', 'fleet_auto_switch', 'fleet_scan_interval',
-                                'fleet_history_lines', 'polling_interval'}
-                
-                filtered_config = {k: v for k, v in current_overlay_config.items() if k not in excluded_keys}
+                filtered_config = {k: v for k, v in current_overlay_config.items() if k not in SHARED_CONFIG_KEYS}
                 
                 # Update with filtered config
                 self.config['sessions'][session_id].update(filtered_config)
                 
                 # Explicitly cleanup any shared keys that might exist in the session config (legacy/dirty state)
-                for key in excluded_keys:
+                for key in SHARED_CONFIG_KEYS:
                     if key in self.config['sessions'][session_id]:
                         del self.config['sessions'][session_id][key]
         
@@ -468,7 +469,6 @@ class TranslatorManager(QObject):
         """Open the global settings dialog."""
         try:
             # Backup current config for restore on Cancel
-            import copy
             original_config = copy.deepcopy(self.config)
 
             dlg = SettingsDialog(self.config, parent=None)
@@ -500,7 +500,6 @@ class TranslatorManager(QObject):
 
         except Exception as e:
             logger.error(f"Error opening settings: {e}")
-            import traceback
             traceback.print_exc()
 
     @Slot(dict)
@@ -519,14 +518,33 @@ class TranslatorManager(QObject):
                 logger.info(f"[{session_id}] Applying Config Update. Font: {new_session_config.get('font_size')}, Opacity: {new_session_config.get('opacity')}")
                 session.update_config(new_session_config)
 
+    def _disconnect_session_signals(self, session):
+        """Safely disconnect all signals from a session."""
+        for signal, slot in [
+            (session.lines_ready, self.worker.process_lines),
+            (session.request_toggle, self.toggle_session),
+            (session.request_settings, self.open_settings_dialog),
+            (session.config_changed, self._handle_session_config_change),
+            (session.character_selected, self.switch_local_character),
+        ]:
+            try:
+                signal.disconnect(slot)
+            except RuntimeError:
+                pass
+        if hasattr(session.overlay, 'fleet_selected'):
+            try:
+                session.overlay.fleet_selected.disconnect(self.switch_fleet)
+            except RuntimeError:
+                pass
+
     def stop_session(self, session_id):
         if session_id not in self.sessions or not self.sessions[session_id]:
             return
-            
+
         session = self.sessions[session_id]
-        session.lines_ready.disconnect(self.worker.process_lines)
+        self._disconnect_session_signals(session)
         session.stop()
-        
+
         self.sessions[session_id] = None
         self.config['sessions'][session_id]['enabled'] = False
         self._update_tray_menu()
@@ -549,16 +567,7 @@ class TranslatorManager(QObject):
         Updates shared config and notifies worker.
         """
         # Extract shared settings (not position/size which are per-session)
-        shared_keys = [
-            'opacity', 'font_size', 'auto_scroll',
-            'ignored_languages', 'target_language', 'deepl_api_key',
-            'color_default', 'color_translated', 'color_highlight', 'log_dir',
-            'fleet_inactive_threshold', 'fleet_auto_switch', 'fleet_scan_interval',
-            'fleet_history_lines',
-            'polling_interval'
-        ]
-
-        for key in shared_keys:
+        for key in SHARED_CONFIG_KEYS:
             if key in updated_config:
                 self.config['shared'][key] = updated_config[key]
 
@@ -927,15 +936,12 @@ class TranslatorManager(QObject):
         for sid in list(self.sessions.keys()):
             session = self.sessions.get(sid)
             if session:
-                # Disconnect signals to prevent memory leaks
-                try:
-                    session.lines_ready.disconnect(self.worker.process_lines)
-                except:
-                    pass
+                # Disconnect all signals to prevent memory leaks
+                self._disconnect_session_signals(session)
 
                 # Stop the session (cleanup resources)
                 session.stop()
-                
+
                 # DON'T call stop_session() - it sets enabled=False
                 # We want to preserve user's preference for next startup
 

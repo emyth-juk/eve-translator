@@ -1,4 +1,5 @@
 import logging
+import time
 from pathlib import Path
 from PySide6.QtCore import QObject, QTimer, Signal
 
@@ -77,8 +78,8 @@ class ChatSession(QObject):
             # If the file hasn't been modified in > 30 minutes, don't show old history.
             try:
                 mtime = self.log_path.stat().st_mtime
-                import time
-                if time.time() - mtime < 1800:  # 30 minutes
+                threshold = self.config.get('fleet_inactive_threshold', 1800)
+                if time.time() - mtime < threshold:
                     last_lines = self.tailer.read_last_n_lines(history_lines)
                     if last_lines:
                         logger.info(f"[{self.session_id}] Loaded {len(last_lines)} existing messages")
@@ -160,8 +161,8 @@ class ChatSession(QObject):
             # CHECK: Is this log file stale?
             try:
                 mtime = self.log_path.stat().st_mtime
-                import time
-                if time.time() - mtime < 1800:  # 30 minutes
+                threshold = self.config.get('fleet_inactive_threshold', 1800)
+                if time.time() - mtime < threshold:
                     last_lines = self.tailer.read_last_n_lines(history_lines)
                     if last_lines:
                         logger.info(f"[{self.session_id}] Loaded {len(last_lines)} messages from new fleet log")

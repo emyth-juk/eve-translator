@@ -39,10 +39,6 @@ def main():
     translated_count = 0
 
     for i, line in enumerate(lines):
-        # Debug: Print first non-header line repr
-        if "[" in line and processed_count == 0:
-             print(f"DEBUG Line {i}: {repr(line)}")
-
         msg = parser.parse(line, i)
         if not msg:
             continue

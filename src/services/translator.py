@@ -1,6 +1,9 @@
+import logging
 from abc import ABC, abstractmethod
 from deep_translator import GoogleTranslator
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 class TranslationProvider(ABC):
     @property
@@ -39,7 +42,7 @@ class GoogleTransProvider(TranslationProvider):
                 
             return self.translator.translate(text)
         except Exception as e:
-            # logger.error(f"Translation Error (Google): {e}") # logger not imported
+            logger.error(f"Translation Error (Google): {e}")
             return None
 
 class DeepLProvider(TranslationProvider):
@@ -93,7 +96,7 @@ class DeepLProvider(TranslationProvider):
             result = self.translator.translate_text(text, **args)
             return result.text
         except Exception as e:
-            print(f"Translation Error (DeepL): {e}")
+            logger.error(f"Translation Error (DeepL): {e}")
             return None
 
 from src.core.glossary import EVEGlossary

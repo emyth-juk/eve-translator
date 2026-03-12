@@ -1,8 +1,10 @@
-from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
-                               QSlider, QSpinBox, QCheckBox, QPushButton, 
+import copy
+import os
+
+from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                               QSlider, QSpinBox, QCheckBox, QPushButton,
                                QColorDialog, QFormLayout, QGroupBox, QWidget, QTabWidget,
                                QFileDialog, QLineEdit)
-import os
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from src.version import __version__
@@ -16,8 +18,6 @@ class SettingsDialog(QDialog):
         self.setWindowTitle(f"Global Settings - v{__version__}")
         self.resize(400, 500)
         # Deep copy config to allow reversion/modification
-        # But for list/dict we need deep copy.
-        import copy
         self.config = copy.deepcopy(full_config)
         
         self.main_layout = QVBoxLayout(self)
