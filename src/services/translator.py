@@ -108,6 +108,9 @@ class TranslationService:
             self.provider = GoogleTransProvider()
         else:
             self.provider = provider
+
+        self._provider_mode = self.provider.name.lower()
+        self._deepl_api_key = ""
         
         # Initialize Glossary
         self.glossary = EVEGlossary(source_lang='zh', target_lang='en')
@@ -121,6 +124,27 @@ class TranslationService:
             # Assume 'zh' as source for now (Glossary is primarily Chinese-focused)
             # In future, source could also be configurable
             self.glossary = EVEGlossary(source_lang='zh', target_lang=target_lang)
+
+        self.set_provider_from_key(config.get('deepl_api_key', ''))
+
+    def set_provider_from_key(self, deepl_api_key: str):
+        """Select the translation provider from the configured DeepL API key."""
+        normalized_key = (deepl_api_key or '').strip()
+
+        if normalized_key:
+            if self._provider_mode != 'deepl' or self._deepl_api_key != normalized_key:
+                logger.info("Switching to DeepL Provider")
+                self.provider = DeepLProvider(normalized_key)
+                self._provider_mode = 'deepl'
+                self._deepl_api_key = normalized_key
+            return
+
+        if self._provider_mode != 'google':
+            logger.info("Switching to Google Provider")
+            self.provider = GoogleTransProvider()
+
+        self._provider_mode = 'google'
+        self._deepl_api_key = ""
 
     def translate_message(self, message: str, target_lang: str = 'en', source_lang: str = None) -> tuple[str, bool, str]:
         if not message.strip():

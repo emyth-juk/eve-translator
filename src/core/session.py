@@ -22,6 +22,8 @@ class ChatSession(QObject):
     request_settings = Signal()
     # Signal to request character switch
     character_selected = Signal(str)
+    # Signal to request application shutdown
+    exit_requested = Signal()
 
     def __init__(self, session_id: str, log_path: str,
                  overlay_config: dict, parent=None):
@@ -57,6 +59,7 @@ class ChatSession(QObject):
         self.overlay.session_toggled.connect(self._handle_session_toggle)
         self.overlay.request_settings.connect(self.request_settings)
         self.overlay.character_selected.connect(self.character_selected)
+        self.overlay.exit_requested.connect(self.exit_requested)
 
         # Polling timer
         self.poll_timer = QTimer()

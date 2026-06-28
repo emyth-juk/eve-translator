@@ -24,6 +24,8 @@ class OverlayWindow(QMainWindow):
     character_selected = Signal(str)
     # Signal to request fleet switch (fleet_id)
     fleet_selected = Signal(str) 
+    # Signal to request application shutdown
+    exit_requested = Signal()
 
     def __init__(self, session_id='fleet', initial_config=None):
         super().__init__()
@@ -361,7 +363,7 @@ class OverlayWindow(QMainWindow):
         menu.addSeparator()
         
         action_exit = QAction("Exit", self)
-        action_exit.triggered.connect(QApplication.instance().quit)
+        action_exit.triggered.connect(self.exit_requested.emit)
         menu.addAction(action_exit)
         
         # Show at cursor
@@ -508,12 +510,6 @@ class OverlayWindow(QMainWindow):
 
     def clear_messages(self):
         """Clear all messages from the overlay."""
-        # Clear chat history
         self.chat_history = []
-
-        # Remove all message widgets from layout
-        while self.layout.count():
-            child = self.layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
+        self.text_browser.clear()
 

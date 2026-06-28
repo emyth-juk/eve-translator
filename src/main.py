@@ -4,10 +4,7 @@ import logging
 import logging.handlers
 import glob
 from pathlib import Path
-from datetime import datetime
 import copy
-import json
-import html
 import traceback
 from src.utils.paths import get_resource_path
 
@@ -40,141 +37,69 @@ def setup_logging():
 logger = logging.getLogger(__name__)
 
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
-from PySide6.QtCore import QObject, Signal, Slot, QThread, Qt, QTimer
+from PySide6.QtCore import QObject, Slot, QThread, Qt, QTimer
 from PySide6.QtGui import QIcon, QAction
 
 from src.core.session import ChatSession
 from src.core.parser import LineParser
 from src.core.tokenizer import EVELinkTokenizer
 from src.core.detector import LanguageDetector
-from src.services.translator import TranslationService, GoogleTransProvider, DeepLProvider
+from src.app_config import (
+    ConfigStore,
+    SHARED_CONFIG_KEYS,
+    filter_session_config,
+    remove_shared_keys_from_sessions,
+    sanitize_config_for_log,
+)
+from src.services.processing import LogProcessingWorker, WorkerSignals
+from src.services.scan_state import ChatScanState
+from src.services.translator import TranslationService
 from src.services.local_detector import LocalChatDetector
 from src.gui.settings import SettingsDialog
 from src.version import __version__
-
-
-from src.core.character_info import CharacterInfo
-from src.core.fleet_info import FleetInfo
-from typing import Dict, Optional
-
-# Shared config keys (used for filtering session-specific vs shared config)
-SHARED_CONFIG_KEYS = frozenset({
-    'opacity', 'font_size', 'auto_scroll',
-    'ignored_languages', 'target_language', 'deepl_api_key',
-    'color_default', 'color_translated', 'color_highlight', 'log_dir',
-    'fleet_inactive_threshold', 'fleet_auto_switch', 'fleet_scan_interval',
-    'fleet_history_lines', 'polling_interval'
-})
-
-class WorkerSignals(QObject):
-    # session_id, text, sender, timestamp, original_text, is_translated
-    message_ready = Signal(str, str, str, str, str, bool)
-
-class LogProcessingWorker(QObject):
-    """
-    Shared worker that processes lines from ALL sessions.
-    Receives session_id with each batch to route output correctly.
-    """
-    def __init__(self, parser, tokenizer, detector, translator_service):
-        super().__init__()
-        self.parser = parser
-        self.tokenizer = tokenizer
-        self.detector = detector
-        self.translator_service = translator_service
-        self.signals = WorkerSignals()
-        self.config = {'ignored_languages': ['en'], 'target_language': 'en'}
-
-    @Slot(dict)
-    def update_config(self, config):
-        """Update shared configuration (target lang, API keys, etc.)."""
-        self.config = config.copy()
-
-        # Update Translator Config (Glossary reloading)
-        self.translator_service.set_config(self.config)
-
-        # Switch translator provider if needed
-        deepl_key = self.config.get('deepl_api_key', '').strip()
-        current_provider = self.translator_service.provider
-
-        if deepl_key:
-            if not isinstance(current_provider, DeepLProvider):
-                logger.info("Switching to DeepL Provider")
-                self.translator_service.provider = DeepLProvider(deepl_key)
-        else:
-            if not isinstance(current_provider, GoogleTransProvider):
-                logger.info("Switching to Google Provider")
-                self.translator_service.provider = GoogleTransProvider()
-
-    @Slot(str, list)
-    def process_lines(self, session_id: str, lines: list):
-        """
-        Process batch of lines from a specific session.
-        """
-        for line in lines:
-            try:
-                self._process_single_line(session_id, line)
-            except Exception as e:
-                logger.error(f"[{session_id}] Error processing line: {e}")
-
-    def _process_single_line(self, session_id: str, line: str):
-        """Process single line and emit result with session_id."""
-        msg = self.parser.parse(line, 0)
-        if not msg:
-            return
-
-        # Tokenize
-        tokenized = self.tokenizer.tokenize(msg.message)
-
-        # Detect
-        ignored = set(self.config.get('ignored_languages', ['en']))
-        should_translate, detected_lang = self.detector.should_translate(
-            tokenized.cleaned, ignored_langs=ignored
-        )
-
-        timestamp_str = msg.timestamp.strftime("%H:%M:%S")
-
-        if not should_translate:
-            final_text = self._restore_with_highlight(tokenized.cleaned, tokenized.tokens)
-            self.signals.message_ready.emit(
-                session_id, final_text, msg.sender,
-                timestamp_str, "", False
-            )
-            return
-
-        # Translate
-        target_lang = self.config.get('target_language', 'en')
-        translated_text, success, provider = self.translator_service.translate_message(
-            tokenized.cleaned, target_lang, source_lang=detected_lang
-        )
-        
-        # Log
-        status = "Success" if success else "Failed"
-        logger.info(f"[{session_id.upper()}] [{provider}] {status}: '{tokenized.cleaned}' -> '{translated_text}'")
-
-        # Restore
-        final_text = self._restore_with_highlight(translated_text, tokenized.tokens)
-        final_original = self._restore_with_highlight(tokenized.cleaned, tokenized.tokens)
-
-        # Emit
-        self.signals.message_ready.emit(
-            session_id, final_text, msg.sender,
-            timestamp_str, final_original, True
-        )
-
-    def _restore_with_highlight(self, text, tokens):
-        safe_text = html.escape(text)
-        for placeholder, original in tokens.items():
-            safe_original = html.escape(original)
-            highlighted = f"<span style='color: yellow;'>{safe_original}</span>"
-            safe_text = safe_text.replace(placeholder, highlighted)
-        return safe_text
-
 
 class TranslatorManager(QObject):
     """
     Main application manager.
     Coordinates multiple chat sessions and shared processing pipeline.
     """
+
+    def _get_scan_state(self):
+        if not hasattr(self, '_scan_state'):
+            self._scan_state = ChatScanState.from_config(getattr(self, 'config', {}))
+        return self._scan_state
+
+    @property
+    def character_registry(self):
+        return self._get_scan_state().character_registry
+
+    @character_registry.setter
+    def character_registry(self, value):
+        self._get_scan_state().character_registry = value
+
+    @property
+    def fleet_registry(self):
+        return self._get_scan_state().fleet_registry
+
+    @fleet_registry.setter
+    def fleet_registry(self, value):
+        self._get_scan_state().fleet_registry = value
+
+    @property
+    def selected_character_id(self):
+        return self._get_scan_state().selected_character_id
+
+    @selected_character_id.setter
+    def selected_character_id(self, value):
+        self._get_scan_state().selected_character_id = value
+
+    @property
+    def selected_fleet_id(self):
+        return self._get_scan_state().selected_fleet_id
+
+    @selected_fleet_id.setter
+    def selected_fleet_id(self, value):
+        self._get_scan_state().selected_fleet_id = value
 
     def __init__(self):
         super().__init__()
@@ -193,13 +118,14 @@ class TranslatorManager(QObject):
             logger.warning(f"Icon not found at {icon_path}")
 
         # Configuration
+        self.config_store = ConfigStore()
         self.config = self._load_config()
 
         # Shared Processing Components
         parser = LineParser()
         tokenizer = EVELinkTokenizer()
         detector = LanguageDetector()
-        translator_service = TranslationService(provider=GoogleTransProvider())
+        translator_service = TranslationService()
 
         # Shared Worker Thread
         self.thread = QThread()
@@ -214,15 +140,8 @@ class TranslatorManager(QObject):
         # Sessions
         self.sessions = {}
 
-        # Character tracking (for Local chat)
-        self.character_registry: Dict[str, CharacterInfo] = {}
-        # Try to load selected character from config
-        self.selected_character_id: Optional[str] = self.config['sessions']['local'].get('character_id')
-
-        # Fleet tracking
-        self.fleet_registry: Dict[str, FleetInfo] = {}
-        # Try to load selected fleet from config
-        self.selected_fleet_id: Optional[str] = self.config['sessions']['fleet'].get('fleet_id')
+        # Chat log scan state
+        self._scan_state = ChatScanState.from_config(self.config)
 
         # Periodic scanner timer (check every X seconds for characters and fleets)
         # Scan interval is configurable, defaulting to 10s as per user request (legacy default was 30s)
@@ -288,75 +207,10 @@ class TranslatorManager(QObject):
         logger.info(f"Using Log Directory: {current_path}")
 
     def _load_config(self) -> dict:
-        config_path = Path.cwd() / 'translator_config.json'
-        
-        # Legacy migration check
-        legacy_path = Path.cwd() / 'overlay_config.json'
-        legacy_data = {}
-        if legacy_path.exists():
-             try:
-                 with open(legacy_path, 'r') as f:
-                     legacy_data = json.load(f)
-             except (IOError, json.JSONDecodeError, ValueError):
-                 pass
-
-        default_config = {
-            'shared': {
-                'opacity': legacy_data.get('opacity', 0.8),
-                'font_size': legacy_data.get('font_size', 10),
-                'auto_scroll': legacy_data.get('auto_scroll', True),
-                'ignored_languages': legacy_data.get('ignored_languages', ['en']),
-                'target_language': legacy_data.get('target_language', 'en'),
-                'deepl_api_key': legacy_data.get('deepl_api_key', ''),
-                'color_default': legacy_data.get('color_default', '#e0e0e0'),
-                'color_translated': legacy_data.get('color_translated', '#00ffff'),
-                'color_highlight': legacy_data.get('color_highlight', 'yellow'),
-                'log_dir': os.path.expanduser("~/Documents/EVE/logs/Chatlogs"),
-                
-                # Fleet chat settings
-                'fleet_inactive_threshold': 1800,  # seconds (30 minutes)
-                'fleet_auto_switch': True,  # Auto-switch when current fleet becomes inactive
-                'fleet_scan_interval': 10,  # seconds
-                'fleet_history_lines': 5,   # Number of past messages to load on start
-                'polling_interval': 1.0     # Log check frequency (seconds)
-            },
-            'sessions': {
-                'fleet': {
-                    'enabled': True,
-                    'x': legacy_data.get('x', 100),
-                    'y': legacy_data.get('y', 100),
-                    'w': legacy_data.get('w', 300),
-                    'h': legacy_data.get('h', 200),
-                    'background_color': '#33001a',
-                    'title_prefix': '[FLEET]'
-                },
-                'local': {
-                    'enabled': False,
-                    'x': 410, 'y': 100, 'w': 300, 'h': 200,
-                    'background_color': '#001a33',
-                    'title_prefix': '[LOCAL]'
-                }
-            }
-        }
-
-        if config_path.exists():
-            try:
-                with open(config_path, 'r') as f:
-                    loaded = json.load(f)
-                    # Merge
-                    if 'shared' in loaded:
-                        default_config['shared'].update(loaded['shared'])
-                    if 'sessions' in loaded:
-                         for s in ['fleet', 'local']:
-                             if s in loaded['sessions']:
-                                 default_config['sessions'][s].update(loaded['sessions'][s])
-            except Exception as e:
-                logger.error(f"Error loading config: {e}")
-
-        return default_config
+        config_store = getattr(self, 'config_store', ConfigStore())
+        return config_store.load()
 
     def _save_config(self):
-        config_path = Path.cwd() / 'translator_config.json'
         # Update session configs
         for session_id, session in self.sessions.items():
             if session:
@@ -364,21 +218,15 @@ class TranslatorManager(QObject):
                 # Only update session-specific properties.
                 # Remove Shared Keys (handled by Shared config)
                 # 'enabled' MUST be allowed so it persists to JSON.
-                filtered_config = {k: v for k, v in current_overlay_config.items() if k not in SHARED_CONFIG_KEYS}
+                filtered_config = filter_session_config(current_overlay_config)
                 
                 # Update with filtered config
+                self.config.setdefault('sessions', {}).setdefault(session_id, {})
                 self.config['sessions'][session_id].update(filtered_config)
-                
-                # Explicitly cleanup any shared keys that might exist in the session config (legacy/dirty state)
-                for key in SHARED_CONFIG_KEYS:
-                    if key in self.config['sessions'][session_id]:
-                        del self.config['sessions'][session_id][key]
-        
-        try:
-            with open(config_path, 'w') as f:
-                json.dump(self.config, f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving config: {e}")
+
+        remove_shared_keys_from_sessions(self.config)
+        config_store = getattr(self, 'config_store', ConfigStore())
+        config_store.save(self.config)
 
     def _setup_system_tray(self):
         self.tray_icon = QSystemTrayIcon(self.app)
@@ -451,6 +299,7 @@ class TranslatorManager(QObject):
         session.request_settings.connect(self.open_settings_dialog)
         session.config_changed.connect(self._handle_session_config_change)
         session.character_selected.connect(self.switch_local_character)
+        session.exit_requested.connect(self.shutdown)
 
         # Connect fleet selection signal (for fleet sessions)
         if hasattr(session.overlay, 'fleet_selected'):
@@ -481,7 +330,10 @@ class TranslatorManager(QObject):
                 new_config = dlg.get_settings()
                 self.config.update(new_config)
                 
-                logger.info(f"[Settings] New Shared Config: {self.config['shared']}")
+                logger.info(
+                    "[Settings] New Shared Config: %s",
+                    sanitize_config_for_log(self.config['shared']),
+                )
                 
                 # Apply changes to worker (Shared)
                 self.worker.update_config(self.config['shared'])
@@ -526,6 +378,7 @@ class TranslatorManager(QObject):
             (session.request_settings, self.open_settings_dialog),
             (session.config_changed, self._handle_session_config_change),
             (session.character_selected, self.switch_local_character),
+            (session.exit_requested, self.shutdown),
         ]:
             try:
                 signal.disconnect(slot)
@@ -826,10 +679,7 @@ class TranslatorManager(QObject):
         logger.info(f"[LOCAL] Switching to character: {self.character_registry[char_id].character_name}")
 
         # Update selection
-        self.selected_character_id = char_id
-        self.config['sessions']['local']['character_id'] = char_id
-        self.config['sessions']['local']['character_name'] = self.character_registry[char_id].character_name
-        self.config['sessions']['local']['system_name'] = self.character_registry[char_id].system_name
+        self._get_scan_state().select_character(char_id, self.config)
 
         # Restart Local session
         self._switch_local_character(char_id)
@@ -878,8 +728,7 @@ class TranslatorManager(QObject):
         logger.info(f"[FLEET] Switching to fleet: {fleet_info.listener_name}")
 
         # Update selection
-        self.selected_fleet_id = fleet_id
-        self.config['sessions']['fleet']['fleet_id'] = fleet_id
+        self._get_scan_state().select_fleet(fleet_id, self.config)
 
         # Restart Fleet session with new log (using switch_fleet_log in session)
         if 'fleet' in self.sessions and self.sessions['fleet']:
