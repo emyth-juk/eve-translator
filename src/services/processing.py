@@ -65,7 +65,7 @@ class LogProcessingWorker(QObject):
         )
 
         status = "Success" if success else "Failed"
-        logger.info(
+        logger.debug(
             "[%s] [%s] %s: %r -> %r",
             session_id.upper(), provider, status, tokenized.cleaned, translated_text
         )

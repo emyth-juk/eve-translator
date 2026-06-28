@@ -2,6 +2,7 @@ import re
 import yaml
 import os
 import logging
+from functools import lru_cache
 from langdetect import detect, LangDetectException
 from typing import Optional, List, Dict
 try:
@@ -17,6 +18,8 @@ except ImportError:
         return os.path.join(base_path, relative_path)
 
 logger = logging.getLogger(__name__)
+
+LANGUAGE_CACHE_SIZE = 1024
 
 class LanguageDetector:
     """
@@ -35,6 +38,13 @@ class LanguageDetector:
         self.force_ignore_patterns = []
         self.internet_slang_patterns = []
         self._load_ignore_patterns()
+        self._compile_ignore_patterns()
+        self._detect_language_cached = lru_cache(maxsize=LANGUAGE_CACHE_SIZE)(
+            self._detect_language_uncached
+        )
+        self._should_translate_cached = lru_cache(maxsize=LANGUAGE_CACHE_SIZE)(
+            self._should_translate_uncached
+        )
 
     def _load_ignore_patterns(self):
         """Load ignore patterns from YAML."""
@@ -59,6 +69,15 @@ class LanguageDetector:
             logger.warning("Using hardcoded fallback for ignore patterns.")
             self._load_hardcoded_patterns()
 
+    def _compile_ignore_patterns(self):
+        """Compile ignore patterns once so every message does not recompile regexes."""
+        self._ignore_regexes = []
+        for pattern in self.force_ignore_patterns + self.internet_slang_patterns:
+            try:
+                self._ignore_regexes.append(re.compile(pattern, re.IGNORECASE))
+            except re.error as exc:
+                logger.error(f"Invalid ignore pattern {pattern!r}: {exc}")
+
     def _load_hardcoded_patterns(self):
         """Fallback patterns if YAML missing."""
         self.force_ignore_patterns = [
@@ -77,6 +96,9 @@ class LanguageDetector:
         return bool(self.cjk_pattern.search(text))
 
     def detect_language(self, text: str) -> str:
+        return self._detect_language_cached(text)
+
+    def _detect_language_uncached(self, text: str) -> str:
         """
         Identify language code (ISO 639-1).
         Fixes CJK false positives (sw, etc) to 'zh'.
@@ -117,20 +139,22 @@ class LanguageDetector:
         return detected
             
     def should_translate(self, text: str, target_lang: str = 'en', ignored_langs=None) -> (bool, str):
+        if ignored_langs is None:
+            ignored_langs = {'en'} # Default ignore English only
+        ignored_tuple = tuple(sorted(ignored_langs))
+        return self._should_translate_cached(text, target_lang, ignored_tuple)
+
+    def _should_translate_uncached(self, text: str, target_lang: str, ignored_tuple: tuple) -> (bool, str):
         """
         Decides if text should be translated.
         Returns: (should_translate: bool, detected_lang: str)
         """
-        if ignored_langs is None:
-            ignored_langs = {'en'} # Default ignore English only
+        ignored_langs = set(ignored_tuple)
 
         # 1a. KEYWORD FILTER (Force Ignore)
-        # Combine all patterns
-        all_ignore_patterns = self.force_ignore_patterns + self.internet_slang_patterns
-
         s_text = text.strip()
-        for pattern in all_ignore_patterns:
-            if re.search(pattern, s_text, re.IGNORECASE):
+        for pattern in self._ignore_regexes:
+            if pattern.search(s_text):
                 return False, 'ignored_keyword'
 
         # 1. CJK fast check (ALWAYS translate CJK if target is not CJK)

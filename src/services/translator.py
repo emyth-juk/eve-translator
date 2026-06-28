@@ -1,9 +1,11 @@
 import logging
+from collections import OrderedDict
 from abc import ABC, abstractmethod
 from deep_translator import GoogleTranslator
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+TRANSLATION_CACHE_SIZE = 512
 
 class TranslationProvider(ABC):
     @property
@@ -111,6 +113,7 @@ class TranslationService:
 
         self._provider_mode = self.provider.name.lower()
         self._deepl_api_key = ""
+        self._translation_cache = OrderedDict()
         
         # Initialize Glossary
         self.glossary = EVEGlossary(source_lang='zh', target_lang='en')
@@ -124,6 +127,7 @@ class TranslationService:
             # Assume 'zh' as source for now (Glossary is primarily Chinese-focused)
             # In future, source could also be configurable
             self.glossary = EVEGlossary(source_lang='zh', target_lang=target_lang)
+            self._clear_translation_cache()
 
         self.set_provider_from_key(config.get('deepl_api_key', ''))
 
@@ -137,14 +141,40 @@ class TranslationService:
                 self.provider = DeepLProvider(normalized_key)
                 self._provider_mode = 'deepl'
                 self._deepl_api_key = normalized_key
+                self._clear_translation_cache()
             return
 
         if self._provider_mode != 'google':
             logger.info("Switching to Google Provider")
             self.provider = GoogleTransProvider()
+            self._clear_translation_cache()
 
         self._provider_mode = 'google'
         self._deepl_api_key = ""
+
+    def _clear_translation_cache(self):
+        self._translation_cache.clear()
+
+    def _cache_key(self, message: str, target_lang: str, source_lang: str = None):
+        normalized_source = (source_lang or 'auto').lower()
+        return (
+            self._provider_mode,
+            (target_lang or 'en').lower(),
+            normalized_source,
+            message,
+        )
+
+    def _get_cached_translation(self, key):
+        if key not in self._translation_cache:
+            return None
+        translated = self._translation_cache.pop(key)
+        self._translation_cache[key] = translated
+        return translated
+
+    def _store_cached_translation(self, key, translated: str):
+        self._translation_cache[key] = translated
+        if len(self._translation_cache) > TRANSLATION_CACHE_SIZE:
+            self._translation_cache.popitem(last=False)
 
     def translate_message(self, message: str, target_lang: str = 'en', source_lang: str = None) -> tuple[str, bool, str]:
         if not message.strip():
@@ -154,9 +184,15 @@ class TranslationService:
         # Replaces known EVE terms (like '毒蜥') with English ('Gila')
         # This helps DeepL context and ensures correct terminology.
         preprocessed = self.glossary.replace_terms(message)
+
+        cache_key = self._cache_key(preprocessed, target_lang, source_lang)
+        cached = self._get_cached_translation(cache_key)
+        if cached is not None:
+            return cached, True, self.provider.name
         
         translated = self.provider.translate(preprocessed, target_lang, source_lang)
         if translated:
+            self._store_cached_translation(cache_key, translated)
             return translated, True, self.provider.name
         else:
             # If translation fails, return preprocessed (glossary applied) at least?
