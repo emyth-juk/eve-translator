@@ -1,17 +1,21 @@
 
 import unittest
 import json
-from unittest.mock import MagicMock, patch, mock_open
+import tempfile
+import shutil
+from unittest.mock import MagicMock, patch
 from pathlib import Path
+from src.app_config import ConfigStore
 from src.main import TranslatorManager
 
 class TestConfigPersistence(unittest.TestCase):
 
     def setUp(self):
-        # We need to minimally init TranslatorManager without QApp if possible, or mocked.
-        # TranslatorManager inherits QObject? No, usually explicitly.
-        # Let's inspect main.py imports.
-        pass
+        self.test_dir = tempfile.mkdtemp()
+        self.config_path = Path(self.test_dir) / ".eve_translator" / "translator_config.json"
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
 
     @patch('src.main.TranslatorManager.__init__', return_value=None) # Skip init
     def test_save_config_logic(self, mock_init):
@@ -46,30 +50,25 @@ class TestConfigPersistence(unittest.TestCase):
             }
         }
         
-        # Mock file writing
-        with patch('builtins.open', mock_open()) as mocked_file, \
-             patch('src.main.Path.cwd', return_value=Path('/tmp')):
-            
-            app._save_config()
-            
-            # Verify file write
-            mocked_file.assert_called_with(Path('/tmp/translator_config.json'), 'w')
-            
-            # Get the JSON written
-            # handle = mocked_file()
-            # handle.write.assert_called... but json.dump calls write multiple times often.
-            # Easier to inspect app.config state which was dumped.
-            
-            session_conf = app.config['sessions']['session1']
-            
-            # 1. Included keys should be updated
-            self.assertEqual(session_conf['x'], 100)
-            self.assertEqual(session_conf['some_unique_setting'], 'value')
-            
-            # 2. Excluded keys should be REMOVED (opacity, polling_interval)
-            self.assertNotIn('opacity', session_conf)
-            self.assertNotIn('polling_interval', session_conf)
-            self.assertNotIn('font_size', session_conf)
+        app.config_store = ConfigStore(path=self.config_path, legacy_dir=self.test_dir)
+
+        app._save_config()
+
+        self.assertTrue(self.config_path.exists())
+        with open(self.config_path, 'r', encoding='utf-8') as config_file:
+            saved = json.load(config_file)
+
+        session_conf = app.config['sessions']['session1']
+
+        # 1. Included keys should be updated
+        self.assertEqual(session_conf['x'], 100)
+        self.assertEqual(session_conf['some_unique_setting'], 'value')
+
+        # 2. Excluded keys should be REMOVED (opacity, polling_interval)
+        self.assertNotIn('opacity', session_conf)
+        self.assertNotIn('polling_interval', session_conf)
+        self.assertNotIn('font_size', session_conf)
+        self.assertNotIn('opacity', saved['sessions']['session1'])
 
 if __name__ == '__main__':
     unittest.main()
