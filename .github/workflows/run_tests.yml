@@ -11,6 +11,8 @@ jobs:
   test:
     name: Test on ${{ matrix.os }} with Python ${{ matrix.python-version }}
     runs-on: ${{ matrix.os }}
+    env:
+      QT_QPA_PLATFORM: offscreen
     strategy:
       fail-fast: false
       matrix:
@@ -29,8 +31,7 @@ jobs:
     - name: Install Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        pip install pytest pytest-qt
+        pip install -r requirements-dev.txt
 
     - name: Install Linux Libs (Headless support)
       if: runner.os == 'Linux'
@@ -42,9 +43,13 @@ jobs:
     - name: Run Tests (Windows)
       if: runner.os == 'Windows'
       run: |
-        pytest tests/
+        python -m pytest -q
+
+    - name: Run Ruff
+      run: |
+        ruff check src tests
 
     - name: Run Tests (Linux Headless)
       if: runner.os == 'Linux'
       run: |
-        xvfb-run pytest tests/
+        xvfb-run python -m pytest -q
