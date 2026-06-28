@@ -285,6 +285,35 @@ class TestSessionConfigUpdate(unittest.TestCase):
         session.stop()  # Should not crash
         self.assertFalse(session.is_running)
 
+    @patch(PATCH_OVERLAY)
+    @patch(PATCH_TAILER)
+    def test_watched_log_uses_relaxed_fallback_interval(self, MockTailer, MockOW):
+        """Active file watch should relax fallback polling but respect larger user intervals."""
+        from src.core.session import ChatSession
+
+        session = ChatSession('fleet', self.log_path, _make_config(polling_interval=1.0))
+        session._file_watch_active = True
+        self.assertEqual(session._poll_interval_ms(), 5000)
+
+        session.config['polling_interval'] = 10.0
+        self.assertEqual(session._poll_interval_ms(), 10000)
+
+    @patch(PATCH_OVERLAY)
+    @patch(PATCH_TAILER)
+    def test_debounced_file_change_readds_watch_and_polls(self, MockTailer, MockOW):
+        """Debounced watcher event should re-arm watching and read new lines."""
+        from src.core.session import ChatSession
+
+        session = ChatSession('fleet', self.log_path, _make_config())
+        session.is_running = True
+        session._start_log_watcher = MagicMock(return_value=True)
+        session._poll_log = MagicMock()
+
+        session._handle_debounced_file_change()
+
+        session._start_log_watcher.assert_called_once()
+        session._poll_log.assert_called_once()
+
 
 if __name__ == '__main__':
     unittest.main()

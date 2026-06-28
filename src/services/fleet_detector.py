@@ -16,6 +16,17 @@ class FleetDetector:
     Supports parsing listener names and tracking multiple active fleets.
     """
 
+    def __init__(self):
+        self._listener_cache = {}
+
+    def _file_cache_key(self, filepath: str):
+        try:
+            path = Path(filepath)
+            stat = path.stat()
+            return (str(path), stat.st_size, stat.st_mtime)
+        except OSError:
+            return None
+
     def parse_listener_from_log(self, filepath: str) -> Optional[str]:
         """
         Parse listener (character) name from fleet log header.
@@ -27,6 +38,11 @@ class FleetDetector:
         Returns:
             Character name or None if not found
         """
+        cache_key = self._file_cache_key(filepath)
+        if cache_key in self._listener_cache:
+            return self._listener_cache[cache_key]
+
+        listener = None
         try:
             with open(filepath, 'r', encoding='utf-16-le', errors='replace') as f:
                 for _ in range(15):
@@ -36,10 +52,14 @@ class FleetDetector:
                     if 'Listener:' in line:
                         parts = line.split('Listener:')
                         if len(parts) > 1:
-                            return parts[1].strip()
+                            listener = parts[1].strip()
+                            break
         except (OSError, UnicodeError):
             pass
-        return None
+
+        if cache_key is not None:
+            self._listener_cache[cache_key] = listener
+        return listener
 
     def parse_timestamp_from_filename(self, filename: str) -> Optional[float]:
         """

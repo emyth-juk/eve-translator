@@ -22,6 +22,18 @@ class LocalChatDetector:
     Supports auto-detection of most recent log and character name parsing.
     """
 
+    def __init__(self):
+        self._character_cache = {}
+        self._system_cache = {}
+
+    def _file_cache_key(self, filepath: str):
+        try:
+            path = Path(filepath)
+            stat = path.stat()
+            return (str(path), stat.st_size, stat.st_mtime)
+        except OSError:
+            return None
+
     def parse_character_id_from_filename(self, filename: str) -> Optional[str]:
         """
         Extract character ID from Local chat filename.
@@ -38,6 +50,10 @@ class LocalChatDetector:
         Scans values to find the LATEST system change (not just the first).
         "EVE System > Channel changed to Local : <SYSTEM_NAME>"
         """
+        cache_key = self._file_cache_key(filepath)
+        if cache_key in self._system_cache:
+            return self._system_cache[cache_key]
+
         last_system = None
         try:
             with open(filepath, 'r', encoding='utf-16-le', errors='replace') as f:
@@ -54,6 +70,8 @@ class LocalChatDetector:
                                 last_system = system_part[1].strip()
         except (OSError, UnicodeError):
             pass
+        if cache_key is not None:
+            self._system_cache[cache_key] = last_system
         return last_system
 
     def is_character_window_open(self, char_name: str) -> bool:
@@ -224,6 +242,11 @@ class LocalChatDetector:
         Parse character name from log header.
         Reads first ~15 lines looking for "Listener: <CharacterName>".
         """
+        cache_key = self._file_cache_key(filepath)
+        if cache_key in self._character_cache:
+            return self._character_cache[cache_key]
+
+        character_name = None
         try:
             with open(filepath, 'r', encoding='utf-16-le', errors='replace') as f:
                 for _ in range(15):
@@ -233,7 +256,10 @@ class LocalChatDetector:
                     if 'Listener:' in line:
                         parts = line.split('Listener:')
                         if len(parts) > 1:
-                            return parts[1].strip()
+                            character_name = parts[1].strip()
+                            break
         except (OSError, UnicodeError):
             pass
-        return None
+        if cache_key is not None:
+            self._character_cache[cache_key] = character_name
+        return character_name

@@ -196,6 +196,26 @@ class TestFleetLogTailer(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         tailer.close()
 
+    def test_read_last_n_lines_matches_full_scan_for_large_log(self):
+        messages = [
+            "Channel ID:      (None)",
+            "Channel Name:    Fleet",
+            "Listener:        TestChar",
+            "Session started: 2025.12.16 08:24:57",
+            "",
+        ]
+        expected_messages = []
+        for i in range(250):
+            line = f"[ 2025.12.16 10:{i % 60:02d}:00 ] Player > Message {i}"
+            messages.append(line)
+            expected_messages.append(line)
+
+        path = self._create_log(lines=messages)
+        tailer = FleetLogTailer(path)
+
+        self.assertEqual(tailer.read_last_n_lines(7), expected_messages[-7:])
+        tailer.close()
+
     # --- Integration ---
 
     def test_full_tail_workflow(self):

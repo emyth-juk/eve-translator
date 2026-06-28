@@ -3,6 +3,7 @@ import tempfile
 import shutil
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from datetime import datetime
 
@@ -56,6 +57,26 @@ class TestFleetDetectorParsing(unittest.TestCase):
     def test_parse_listener_from_log_nonexistent(self):
         result = self.detector.parse_listener_from_log("/nonexistent/path.txt")
         self.assertIsNone(result)
+
+    def test_parse_listener_from_log_uses_metadata_cache(self):
+        path = self._create_fleet_log("Fleet_20251216_082457.txt", "CachedPilot")
+
+        with patch("builtins.open", wraps=open) as mock_open:
+            self.assertEqual(self.detector.parse_listener_from_log(path), "CachedPilot")
+            self.assertEqual(self.detector.parse_listener_from_log(path), "CachedPilot")
+
+        self.assertEqual(mock_open.call_count, 1)
+
+    def test_parse_listener_from_log_invalidates_cache_on_change(self):
+        path = self._create_fleet_log("Fleet_20251216_082457.txt", "OldPilot")
+
+        with patch("builtins.open", wraps=open) as mock_open:
+            self.assertEqual(self.detector.parse_listener_from_log(path), "OldPilot")
+            with open(path, 'w', encoding='utf-16-le') as f:
+                f.write("Listener:        NewPilotLonger\r\n")
+            self.assertEqual(self.detector.parse_listener_from_log(path), "NewPilotLonger")
+
+        self.assertEqual(mock_open.call_count, 3)
 
     # --- parse_timestamp_from_filename ---
 

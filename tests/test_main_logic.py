@@ -185,6 +185,25 @@ class TestBuildSessionConfig(unittest.TestCase):
             self.assertEqual(config['opacity'], 0.9)
 
 
+class TestScannerWatcherConfig(unittest.TestCase):
+    """Tests for scanner fallback interval selection."""
+
+    def test_watched_directory_uses_relaxed_fallback_interval(self):
+        with patch('src.main.TranslatorManager.__init__', lambda self: None):
+            from src.main import TranslatorManager
+
+            mgr = TranslatorManager()
+            mgr.config = {'shared': {'fleet_scan_interval': 10}}
+            mgr._log_dir_watch_active = True
+            self.assertEqual(mgr._scanner_interval_ms(), 60000)
+
+            mgr.config['shared']['fleet_scan_interval'] = 120
+            self.assertEqual(mgr._scanner_interval_ms(), 120000)
+
+            mgr._log_dir_watch_active = False
+            self.assertEqual(mgr._scanner_interval_ms(), 120000)
+
+
 class TestDisconnectSessionSignals(unittest.TestCase):
     """Tests for _disconnect_session_signals helper."""
 

@@ -1,9 +1,11 @@
 import logging
 import time
 from pathlib import Path
-from PySide6.QtCore import QObject, QTimer, Signal
+from PySide6.QtCore import QObject, QCoreApplication, QFileSystemWatcher, Qt, QTimer, Signal
 
 logger = logging.getLogger(__name__)
+LOG_WATCH_DEBOUNCE_MS = 100
+WATCHED_LOG_FALLBACK_SECONDS = 5.0
 
 class ChatSession(QObject):
     """
@@ -63,7 +65,18 @@ class ChatSession(QObject):
 
         # Polling timer
         self.poll_timer = QTimer()
+        self.poll_timer.setTimerType(Qt.TimerType.CoarseTimer)
         self.poll_timer.timeout.connect(self._poll_log)
+        self.file_watch_debounce = QTimer(self)
+        self.file_watch_debounce.setSingleShot(True)
+        self.file_watch_debounce.setInterval(LOG_WATCH_DEBOUNCE_MS)
+        self.file_watch_debounce.setTimerType(Qt.TimerType.CoarseTimer)
+        self.file_watch_debounce.timeout.connect(self._handle_debounced_file_change)
+        self.file_watcher = None
+        self._file_watch_active = False
+        if QCoreApplication.instance() is not None:
+            self.file_watcher = QFileSystemWatcher(self)
+            self.file_watcher.fileChanged.connect(self._handle_log_file_changed)
 
         self.is_running = False
 
@@ -98,8 +111,8 @@ class ChatSession(QObject):
         self.overlay.show()
 
         # Start polling
-        interval = self.config.get('polling_interval', 1.0)
-        self.poll_timer.start(int(interval * 1000))
+        self._start_log_watcher()
+        self.poll_timer.start(self._poll_interval_ms())
 
         self.is_running = True
         logger.info(f"[{self.session_id}] Session started: {self.log_path}")
@@ -111,6 +124,8 @@ class ChatSession(QObject):
 
         # Stop polling
         self.poll_timer.stop()
+        self.file_watch_debounce.stop()
+        self._stop_log_watcher()
 
         # Close tailer
         if self.tailer:
@@ -142,6 +157,8 @@ class ChatSession(QObject):
 
         # Stop polling temporarily
         self.poll_timer.stop()
+        self.file_watch_debounce.stop()
+        self._stop_log_watcher()
 
         # Close old tailer
         if self.tailer:
@@ -180,10 +197,61 @@ class ChatSession(QObject):
         self.tailer.seek_to_end()
 
         # Resume polling
-        interval = self.config.get('polling_interval', 1.0)
-        self.poll_timer.start(int(interval * 1000))
+        self._start_log_watcher()
+        self.poll_timer.start(self._poll_interval_ms())
 
         logger.info(f"[{self.session_id}] Fleet log switch complete")
+
+    def _configured_poll_interval_ms(self):
+        interval = self.config.get('polling_interval', 1.0)
+        return max(100, int(interval * 1000))
+
+    def _poll_interval_ms(self):
+        configured_ms = self._configured_poll_interval_ms()
+        if self._file_watch_active:
+            return max(configured_ms, int(WATCHED_LOG_FALLBACK_SECONDS * 1000))
+        return configured_ms
+
+    def _start_log_watcher(self):
+        self._file_watch_active = False
+        if self.file_watcher is None:
+            return False
+
+        path = str(self.log_path)
+        for watched in list(self.file_watcher.files()):
+            if watched != path:
+                self.file_watcher.removePath(watched)
+
+        if not self.log_path.exists():
+            if path in self.file_watcher.files():
+                self.file_watcher.removePath(path)
+            return False
+
+        if path not in self.file_watcher.files():
+            self._file_watch_active = self.file_watcher.addPath(path)
+        else:
+            self._file_watch_active = True
+        return self._file_watch_active
+
+    def _stop_log_watcher(self):
+        if self.file_watcher is None:
+            self._file_watch_active = False
+            return
+        for watched in list(self.file_watcher.files()):
+            self.file_watcher.removePath(watched)
+        self._file_watch_active = False
+
+    def _handle_log_file_changed(self, changed_path: str):
+        if Path(changed_path) != self.log_path:
+            return
+        if not self.file_watch_debounce.isActive():
+            self.file_watch_debounce.start()
+
+    def _handle_debounced_file_change(self):
+        self._start_log_watcher()
+        if self.is_running:
+            self.poll_timer.start(self._poll_interval_ms())
+            self._poll_log()
 
     def update_session_states(self, states: dict):
         """Pass enabled states to overlay."""
@@ -229,7 +297,7 @@ class ChatSession(QObject):
         new_interval = self.config.get('polling_interval', 1.0)
         if self.is_running and abs(new_interval - old_interval) > 0.01:
             logger.info(f"[{self.session_id}] Updating polling interval: {new_interval}s")
-            self.poll_timer.start(int(new_interval * 1000))
+            self.poll_timer.start(self._poll_interval_ms())
 
     def _handle_config_update(self, new_config):
         self.config.update(new_config)

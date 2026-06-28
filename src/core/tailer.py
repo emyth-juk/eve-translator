@@ -84,6 +84,18 @@ class FleetLogTailer:
             self.file_handle.close()
             self.file_handle = None
 
+    @staticmethod
+    def _is_message_line(line: str) -> bool:
+        return '[ 2' in line and '] ' in line
+
+    def _read_all_message_lines(self) -> List[str]:
+        with open(self.filepath, 'r', encoding='utf-16-le', errors='replace') as f:
+            return [
+                line.rstrip('\r\n')
+                for line in f
+                if self._is_message_line(line)
+            ]
+
     def read_last_n_lines(self, n: int = 30) -> List[str]:
         """
         Read the last N message lines from the log file.
@@ -104,22 +116,41 @@ class FleetLogTailer:
             return []
 
         try:
-            with open(self.filepath, 'r', encoding='utf-16-le', errors='replace') as f:
-                # Read all lines
-                all_lines = f.readlines()
+            if n <= 0:
+                return self._read_all_message_lines()
 
-                # Filter to only message lines (contain timestamp pattern [ YYYY.MM.DD HH:MM:SS ])
-                message_lines = []
-                for line in all_lines:
-                    # Check if line contains EVE message timestamp pattern
-                    if '[ 2' in line and '] ' in line:
-                        message_lines.append(line.rstrip('\r\n'))
+            file_size = self.filepath.stat().st_size
+            if file_size == 0:
+                return []
 
-                # Return last N message lines
-                if len(message_lines) <= n:
-                    return message_lines
-                else:
-                    return message_lines[-n:]
+            chunk_size = 8192
+            position = file_size
+            buffer = b''
+            message_lines = []
+
+            with open(self.filepath, 'rb') as f:
+                while position > 0 and len(message_lines) < n:
+                    read_size = min(chunk_size, position)
+                    if read_size % 2 and read_size < position:
+                        read_size -= 1
+                    position -= read_size
+                    f.seek(position)
+                    buffer = f.read(read_size) + buffer
+
+                    text = buffer.decode('utf-16-le', errors='replace')
+                    lines = text.splitlines()
+                    if position > 0 and lines:
+                        lines = lines[1:]
+
+                    message_lines = [
+                        line.rstrip('\r\n')
+                        for line in lines
+                        if self._is_message_line(line)
+                    ]
+
+            if len(message_lines) <= n:
+                return message_lines
+            return message_lines[-n:]
 
         except (OSError, UnicodeError) as e:
             # File read error

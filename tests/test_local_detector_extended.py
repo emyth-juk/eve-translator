@@ -4,6 +4,7 @@ import tempfile
 import shutil
 import time
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from src.services.local_detector import LocalChatDetector
@@ -158,6 +159,15 @@ class TestLocalChatDetectorExtended(unittest.TestCase):
         result = self.detector.get_character_from_log("/nonexistent/path.txt")
         self.assertIsNone(result)
 
+    def test_get_character_from_log_uses_metadata_cache(self):
+        path = self._create_local_log("111", "CachedPilot")
+
+        with patch("builtins.open", wraps=open) as mock_open:
+            self.assertEqual(self.detector.get_character_from_log(path), "CachedPilot")
+            self.assertEqual(self.detector.get_character_from_log(path), "CachedPilot")
+
+        self.assertEqual(mock_open.call_count, 1)
+
     # --- extract_system_name ---
 
     def test_extract_system_name(self):
@@ -189,6 +199,17 @@ class TestLocalChatDetectorExtended(unittest.TestCase):
 
         result = self.detector.extract_system_name(path)
         self.assertEqual(result, "Amarr")
+
+    def test_extract_system_name_invalidates_cache_on_change(self):
+        path = self._create_local_log("111", "Pilot", system_name="Jita")
+
+        with patch("builtins.open", wraps=open) as mock_open:
+            self.assertEqual(self.detector.extract_system_name(path), "Jita")
+            with open(path, 'a', encoding='utf-16-le') as f:
+                f.write("\r\n[ 2025.12.01 10:00:00 ] EVE System > Channel changed to Local : Amarr")
+            self.assertEqual(self.detector.extract_system_name(path), "Amarr")
+
+        self.assertEqual(mock_open.call_count, 3)
 
     # --- scan_active_characters ---
 

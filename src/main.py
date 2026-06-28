@@ -37,7 +37,7 @@ def setup_logging():
 logger = logging.getLogger(__name__)
 
 from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu
-from PySide6.QtCore import QObject, Slot, QThread, Qt, QTimer
+from PySide6.QtCore import QObject, QCoreApplication, QFileSystemWatcher, Slot, QThread, Qt, QTimer
 from PySide6.QtGui import QIcon, QAction
 
 from src.core.session import ChatSession
@@ -57,6 +57,9 @@ from src.services.translator import TranslationService
 from src.services.local_detector import LocalChatDetector
 from src.gui.settings import SettingsDialog
 from src.version import __version__
+
+DIR_SCAN_DEBOUNCE_MS = 500
+WATCHED_DIR_FALLBACK_SECONDS = 60
 
 class TranslatorManager(QObject):
     """
@@ -145,11 +148,21 @@ class TranslatorManager(QObject):
 
         # Periodic scanner timer (check every X seconds for characters and fleets)
         # Scan interval is configurable, defaulting to 10s as per user request (legacy default was 30s)
+        self._log_dir_watch_active = False
         self.scanner_timer = QTimer()
+        self.scanner_timer.setTimerType(Qt.TimerType.CoarseTimer)
         self.scanner_timer.timeout.connect(self._periodic_scan)
+        self.scan_debounce_timer = QTimer()
+        self.scan_debounce_timer.setSingleShot(True)
+        self.scan_debounce_timer.setInterval(DIR_SCAN_DEBOUNCE_MS)
+        self.scan_debounce_timer.setTimerType(Qt.TimerType.CoarseTimer)
+        self.scan_debounce_timer.timeout.connect(self._handle_debounced_directory_scan)
+        self.log_dir_watcher = None
+        if QCoreApplication.instance() is not None:
+            self.log_dir_watcher = QFileSystemWatcher(self)
+            self.log_dir_watcher.directoryChanged.connect(self._handle_log_directory_changed)
         
-        scan_interval_ms = self.config['shared'].get('fleet_scan_interval', 10) * 1000
-        self.scanner_timer.start(scan_interval_ms)
+        self.scanner_timer.start(self._scanner_interval_ms())
 
         # Initial scan
         self._periodic_scan()
@@ -159,6 +172,7 @@ class TranslatorManager(QObject):
 
         # Validate Log Directory FIRST (before initializing sessions)
         self._ensure_log_directory()
+        self._configure_log_directory_watcher()
 
         # Initialize sessions (after log directory is confirmed valid)
         self._initialize_sessions()
@@ -167,6 +181,49 @@ class TranslatorManager(QObject):
 
     def _get_configured_log_dir(self):
         return self.config['shared'].get('log_dir', '')
+
+    def _configured_scan_interval_ms(self):
+        return max(1000, int(self.config['shared'].get('fleet_scan_interval', 10) * 1000))
+
+    def _scanner_interval_ms(self):
+        configured_ms = self._configured_scan_interval_ms()
+        if getattr(self, '_log_dir_watch_active', False):
+            return max(configured_ms, WATCHED_DIR_FALLBACK_SECONDS * 1000)
+        return configured_ms
+
+    def _restart_scanner_timer(self):
+        if hasattr(self, 'scanner_timer') and self.scanner_timer:
+            self.scanner_timer.start(self._scanner_interval_ms())
+
+    def _configure_log_directory_watcher(self):
+        self._log_dir_watch_active = False
+        watcher = getattr(self, 'log_dir_watcher', None)
+        if watcher is None:
+            self._restart_scanner_timer()
+            return False
+
+        for watched in list(watcher.directories()):
+            watcher.removePath(watched)
+
+        log_dir = self._get_configured_log_dir()
+        if log_dir and os.path.isdir(log_dir):
+            self._log_dir_watch_active = watcher.addPath(log_dir)
+
+        self._restart_scanner_timer()
+        return self._log_dir_watch_active
+
+    def _handle_log_directory_changed(self, changed_path: str):
+        if changed_path != self._get_configured_log_dir():
+            return
+        if not self.scan_debounce_timer.isActive():
+            self.scan_debounce_timer.start()
+
+    def _handle_debounced_directory_scan(self):
+        self._configure_log_directory_watcher()
+        self._periodic_scan()
+
+    def _apply_scanner_config(self):
+        self._configure_log_directory_watcher()
 
     def _ensure_log_directory(self):
         """Check if log dir is valid, if not, ask user."""
@@ -204,6 +261,8 @@ class TranslatorManager(QObject):
         # Save validated path
         self.config['shared']['log_dir'] = current_path
         self._save_config()
+        if hasattr(self, 'log_dir_watcher'):
+            self._configure_log_directory_watcher()
         logger.info(f"Using Log Directory: {current_path}")
 
     def _load_config(self) -> dict:
@@ -340,7 +399,8 @@ class TranslatorManager(QObject):
                 
                 # Apply changes to running sessions
                 self._apply_config_update()
-                
+                self._apply_scanner_config()
+
                 self._save_config()
             else:
                 # Cancelled: Restore original config
@@ -349,6 +409,7 @@ class TranslatorManager(QObject):
                 # Re-apply original config to revert any previews
                 self.worker.update_config(self.config['shared'])
                 self._apply_config_update()
+                self._apply_scanner_config()
 
         except Exception as e:
             logger.error(f"Error opening settings: {e}")
@@ -360,6 +421,7 @@ class TranslatorManager(QObject):
         self.config.update(new_config)
         # Apply visual changes to sessions immediately
         self._apply_config_update()
+        self._apply_scanner_config()
 
     def _apply_config_update(self):
         """Propagate config changes to all active sessions."""
@@ -432,6 +494,7 @@ class TranslatorManager(QObject):
 
         # Notify worker of shared config changes
         self.worker.update_config(self.config['shared'])
+        self._apply_scanner_config()
 
         # Save to disk
         self._save_config()
