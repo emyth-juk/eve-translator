@@ -29,11 +29,11 @@ jobs:
     - name: Install Dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install -r requirements.txt
+        python -m pip install -r requirements-build.txt
     
     - name: Build Executable
       run: |
-        pyinstaller --clean --noconfirm --onefile --windowed --name "EVETranslator_${{ github.ref_name }}" --icon="src\assets\icon.ico" --add-data "src/assets;src/assets" --add-data "data;data" --collect-data "langdetect" --hidden-import "PySide6" src/main.py
+        python -m PyInstaller --clean --noconfirm --onefile --windowed --name "EVETranslator_${{ github.ref_name }}" --icon="src\assets\icon.ico" --add-data "src\assets\icon.png;src\assets" --add-data "data;data" --collect-data "langdetect" --hidden-import "PySide6" src/main.py
 
 
 
