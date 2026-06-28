@@ -76,14 +76,14 @@ class TestOverlayNonUILogic(unittest.TestCase):
     def test_add_message_trims_at_100(self):
         overlay = self._make_overlay()
         # Clear welcome message
-        overlay.chat_history = []
+        overlay.clear_messages()
 
         # Add 101 messages
         for i in range(101):
             overlay.add_message(f"Msg {i}", "Player", "08:00:00", "", False)
 
         # Should trim to 100
-        self.assertLessEqual(len(overlay.chat_history), 101)
+        self.assertEqual(len(overlay.chat_history), 100)
 
     def test_clear_messages_clears_history_and_text_browser(self):
         overlay = self._make_overlay()
@@ -92,7 +92,7 @@ class TestOverlayNonUILogic(unittest.TestCase):
 
         overlay.clear_messages()
 
-        self.assertEqual(overlay.chat_history, [])
+        self.assertEqual(list(overlay.chat_history), [])
         self.assertEqual(overlay.text_browser.toPlainText(), "")
 
     def test_exit_requested_signal(self):

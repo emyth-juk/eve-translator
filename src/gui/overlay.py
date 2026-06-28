@@ -3,6 +3,7 @@ import os
 import datetime
 import re
 import html
+from collections import deque
 
 from PySide6.QtWidgets import (QMainWindow, QLabel, QVBoxLayout, QWidget, QApplication, 
                                QTextBrowser, QFrame, QMenu, QFileDialog, QMessageBox, QSizeGrip)
@@ -12,6 +13,9 @@ from PySide6.QtGui import QColor, QPalette, QFont, QCursor, QMouseEvent, QAction
 from src.gui.settings import SettingsDialog
 
 from src.version import __version__
+
+MAX_VISIBLE_MESSAGES = 100
+UI_FLUSH_INTERVAL_MS = 50
 
 class OverlayWindow(QMainWindow):
     # Signal emitted when config is saved/loaded/changed permanently
@@ -61,6 +65,8 @@ class OverlayWindow(QMainWindow):
         self.text_browser.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.text_browser.setFrameShape(QFrame.Shape.NoFrame)
         self.text_browser.setMouseTracking(True)
+        self.text_browser.document().setMaximumBlockCount(MAX_VISIBLE_MESSAGES)
+        self.text_browser.setUndoRedoEnabled(False)
         # Install event filter to capture mouse events if needed, 
         # though native resize handles most of it, we still need to set cursors manually
         # because the window is borderless.
@@ -87,7 +93,15 @@ class OverlayWindow(QMainWindow):
         }
         
         self.config = initial_config.copy() if initial_config else default_config
-        self.chat_history = []
+        self.chat_history = deque(maxlen=MAX_VISIBLE_MESSAGES)
+        self._pending_messages = []
+        self._style_state = {}
+        self._needs_full_refresh = False
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(True)
+        self._flush_timer.setInterval(UI_FLUSH_INTERVAL_MS)
+        self._flush_timer.setTimerType(Qt.TimerType.CoarseTimer)
+        self._flush_timer.timeout.connect(self._flush_pending_messages)
         # Track state of all sessions for context menu checkmarks
         self.all_session_states = {}
         # Track available characters for Local selection
@@ -117,6 +131,7 @@ class OverlayWindow(QMainWindow):
 
     def apply_config(self):
         screen_geo = QApplication.primaryScreen().availableGeometry()
+        needs_refresh = False
         
         # Apply Geometry
         x = self.config.get('x', -1)
@@ -130,21 +145,46 @@ class OverlayWindow(QMainWindow):
             x = screen_geo.width() - w - 50 - offset
             y = screen_geo.height() - h - 100 - offset
             
-        self.setGeometry(x, y, w, h)
+        new_geometry = QRect(x, y, w, h)
+        if self.geometry() != new_geometry:
+            self.setGeometry(new_geometry)
         
         # Apply visual settings
-        self.setWindowOpacity(self.config.get('opacity', 0.8))
+        opacity = self.config.get('opacity', 0.8)
+        if abs(self.windowOpacity() - opacity) > 0.001:
+            self.setWindowOpacity(opacity)
         
         bg_color = self.config.get('background_color', 'black')
         # Add subtle border to visualize edges
-        self.text_browser.setStyleSheet(f"background-color: {bg_color}; border: 1px solid #444;")
+        stylesheet = f"background-color: {bg_color}; border: 1px solid #444;"
+        if self._style_state.get('stylesheet') != stylesheet:
+            self.text_browser.setStyleSheet(stylesheet)
         
         # Apply Font
         font_size = self.config.get('font_size', 10)
-        font = QFont("Arial", font_size)
-        self.text_browser.setFont(font)
-        
-        self.refresh_ui()
+        if self._style_state.get('font_size') != font_size:
+            self.text_browser.setFont(QFont("Arial", font_size))
+            needs_refresh = True
+
+        color_state = (
+            self.config.get('color_default', '#e0e0e0'),
+            self.config.get('color_translated', '#00ffff'),
+            self.config.get('color_highlight', 'yellow'),
+        )
+        if self._style_state.get('colors') != color_state:
+            needs_refresh = True
+
+        self._style_state = {
+            'stylesheet': stylesheet,
+            'font_size': font_size,
+            'colors': color_state,
+        }
+
+        if needs_refresh:
+            if self.isVisible():
+                self.refresh_ui()
+            else:
+                self._needs_full_refresh = True
 
     def _update_config_from_geometry(self):
         geo = self.geometry()
@@ -425,15 +465,50 @@ class OverlayWindow(QMainWindow):
 
     def refresh_ui(self):
         # Rebuild full HTML from history
-        full_html = ""
-        for msg_data in self.chat_history:
-            full_html += self._format_message_html(msg_data)
+        self._pending_messages.clear()
+        if self._flush_timer.isActive():
+            self._flush_timer.stop()
+
+        full_html = "".join(self._format_message_html(msg_data) for msg_data in self.chat_history)
             
         self.text_browser.setHtml(full_html)
+        self._needs_full_refresh = False
         
         # Scroll to bottom if needed
         if self.config.get('auto_scroll', True):
             self.text_browser.moveCursor(QTextCursor.MoveOperation.End)
+
+    def _queue_message_render(self, msg_data):
+        self._pending_messages.append(msg_data)
+        if len(self._pending_messages) > MAX_VISIBLE_MESSAGES:
+            self._pending_messages = list(self.chat_history)
+        if not self._flush_timer.isActive():
+            self._flush_timer.start()
+
+    def _flush_pending_messages(self):
+        if not self._pending_messages:
+            return
+
+        if not self.isVisible():
+            self._pending_messages.clear()
+            self._needs_full_refresh = True
+            return
+
+        if self._needs_full_refresh:
+            self.refresh_ui()
+            return
+
+        pending = self._pending_messages
+        self._pending_messages = []
+        self.text_browser.setUpdatesEnabled(False)
+        try:
+            for msg_data in pending:
+                self.text_browser.append(self._format_message_html(msg_data))
+        finally:
+            self.text_browser.setUpdatesEnabled(True)
+            
+        if self.config.get('auto_scroll', True):
+             self.text_browser.moveCursor(QTextCursor.MoveOperation.End)
 
     def _format_message_html(self, msg_data):
         """Helper to format a single message dict into HTML string."""
@@ -475,26 +550,10 @@ class OverlayWindow(QMainWindow):
         
         # Optimization: Skip rendering if window is hidden
         if not self.isVisible():
+             self._needs_full_refresh = True
              return
 
-        if len(self.chat_history) > 100:
-            self.chat_history.pop(0)
-            # Full rebuild might be needed to remove first item visually, 
-            # OR we just rebuild when 100 limit hit infrequently.
-            # Efficiency: If we append, the top remains.
-            # Ideally we reload occasionally?
-            # For now, let's just append. If history is HUGE, text browser handles it.
-            # But if we really want to drop the first line from display, we need to reload.
-            # Rebuilding 100 lines is CHEAP for string ops.
-            self.refresh_ui()
-        else:
-            # Append single message
-            html_chunk = self._format_message_html(msg_data)
-            self.text_browser.append(html_chunk)
-            
-            # Auto-scroll
-            if self.config.get('auto_scroll', True):
-                 self.text_browser.moveCursor(QTextCursor.MoveOperation.End)
+        self._queue_message_render(msg_data)
 
     def update_status(self, text):
         pass
@@ -510,6 +569,10 @@ class OverlayWindow(QMainWindow):
 
     def clear_messages(self):
         """Clear all messages from the overlay."""
-        self.chat_history = []
+        self.chat_history.clear()
+        self._pending_messages.clear()
+        if self._flush_timer.isActive():
+            self._flush_timer.stop()
+        self._needs_full_refresh = False
         self.text_browser.clear()
 
