@@ -1,8 +1,11 @@
 import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtTest import QTest
 
 from src.core.character_info import CharacterInfo
 from src.core.fleet_info import FleetInfo
@@ -28,7 +31,14 @@ class TestOverlayNonUILogic(unittest.TestCase):
             'background_color': '#33001a',
         }
         overlay = OverlayWindow(session_id=session_id, initial_config=config)
+        self.addCleanup(overlay.close)
         return overlay
+
+    def _wait_for_overlay_flush(self):
+        from src.gui.overlay import UI_FLUSH_INTERVAL_MS
+
+        QTest.qWait(UI_FLUSH_INTERVAL_MS + 50)
+        QApplication.processEvents()
 
     # --- _strip_html ---
 
@@ -84,6 +94,94 @@ class TestOverlayNonUILogic(unittest.TestCase):
 
         # Should trim to 100
         self.assertEqual(len(overlay.chat_history), 100)
+
+    def test_hidden_overlay_history_remains_capped(self):
+        from src.gui.overlay import MAX_VISIBLE_MESSAGES
+
+        overlay = self._make_overlay()
+        overlay.clear_messages()
+
+        for i in range(MAX_VISIBLE_MESSAGES + 50):
+            overlay.add_message(f"Msg {i}", "Player", "08:00:00", "", False)
+
+        self.assertEqual(len(overlay.chat_history), MAX_VISIBLE_MESSAGES)
+        self.assertEqual(overlay.chat_history[0]['text'], "Msg 50")
+        self.assertTrue(overlay._needs_full_refresh)
+
+    def test_visible_overlay_document_block_count_remains_capped(self):
+        from src.gui.overlay import MAX_VISIBLE_MESSAGES
+
+        overlay = self._make_overlay()
+        overlay.show()
+        QApplication.processEvents()
+        overlay.clear_messages()
+
+        for i in range(MAX_VISIBLE_MESSAGES + 50):
+            overlay.add_message(f"Msg {i}", "Player", "08:00:00", "", False)
+
+        self._wait_for_overlay_flush()
+
+        self.assertEqual(len(overlay.chat_history), MAX_VISIBLE_MESSAGES)
+        self.assertLessEqual(overlay.text_browser.document().blockCount(), MAX_VISIBLE_MESSAGES)
+
+    def test_style_change_rebuilds_once_and_preserves_messages(self):
+        overlay = self._make_overlay()
+        overlay.show()
+        QApplication.processEvents()
+        overlay.clear_messages()
+        overlay.add_message(
+            "Move to <span style='color: yellow;'>Jita</span>",
+            "FC",
+            "08:00:00",
+            "",
+            False,
+        )
+        self._wait_for_overlay_flush()
+
+        with patch.object(overlay, "refresh_ui", wraps=overlay.refresh_ui) as refresh_spy:
+            overlay.config['color_highlight'] = '#123456'
+            overlay.apply_config()
+
+        rendered_html = overlay.text_browser.toHtml()
+        self.assertEqual(refresh_spy.call_count, 1)
+        self.assertIn("Move to", rendered_html)
+        self.assertIn("#123456", rendered_html)
+
+    def test_batched_message_flush_scrolls_once(self):
+        overlay = self._make_overlay()
+        overlay.show()
+        QApplication.processEvents()
+        overlay.clear_messages()
+
+        original_move_cursor = overlay.text_browser.moveCursor
+        overlay.text_browser.moveCursor = MagicMock(side_effect=original_move_cursor)
+
+        for i in range(10):
+            overlay.add_message(f"Msg {i}", "Player", "08:00:00", "", False)
+
+        self._wait_for_overlay_flush()
+
+        self.assertEqual(overlay.text_browser.moveCursor.call_count, 1)
+
+    def test_export_includes_bounded_current_history(self):
+        overlay = self._make_overlay()
+        overlay.clear_messages()
+        for i in range(150):
+            overlay.add_message(f"Msg {i}", "Player", "08:00:00", "", False)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            export_path = Path(temp_dir) / "overlay-export.txt"
+            with patch(
+                'src.gui.overlay.QFileDialog.getSaveFileName',
+                return_value=(str(export_path), "Text Files (*.txt)"),
+            ), patch('src.gui.overlay.QMessageBox.information'):
+                overlay.export_chat()
+
+            exported_lines = export_path.read_text(encoding='utf-8').splitlines()
+
+        self.assertEqual(len(exported_lines), 100)
+        self.assertIn("Msg 50", exported_lines[0])
+        self.assertIn("Msg 149", exported_lines[-1])
 
     def test_clear_messages_clears_history_and_text_browser(self):
         overlay = self._make_overlay()
