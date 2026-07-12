@@ -588,6 +588,31 @@ class TestSessionRuntimeState(unittest.TestCase):
 
             self.assertIsNone(mgr._find_latest_local_log())
 
+    def test_inactive_selected_character_falls_back_to_live_character(self):
+        from src.core.character_info import CharacterInfo
+
+        mgr = self._make_manager(local_enabled=True)
+        mgr.selected_character_id = 'old'
+        mgr.character_registry = {
+            'old': CharacterInfo(
+                'old', 'Sleeping Pilot', 'stale-local.txt', 1000, 'Jita', False
+            ),
+            'live': CharacterInfo(
+                'live', 'Active Pilot', 'live-local.txt', 2000, 'Amarr', True
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            mgr.config['shared']['log_dir'] = temp_dir
+
+            self.assertEqual(mgr._find_latest_local_log(), 'live-local.txt')
+
+        self.assertEqual(mgr.selected_character_id, 'live')
+        self.assertEqual(
+            mgr.config['sessions']['local']['character_name'],
+            'Active Pilot',
+        )
+
     def test_inactive_local_character_downgrades_open_overlay_to_waiting(self):
         from src.core.character_info import CharacterInfo
         from src.main import SessionRuntimeState
@@ -635,6 +660,42 @@ class TestSessionRuntimeState(unittest.TestCase):
             mgr._get_session_runtime_state('local'),
             SessionRuntimeState.ACTIVE,
         )
+
+    def test_scan_switches_running_local_from_inactive_to_live_character(self):
+        from src.core.character_info import CharacterInfo
+
+        mgr = self._make_manager(local_enabled=True)
+        mgr.config['shared']['log_dir'] = 'C:/logs'
+        mgr.sessions['local'] = MagicMock()
+        mgr.selected_character_id = 'old'
+        mgr.character_registry = {
+            'old': CharacterInfo(
+                'old', 'Sleeping Pilot', 'old.txt', 1000, 'Jita', True
+            ),
+        }
+        new_registry = {
+            'old': CharacterInfo(
+                'old', 'Sleeping Pilot', 'old.txt', 1000, 'Jita', False
+            ),
+            'live': CharacterInfo(
+                'live', 'Active Pilot', 'live.txt', 2000, 'Amarr', True
+            ),
+        }
+        mgr._switch_local_character = MagicMock()
+        mgr._broadcast_character_list = MagicMock()
+
+        with patch('src.main.os.path.exists', return_value=True), \
+                patch('src.main.LocalChatDetector') as detector_cls:
+            detector_cls.return_value.scan_active_characters.return_value = new_registry
+            mgr._scan_characters()
+
+        self.assertEqual(mgr.character_registry, new_registry)
+        self.assertEqual(mgr.selected_character_id, 'live')
+        self.assertEqual(
+            mgr.config['sessions']['local']['character_name'],
+            'Active Pilot',
+        )
+        mgr._switch_local_character.assert_called_once_with('live')
 
     def test_most_recent_active_character_is_selected_for_local(self):
         from src.core.character_info import CharacterInfo

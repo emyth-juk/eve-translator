@@ -284,15 +284,15 @@ class TranslatorManager(QObject):
         
         self.scanner_timer.start(self._scanner_interval_ms())
 
-        # Initial scan
-        self._periodic_scan()
-
         # System Tray
         self._setup_system_tray()
 
         # Validate Log Directory FIRST (before initializing sessions)
         self._ensure_log_directory()
         self._configure_log_directory_watcher()
+        # Scan only after first-run folder selection has finalized the path, so
+        # session initialization sees the current registry immediately.
+        self._periodic_scan()
         # Show provider guidance after modal log setup so the notification is
         # not hidden behind the first-run folder picker.
         self._show_provider_setup_notice()
@@ -1368,22 +1368,27 @@ class TranslatorManager(QObject):
         # Character activity is established by the periodic detector using both
         # recent writes and the presence of an open EVE client window. Historical
         # Local logs remain selectable metadata, but must not make readiness Active.
+        selected_character = None
         if self.selected_character_id:
             logger.info(f"[LOCAL] Searching log for selected CharID: {self.selected_character_id}")
-            char_info = self.character_registry.get(self.selected_character_id)
-            if char_info is not None:
-                if not char_info.is_active:
+            selected_character = self.character_registry.get(
+                self.selected_character_id
+            )
+            if selected_character is not None:
+                if not selected_character.is_active:
                     logger.info(
-                        "[LOCAL] Selected character %s is inactive; waiting for a live log",
-                        char_info.character_name,
+                        "[LOCAL] Selected character %s is inactive; checking for another active character",
+                        selected_character.character_name,
                     )
-                    return None
-
-                logger.info(f"[LOCAL] Tracking: {char_info.character_name}")
-                self.config['sessions']['local']['character_name'] = char_info.character_name
-                self.config['sessions']['local']['character_id'] = char_info.character_id
-                self.config['sessions']['local']['system_name'] = char_info.system_name
-                return char_info.latest_log_path
+                else:
+                    logger.info(
+                        f"[LOCAL] Tracking: {selected_character.character_name}"
+                    )
+                    self._get_scan_state().select_character(
+                        selected_character.character_id,
+                        self.config,
+                    )
+                    return selected_character.latest_log_path
 
         active_characters = [
             char_info
@@ -1394,11 +1399,15 @@ class TranslatorManager(QObject):
             return None
 
         char_info = max(active_characters, key=lambda item: item.log_mtime)
-        logger.info(f"[LOCAL] Auto-selected: {char_info.character_name}")
-        self.selected_character_id = char_info.character_id
-        self.config['sessions']['local']['character_id'] = char_info.character_id
-        self.config['sessions']['local']['character_name'] = char_info.character_name
-        self.config['sessions']['local']['system_name'] = char_info.system_name
+        if selected_character is not None:
+            logger.info(
+                "[LOCAL] Auto-switching from inactive %s to active %s",
+                selected_character.character_name,
+                char_info.character_name,
+            )
+        else:
+            logger.info(f"[LOCAL] Auto-selected: {char_info.character_name}")
+        self._get_scan_state().select_character(char_info.character_id, self.config)
         return char_info.latest_log_path
 
     def _periodic_scan(self):
@@ -1520,6 +1529,7 @@ class TranslatorManager(QObject):
         detector = LocalChatDetector()
         new_registry = detector.scan_active_characters(log_dir)
         restart_selected_local = False
+        fallback_character_id = None
 
         # Check if selected character's log changed
         if self.selected_character_id:
@@ -1557,12 +1567,28 @@ class TranslatorManager(QObject):
             elif self.sessions.get('local'):
                 self._set_session_runtime_state('local', SessionRuntimeState.WAITING)
 
+        selected_info = new_registry.get(self.selected_character_id)
+        active_characters = [
+            char_info for char_info in new_registry.values() if char_info.is_active
+        ]
+        if (
+            self.config['sessions']['local'].get('enabled', False)
+            and getattr(self, '_sessions_initialized', True)
+            and active_characters
+            and (selected_info is None or not selected_info.is_active)
+        ):
+            fallback = max(active_characters, key=lambda item: item.log_mtime)
+            if fallback.character_id != self.selected_character_id:
+                fallback_character_id = fallback.character_id
+
         # Update registry
         self.character_registry = new_registry
 
         # Restart after publishing the new registry so log lookup cannot reopen
         # the previous character log.
-        if restart_selected_local:
+        if fallback_character_id:
+            self.switch_local_character(fallback_character_id)
+        elif restart_selected_local:
             self._switch_local_character(self.selected_character_id)
 
         # Broadcast to overlays (for context menu)
