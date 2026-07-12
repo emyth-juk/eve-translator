@@ -615,17 +615,6 @@ class TranslationScheduler(QObject):
                     )
                     for job in jobs
                 ]
-        except TypeError:
-            # Compatibility with injected/legacy services that do not accept
-            # provider-native context yet.
-            results = [
-                self.translator_service.translate_message(
-                    job.source_text,
-                    job.target_language,
-                    source_lang=job.detected_language,
-                )
-                for job in jobs
-            ]
         except Exception as exc:
             logger.error("Unexpected scheduled translation failure: %s", type(exc).__name__)
             provider = getattr(self.translator_service, 'provider_name', '')

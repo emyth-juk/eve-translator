@@ -287,6 +287,29 @@ def test_scheduler_preserves_batch_order_and_context_scope():
     assert scheduler._context_for(other_source) is None
 
 
+def test_scheduler_reports_internal_type_error_without_retrying_or_escaping():
+    service = MagicMock()
+    service.entity_index = None
+    service.provider_name = "Broken provider"
+    service.translate_message.side_effect = TypeError("internal defect")
+    scheduler = TranslationScheduler(service)
+    emitted = []
+    scheduler.message_ready.connect(emitted.append)
+    job = TranslationJob(
+        message_id="broken", session_id="fleet", source_id="source",
+        source_text="bonjour", final_original="bonjour", sender="Pilot",
+        timestamp="12:00:00", detected_language="fr", target_language="en",
+        tokens={},
+    )
+
+    scheduler._translate_jobs([job])
+
+    service.translate_message.assert_called_once()
+    assert len(emitted) == 1
+    assert emitted[0].state == TranslationState.FAILED
+    assert emitted[0].text == "bonjour"
+
+
 def test_command_classifier_uses_visible_label_from_eve_link_controls():
     parser = MagicMock()
     parser.parse.return_value = SimpleNamespace(

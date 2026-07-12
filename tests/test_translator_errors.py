@@ -2,8 +2,16 @@
 import unittest
 import threading
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-from src.services.translator import DeepLProvider, GoogleTransProvider
+import deep_translator.google as deep_translator_google
+
+from src.services.translator import (
+    GOOGLE_CONNECT_TIMEOUT_SECONDS,
+    GOOGLE_READ_TIMEOUT_SECONDS,
+    DeepLProvider,
+    GoogleTransProvider,
+)
 
 class TestTranslatorErrors(unittest.TestCase):
 
@@ -44,6 +52,25 @@ class TestTranslatorErrors(unittest.TestCase):
             result = provider.translate("Hello", "fr")
             
             self.assertIsNone(result)
+
+    def test_google_transport_applies_connect_and_read_timeouts(self):
+        with patch('src.services.translator.GoogleTranslator') as MockGT:
+            provider = GoogleTransProvider()
+            provider._http_session.get = MagicMock(
+                return_value=SimpleNamespace(text="bonjour")
+            )
+            MockGT.return_value.translate.side_effect = (
+                lambda _text: deep_translator_google.requests.get(
+                    "https://translate.invalid"
+                ).text
+            )
+
+            assert provider.translate("Hello", "fr") == "bonjour"
+
+        provider._http_session.get.assert_called_once_with(
+            "https://translate.invalid",
+            timeout=(GOOGLE_CONNECT_TIMEOUT_SECONDS, GOOGLE_READ_TIMEOUT_SECONDS),
+        )
 
     def test_google_request_stops_blocking_after_deadline(self):
         release_request = threading.Event()

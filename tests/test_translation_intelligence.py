@@ -82,6 +82,16 @@ class BatchProvider:
         return f"single:{text}"
 
 
+class PlaceholderManglerProvider(SingleProvider):
+    def __init__(self, transform):
+        super().__init__()
+        self.transform = transform
+
+    def translate(self, text, target_lang='en', source_lang=None):
+        self.calls.append((text, target_lang, source_lang))
+        return self.transform(text)
+
+
 def test_glossary_is_selected_lazily_for_detected_source_and_target():
     factory = RecordingGlossaryFactory()
     provider = SingleProvider()
@@ -169,6 +179,66 @@ def test_entity_index_is_protected_from_provider_and_restored():
     assert "Raven Navy Issue" not in provider.calls[0][0]
     assert "__EVEENTITY_1__" in provider.calls[0][0]
     assert result == ("translated:Primary Raven Navy Issue", True, "Single")
+
+
+def test_entity_placeholder_restores_after_provider_lowercases_it():
+    provider = PlaceholderManglerProvider(str.lower)
+    entity_index = ProtectedEntityIndex([ProtectedEntity("Raven", "ship")])
+    service = TranslationService(provider=provider, entity_index=entity_index)
+
+    assert service.translate_message("Primary Raven", "fr", "en") == (
+        "primary Raven", True, "Single"
+    )
+
+
+def test_doctrine_placeholder_restores_with_spaces_around_separators():
+    class Doctrine:
+        scope = "shield@1"
+        revision = "shield@1:one"
+        protected_names = ("Night Raven",)
+
+        @staticmethod
+        def terms_for(_source, _target):
+            return {}
+
+    def add_spaces(text):
+        return text.replace(
+            "__EVEDOCTRINE_1__", "_ _  evedoctrine _ 1 _ _"
+        )
+
+    service = TranslationService(
+        provider=PlaceholderManglerProvider(add_spaces),
+        doctrine_pack=Doctrine(),
+    )
+
+    assert service.translate_message("Primary Night Raven", "fr", "en") == (
+        "Primary Night Raven", True, "Single"
+    )
+
+
+def test_missing_or_duplicated_placeholder_fails_closed_to_original():
+    entity_index = ProtectedEntityIndex([ProtectedEntity("Raven", "ship")])
+    missing = TranslationService(
+        provider=PlaceholderManglerProvider(
+            lambda text: text.replace("__EVEENTITY_1__", "")
+        ),
+        entity_index=entity_index,
+    )
+    duplicated = TranslationService(
+        provider=PlaceholderManglerProvider(
+            lambda text: text.replace(
+                "__EVEENTITY_1__", "__EVEENTITY_1__ __EVEENTITY_1__"
+            )
+        ),
+        entity_index=entity_index,
+    )
+
+    assert missing.translate_message("Primary Raven", "fr", "en") == (
+        "Primary Raven", False, "Single"
+    )
+    assert duplicated.translate_message("Primary Raven", "fr", "en") == (
+        "Primary Raven", False, "Single"
+    )
 
 
 def test_official_sde_names_canonicalize_before_yaml_ship_aliases():

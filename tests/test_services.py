@@ -1,4 +1,5 @@
 import pytest
+import threading
 from unittest.mock import MagicMock, patch
 
 from src.core.detector import LanguageDetector
@@ -174,6 +175,45 @@ def test_unavailable_provider_retries_when_same_config_is_applied():
     assert service.provider_available is True
     assert service.provider_name == 'Google'
     assert google_factory.call_count == 2
+
+
+def test_provider_status_uses_one_atomic_provider_snapshot():
+    available_started = threading.Event()
+    release_available = threading.Event()
+
+    class SlowOldProvider:
+        name = "Old"
+
+        @property
+        def available(self):
+            available_started.set()
+            release_available.wait(1.0)
+            return True
+
+        unavailable_reason = ""
+
+    new_provider = CountingProvider([])
+    new_provider.name = "Google"
+    service = TranslationService(
+        provider=SlowOldProvider(),
+        provider_factories={'google': MagicMock(return_value=new_provider)},
+    )
+    captured = []
+    reader = threading.Thread(target=lambda: captured.append(service.get_provider_status()))
+    reader.start()
+    assert available_started.wait(0.5)
+
+    service.set_provider('google')
+    release_available.set()
+    reader.join(1.0)
+
+    assert captured == [{
+        'mode': 'old',
+        'name': 'Old',
+        'available': True,
+        'reason': '',
+    }]
+    assert service.get_provider_status()['name'] == 'Google'
 
 
 def test_provider_test_is_injectable_and_does_not_change_active_provider():

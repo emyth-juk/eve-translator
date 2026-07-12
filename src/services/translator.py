@@ -7,6 +7,8 @@ from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+import requests
+import deep_translator.google as deep_translator_google
 from deep_translator import GoogleTranslator
 
 from src.app_config import (
@@ -22,6 +24,31 @@ from src.core.lexicon import LexiconTerm, LongestLexiconMatcher
 logger = logging.getLogger(__name__)
 TRANSLATION_CACHE_SIZE = 512
 PROVIDER_CALL_TIMEOUT_SECONDS = 12.0
+DEEPL_CALL_TIMEOUT_SECONDS = 90.0
+GOOGLE_CONNECT_TIMEOUT_SECONDS = 4.0
+GOOGLE_READ_TIMEOUT_SECONDS = 8.0
+
+
+class _TimeoutRequests:
+    """Minimal requests facade used by deep-translator's Google scraper.
+
+    deep-translator 1.11 does not expose a timeout and calls its module-level
+    ``requests.get`` directly. Supplying a dedicated session here keeps the
+    upstream parsing/validation behavior while enforcing real socket limits.
+    """
+
+    def __init__(self, session: requests.Session):
+        self._session = session
+
+    def get(self, url, **kwargs):
+        kwargs.setdefault(
+            "timeout",
+            (GOOGLE_CONNECT_TIMEOUT_SECONDS, GOOGLE_READ_TIMEOUT_SECONDS),
+        )
+        return self._session.get(url, **kwargs)
+
+
+_GOOGLE_TRANSPORT_LOCK = threading.Lock()
 
 
 class ProviderCallTimeout(TimeoutError):
@@ -252,6 +279,8 @@ class MockTranslator(TranslationProvider):
 class GoogleTransProvider(TranslationProvider):
     def __init__(self):
         self.translator = GoogleTranslator(source='auto', target='en')
+        self._http_session = requests.Session()
+        self._timeout_requests = _TimeoutRequests(self._http_session)
         self._call_runner = _BoundedCallRunner("google")
 
     @property
@@ -290,7 +319,16 @@ class GoogleTransProvider(TranslationProvider):
                     if normalized_source not in {'auto', 'unknown'}
                     else 'auto'
                 )
-                return self.translator.translate(text)
+                # deep-translator keeps requests as a module global. Serialize
+                # this tiny substitution so another provider instance cannot
+                # observe a half-swapped transport.
+                with _GOOGLE_TRANSPORT_LOCK:
+                    original_requests = deep_translator_google.requests
+                    deep_translator_google.requests = self._timeout_requests
+                    try:
+                        return self.translator.translate(text)
+                    finally:
+                        deep_translator_google.requests = original_requests
 
             return self._call_runner.run(request)
         except Exception as exc:
@@ -312,7 +350,12 @@ class DeepLProvider(TranslationProvider):
         import deepl
 
         self.translator = deepl.Translator(api_key)
-        self._call_runner = _BoundedCallRunner("deepl")
+        # The SDK applies bounded 10-second socket attempts plus retry backoff.
+        # Keep our outer guard beyond that documented retry envelope so it does
+        # not orphan a healthy SDK call after the old 12-second deadline.
+        self._call_runner = _BoundedCallRunner(
+            "deepl", timeout_seconds=DEEPL_CALL_TIMEOUT_SECONDS
+        )
 
     @property
     def name(self) -> str:
@@ -448,6 +491,7 @@ class TranslationService:
         if provider_factories:
             self._provider_factories.update(provider_factories)
 
+        self._provider_lock = threading.RLock()
         self.provider = provider or DisabledTranslationProvider()
         self._provider_mode = self.provider.name.lower()
         self._deepl_api_key = ""
@@ -467,22 +511,30 @@ class TranslationService:
 
     @property
     def provider_mode(self) -> str:
-        return self._provider_mode
+        with self._provider_lock:
+            return self._provider_mode
 
     @property
     def provider_name(self) -> str:
-        return self.provider.name
+        with self._provider_lock:
+            provider = self.provider
+        return provider.name
 
     @property
     def provider_available(self) -> bool:
-        return bool(getattr(self.provider, 'available', True))
+        with self._provider_lock:
+            provider = self.provider
+        return bool(getattr(provider, 'available', True))
 
     def get_provider_status(self) -> dict:
+        with self._provider_lock:
+            mode = self._provider_mode
+            provider = self.provider
         return {
-            'mode': self.provider_mode,
-            'name': self.provider_name,
-            'available': self.provider_available,
-            'reason': getattr(self.provider, 'unavailable_reason', ''),
+            'mode': mode,
+            'name': provider.name,
+            'available': bool(getattr(provider, 'available', True)),
+            'reason': getattr(provider, 'unavailable_reason', ''),
         }
 
     def set_config(self, config: dict):
@@ -522,12 +574,18 @@ class TranslationService:
             normalized_mode = TRANSLATION_PROVIDER_DISABLED
         normalized_key = _normalize_api_key(deepl_api_key)
 
+        with self._provider_lock:
+            current_mode = self._provider_mode
+            current_key = self._deepl_api_key
+            current_provider = self.provider
         key_changed = (
             normalized_mode == TRANSLATION_PROVIDER_DEEPL
-            and normalized_key != self._deepl_api_key
+            and normalized_key != current_key
         )
-        if normalized_mode == self._provider_mode and not key_changed:
-            if normalized_mode == TRANSLATION_PROVIDER_DISABLED or self.provider_available:
+        if normalized_mode == current_mode and not key_changed:
+            if normalized_mode == TRANSLATION_PROVIDER_DISABLED or bool(
+                getattr(current_provider, 'available', True)
+            ):
                 return
 
         if normalized_mode == TRANSLATION_PROVIDER_DISABLED:
@@ -557,26 +615,13 @@ class TranslationService:
                 )
 
         logger.info("Translation provider mode changed to %s", normalized_mode)
-        self.provider = provider
-        self._provider_mode = normalized_mode
-        self._deepl_api_key = (
-            normalized_key if normalized_mode == TRANSLATION_PROVIDER_DEEPL else ""
-        )
+        with self._provider_lock:
+            self.provider = provider
+            self._provider_mode = normalized_mode
+            self._deepl_api_key = (
+                normalized_key if normalized_mode == TRANSLATION_PROVIDER_DEEPL else ""
+            )
         self._clear_translation_cache()
-
-    def set_provider_from_key(self, deepl_api_key: str):
-        """Migrate the pre-v1.4 implicit provider behavior safely.
-
-        A saved DeepL key still selects DeepL. An empty key now disables cloud
-        translation instead of silently selecting Google.
-        """
-        normalized_key = _normalize_api_key(deepl_api_key)
-        provider_mode = (
-            TRANSLATION_PROVIDER_DEEPL
-            if normalized_key
-            else TRANSLATION_PROVIDER_DISABLED
-        )
-        self.set_provider(provider_mode, normalized_key)
 
     def test_provider(
         self,
@@ -1063,12 +1108,42 @@ class TranslationService:
     ) -> str | None:
         if not isinstance(translated, str) or not translated.strip():
             return None
-        if any(placeholder not in translated for placeholder in tokens):
-            logger.warning("Provider changed a protected EVE entity placeholder")
-            return None
         restored = translated
         for placeholder, original in tokens.items():
-            restored = restored.replace(placeholder, original)
+            exact_count = restored.count(placeholder)
+            if exact_count == 1:
+                restored = restored.replace(placeholder, original, 1)
+                continue
+            if exact_count > 1:
+                logger.warning("Provider duplicated a protected EVE entity placeholder")
+                return None
+
+            token_match = re.fullmatch(
+                r"(_+)(EVE(?:DOCTRINE|ENTITY))_(\d+)(_+)",
+                placeholder,
+                flags=re.IGNORECASE,
+            )
+            if token_match is None:
+                logger.warning("Provider changed a protected EVE entity placeholder")
+                return None
+            leading, family, number, trailing = token_match.groups()
+            flexible_pattern = re.compile(
+                r"(?<!_)"
+                + "".join(r"_\s*" for _ in leading)
+                + re.escape(family)
+                + r"\s*_\s*"
+                + re.escape(number)
+                + r"\s*"
+                + "".join(r"_\s*" for _ in trailing)
+                + r"(?!_)",
+                flags=re.IGNORECASE,
+            )
+            matches = list(flexible_pattern.finditer(restored))
+            if len(matches) != 1:
+                logger.warning("Provider changed a protected EVE entity placeholder")
+                return None
+            match = matches[0]
+            restored = restored[:match.start()] + original + restored[match.end():]
         return restored
 
     def _translate_via_provider(
