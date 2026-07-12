@@ -266,6 +266,58 @@ class TestFleetDetectorScanning(unittest.TestCase):
         result = FleetDetector.get_most_recent_fleet(fleets)
         self.assertEqual(result.listener_name, "SoloPilot")
 
+    def test_get_most_recent_fleet_breaks_timestamp_ties_deterministically(self):
+        lower_path = FleetInfo(
+            "lower",
+            "LowerPath",
+            "C:/logs/Fleet_a.txt",
+            2000,
+            100.0,
+            True,
+        )
+        higher_path = FleetInfo(
+            "higher",
+            "HigherPath",
+            "C:/logs/Fleet_z.txt",
+            2000,
+            100.0,
+            True,
+        )
+
+        forward = FleetDetector.get_most_recent_fleet(
+            {"lower": lower_path, "higher": higher_path}
+        )
+        reverse = FleetDetector.get_most_recent_fleet(
+            {"higher": higher_path, "lower": lower_path}
+        )
+
+        self.assertIs(forward, higher_path)
+        self.assertIs(reverse, higher_path)
+
+    def test_get_most_recent_fleet_prefers_mtime_before_path(self):
+        older_write = FleetInfo(
+            "older-write",
+            "OlderWrite",
+            "C:/logs/Fleet_z.txt",
+            1000,
+            100.0,
+            True,
+        )
+        newer_write = FleetInfo(
+            "newer-write",
+            "NewerWrite",
+            "C:/logs/Fleet_a.txt",
+            2000,
+            100.0,
+            True,
+        )
+
+        result = FleetDetector.get_most_recent_fleet(
+            {"older-write": older_write, "newer-write": newer_write}
+        )
+
+        self.assertIs(result, newer_write)
+
 
 if __name__ == '__main__':
     unittest.main()

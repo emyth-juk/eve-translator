@@ -7,6 +7,7 @@ from src.services.log_discovery import (
     EVELogEntry,
     EVE_LOG_FUTURE_MTIME_SKEW_SECONDS,
     UTF16HeaderCache,
+    log_recency_key,
     scan_eve_log_entries,
 )
 import logging
@@ -102,9 +103,17 @@ class FleetDetector:
             fleets: Dict of fleet_id -> FleetInfo
 
         Returns:
-            FleetInfo with the highest created_time, or None if empty
+            FleetInfo with the newest creation time, then modification time,
+            with a stable path tie-breaker; or None if empty.
         """
         if not fleets:
             return None
 
-        return max(fleets.values(), key=lambda f: f.created_time)
+        return max(
+            fleets.values(),
+            key=lambda fleet: log_recency_key(
+                fleet.created_time,
+                fleet.log_mtime,
+                fleet.log_path,
+            ),
+        )
