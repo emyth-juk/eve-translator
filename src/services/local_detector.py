@@ -1,12 +1,19 @@
 import os
-import glob
-import re
 import sys
 import time
+from collections.abc import Iterable
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
-from datetime import datetime
+from typing import Dict, List, Optional, Tuple
+
 from src.core.character_info import CharacterInfo
+from src.services.log_discovery import (
+    EVELogEntry,
+    EVE_LOG_FUTURE_MTIME_SKEW_SECONDS,
+    UTF16HeaderCache,
+    normalized_log_path,
+    parse_eve_log_filename,
+    scan_eve_log_entries,
+)
 import logging
 
 if sys.platform == 'win32':
@@ -23,14 +30,14 @@ class LocalChatDetector:
     """
 
     def __init__(self):
-        self._character_cache = {}
+        self._header_cache = UTF16HeaderCache()
         self._system_cache = {}
 
     def _file_cache_key(self, filepath: str):
         try:
             path = Path(filepath)
             stat = path.stat()
-            return (str(path), stat.st_size, stat.st_mtime)
+            return (str(path), stat.st_size, stat.st_mtime_ns)
         except OSError:
             return None
 
@@ -40,9 +47,10 @@ class LocalChatDetector:
         Args:
             filename: e.g., "Local_20251201_095136_1117005149.txt"
         """
-        pattern = r'Local_\d{8}_\d{6}_(\d+)\.txt$'
-        match = re.search(pattern, filename)
-        return match.group(1) if match else None
+        parsed = parse_eve_log_filename(filename)
+        if parsed is None or parsed.channel_name.casefold() != "local":
+            return None
+        return parsed.character_id
 
     def extract_system_name(self, filepath: str) -> Optional[str]:
         """
@@ -50,7 +58,16 @@ class LocalChatDetector:
         Scans values to find the LATEST system change (not just the first).
         "EVE System > Channel changed to Local : <SYSTEM_NAME>"
         """
-        cache_key = self._file_cache_key(filepath)
+        return self._extract_system_name(
+            filepath,
+            self._file_cache_key(filepath),
+        )
+
+    def _extract_system_name(
+        self,
+        filepath: str,
+        cache_key: tuple[str, int, int] | None,
+    ) -> Optional[str]:
         if cache_key in self._system_cache:
             return self._system_cache[cache_key]
 
@@ -107,42 +124,62 @@ class LocalChatDetector:
         
         return found
 
-    def scan_active_characters(self, log_dir: str) -> Dict[str, CharacterInfo]:
+    def scan_active_characters(
+        self,
+        log_dir: str,
+        *,
+        entries: Iterable[EVELogEntry] | None = None,
+    ) -> Dict[str, CharacterInfo]:
         """
         Scan all Local chat logs and group by character.
         Returns:
             Dict mapping CharacterID -> CharacterInfo
             Only includes the LATEST log per character.
         """
-        character_logs = {}  # CharID -> list of (path, mtime)
-
-        try:
-            with os.scandir(log_dir) as entries:
-                for entry in entries:
-                    if entry.is_file() and entry.name.startswith("Local_") and entry.name.endswith(".txt"):
-                        char_id = self.parse_character_id_from_filename(entry.name)
-                        if char_id:
-                            try:
-                                mtime = entry.stat().st_mtime
-                                if char_id not in character_logs:
-                                    character_logs[char_id] = []
-                                character_logs[char_id].append((entry.path, mtime))
-                            except OSError:
-                                continue
-        except OSError:
-            return {}
+        character_logs: dict[str, list[EVELogEntry]] = {}
+        snapshot = entries if entries is not None else scan_eve_log_entries(log_dir)
+        for entry in snapshot:
+            if not (
+                entry.name.startswith("Local_")
+                and entry.name.endswith(".txt")
+            ):
+                continue
+            parsed = entry.filename
+            if (
+                parsed is None
+                or parsed.channel_name.casefold() != "local"
+                or parsed.character_id is None
+            ):
+                continue
+            character_logs.setdefault(parsed.character_id, []).append(entry)
 
         # For each character, get latest log and extract info
         result = {}
         for char_id, logs in character_logs.items():
-            # Sort by mtime, get most recent
-            logs.sort(key=lambda x: x[1], reverse=True)
-            latest_path, latest_mtime = logs[0]
+            # Preserve Local's mtime-first rotation behavior while making ties
+            # deterministic across filesystem enumeration orders.
+            logs.sort(
+                key=lambda item: (
+                    item.mtime,
+                    item.filename.started_time if item.filename else 0.0,
+                    normalized_log_path(item.path),
+                    item.path,
+                ),
+                reverse=True,
+            )
+            latest = logs[0]
 
             # Extract character name from log header (try latest, then older logs)
             char_name = None
-            for path, _ in logs:
-                char_name = self.get_character_from_log(path)
+            for entry in logs:
+                header = self._header_cache.read(
+                    entry.path,
+                    entry.size,
+                    entry.mtime_ns,
+                )
+                char_name = (
+                    header.listener_name if header is not None else ""
+                )
                 if char_name:
                     break
             
@@ -150,10 +187,16 @@ class LocalChatDetector:
                 char_name = f"Character_{char_id}"  # Fallback
 
             # Extract system name from first message
-            system_name = self.extract_system_name(latest_path)
+            system_name = self._extract_system_name(
+                latest.path,
+                (latest.path, latest.size, latest.mtime_ns),
+            )
 
             # Check if active (modified within last 5 minutes OR Window Open)
-            is_active_log = (time.time() - latest_mtime) < 300
+            log_age = time.time() - latest.mtime
+            is_active_log = (
+                -EVE_LOG_FUTURE_MTIME_SKEW_SECONDS <= log_age <= 300
+            )
             is_window_open = self.is_character_window_open(char_name)
             
             is_active = is_active_log or is_window_open
@@ -161,8 +204,8 @@ class LocalChatDetector:
             result[char_id] = CharacterInfo(
                 character_id=char_id,
                 character_name=char_name,
-                latest_log_path=latest_path,
-                log_mtime=latest_mtime,
+                latest_log_path=latest.path,
+                log_mtime=latest.mtime,
                 system_name=system_name,
                 is_active=is_active
             )
@@ -242,24 +285,5 @@ class LocalChatDetector:
         Parse character name from log header.
         Reads first ~15 lines looking for "Listener: <CharacterName>".
         """
-        cache_key = self._file_cache_key(filepath)
-        if cache_key in self._character_cache:
-            return self._character_cache[cache_key]
-
-        character_name = None
-        try:
-            with open(filepath, 'r', encoding='utf-16-le', errors='replace') as f:
-                for _ in range(15):
-                    line = f.readline()
-                    if not line:
-                        break
-                    if 'Listener:' in line:
-                        parts = line.split('Listener:')
-                        if len(parts) > 1:
-                            character_name = parts[1].strip()
-                            break
-        except (OSError, UnicodeError):
-            pass
-        if cache_key is not None:
-            self._character_cache[cache_key] = character_name
-        return character_name
+        header = self._header_cache.read(filepath)
+        return (header.listener_name or None) if header is not None else None

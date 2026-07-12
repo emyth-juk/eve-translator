@@ -3,6 +3,11 @@ from unittest.mock import MagicMock, patch
 import os
 import time
 from src.services.local_detector import LocalChatDetector
+from src.services.log_discovery import (
+    EVELogEntry,
+    EVELogHeader,
+    parse_eve_log_filename,
+)
 
 class TestLocalChatDetector(unittest.TestCase):
     def setUp(self):
@@ -27,39 +32,58 @@ class TestLocalChatDetector(unittest.TestCase):
 
     # test_scan_active_characters removed as it was incomplete and covered by _robust version.
         
-    @patch('src.services.local_detector.os.scandir')
-    @patch('src.services.local_detector.LocalChatDetector.get_character_from_log')
-    @patch('src.services.local_detector.LocalChatDetector.extract_system_name')
-    def test_scan_active_characters_robust(self, mock_extract_system, mock_get_char, mock_scandir):
+    @patch('src.services.local_detector.LocalChatDetector._extract_system_name')
+    def test_scan_active_characters_robust(self, mock_extract_system):
         # Scenario: 
         # Char123: Latest log (Old MTime, No Name) -> Older log (Old MTime, Name="CharC") -> Window Open ("EVE - CharC") -> Active?
         
         # Latest Log (Old, Missing Name)
-        entry1 = MagicMock()
-        entry1.is_file.return_value = True
-        entry1.name = "Local_20250101_100000_123.txt"
-        entry1.path = "/logs/Local_123_Latest.txt"
-        entry1.stat.return_value.st_mtime = time.time() - 3600 # 1 hour ago
+        latest_name = "Local_20250101_100000_123.txt"
+        entry1 = EVELogEntry(
+            name=latest_name,
+            path="/logs/Local_123_Latest.txt",
+            size=100,
+            mtime=time.time() - 3600,
+            mtime_ns=100,
+            ctime=0,
+            filename=parse_eve_log_filename(latest_name),
+        )
         
         # Older Log (Old, Has Name)
-        entry2 = MagicMock()
-        entry2.is_file.return_value = True
-        entry2.name = "Local_20250101_090000_123.txt"
-        entry2.path = "/logs/Local_123_Older.txt"
-        entry2.stat.return_value.st_mtime = time.time() - 7200
-        
-        mock_scandir.return_value.__enter__.return_value = [entry1, entry2]
-        
-        def get_char_side_effect(path):
+        older_name = "Local_20250101_090000_123.txt"
+        entry2 = EVELogEntry(
+            name=older_name,
+            path="/logs/Local_123_Older.txt",
+            size=100,
+            mtime=time.time() - 7200,
+            mtime_ns=200,
+            ctime=0,
+            filename=parse_eve_log_filename(older_name),
+        )
+
+        def header_side_effect(path, _size, _mtime_ns):
             if "Latest" in path: return None
-            if "Older" in path: return "CharC"
+            if "Older" in path: return EVELogHeader(listener_name="CharC")
             return None
-        mock_get_char.side_effect = get_char_side_effect
         mock_extract_system.return_value = "Jita"
-        
-        # Mock Window detection to succeed only for "CharC"
-        with patch.object(self.detector, 'is_character_window_open', side_effect=lambda name: name == "CharC"):
-            registry = self.detector.scan_active_characters("/logs")
+
+        # Mock Window detection to succeed only for "CharC".
+        with (
+            patch.object(
+                self.detector._header_cache,
+                'read',
+                side_effect=header_side_effect,
+            ),
+            patch.object(
+                self.detector,
+                'is_character_window_open',
+                side_effect=lambda name: name == "CharC",
+            ),
+        ):
+            registry = self.detector.scan_active_characters(
+                "/logs",
+                entries=(entry1, entry2),
+            )
             
             self.assertIn("123", registry)
             char_info = registry["123"]
@@ -69,6 +93,51 @@ class TestLocalChatDetector(unittest.TestCase):
             
             # Verify active because window found for "CharC"
             self.assertTrue(char_info.is_active)
+
+    def test_scan_allows_small_clock_skew_but_rejects_far_future_mtime(self):
+        now = 1_750_000_000.0
+
+        def make_entry(char_id, mtime):
+            name = f"Local_20250101_100000_{char_id}.txt"
+            return EVELogEntry(
+                name=name,
+                path=f"/logs/{name}",
+                size=100,
+                mtime=mtime,
+                mtime_ns=int(mtime * 1_000_000_000),
+                ctime=0,
+                filename=parse_eve_log_filename(name),
+            )
+
+        entries = (
+            make_entry("1", now + 1.5),
+            make_entry("2", now + 3600),
+        )
+        with (
+            patch.object(
+                self.detector._header_cache,
+                "read",
+                return_value=EVELogHeader(listener_name="Pilot"),
+            ),
+            patch.object(
+                self.detector,
+                "_extract_system_name",
+                return_value=None,
+            ),
+            patch.object(
+                self.detector,
+                "is_character_window_open",
+                return_value=False,
+            ),
+            patch("src.services.local_detector.time.time", return_value=now),
+        ):
+            result = self.detector.scan_active_characters(
+                "/logs",
+                entries=entries,
+            )
+
+        self.assertTrue(result["1"].is_active)
+        self.assertFalse(result["2"].is_active)
 
     @patch('src.services.local_detector.os.scandir')
     def test_get_latest_log_for_character(self, mock_scandir):

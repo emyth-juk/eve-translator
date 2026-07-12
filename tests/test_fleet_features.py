@@ -2,7 +2,7 @@
 import unittest
 from unittest.mock import MagicMock, patch, PropertyMock
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from src.core.fleet_info import FleetInfo
@@ -62,7 +62,7 @@ class TestFleetFeatures(unittest.TestCase):
         ts = self.detector.parse_timestamp_from_filename(filename)
         self.assertIsNotNone(ts)
         
-        dt = datetime.fromtimestamp(ts)
+        dt = datetime.fromtimestamp(ts, timezone.utc)
         self.assertEqual(dt.year, 2025)
         self.assertEqual(dt.month, 12)
         self.assertEqual(dt.day, 16)

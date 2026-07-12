@@ -5,7 +5,7 @@ import time
 import unittest
 from unittest.mock import patch
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 from src.services.fleet_detector import FleetDetector
 from src.core.fleet_info import FleetInfo
@@ -83,7 +83,7 @@ class TestFleetDetectorParsing(unittest.TestCase):
     def test_parse_timestamp_standard_filename(self):
         ts = self.detector.parse_timestamp_from_filename("Fleet_20251216_082457.txt")
         self.assertIsNotNone(ts)
-        dt = datetime.fromtimestamp(ts)
+        dt = datetime.fromtimestamp(ts, timezone.utc)
         self.assertEqual(dt.year, 2025)
         self.assertEqual(dt.month, 12)
         self.assertEqual(dt.day, 16)
@@ -197,6 +197,27 @@ class TestFleetDetectorScanning(unittest.TestCase):
         # Tight threshold (60s) should exclude it
         result = self.detector.scan_active_fleets(self.test_dir, active_threshold_seconds=60)
         self.assertEqual(len(result), 0)
+
+    def test_scan_allows_small_clock_skew_but_rejects_far_future_mtime(self):
+        now = time.time()
+        self._create_fleet_log(
+            "Fleet_20251216_082457.txt",
+            "SmallSkew",
+            touch_time=now + 1.5,
+        )
+        self._create_fleet_log(
+            "Fleet_20251216_092457.txt",
+            "FarFuture",
+            touch_time=now + 3600,
+        )
+
+        with patch("src.services.fleet_detector.time.time", return_value=now):
+            result = self.detector.scan_active_fleets(self.test_dir)
+
+        self.assertEqual(
+            {fleet.listener_name for fleet in result.values()},
+            {"SmallSkew"},
+        )
 
     def test_scan_fleet_info_fields(self):
         """Verify all FleetInfo fields are populated correctly."""

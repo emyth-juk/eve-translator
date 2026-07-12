@@ -1,10 +1,15 @@
-import os
-import re
 import time
-from pathlib import Path
-from typing import Optional, Dict
-from datetime import datetime
+from collections.abc import Iterable
+from typing import Dict, Optional
+
 from src.core.fleet_info import FleetInfo
+from src.services.log_discovery import (
+    EVELogEntry,
+    EVE_LOG_FUTURE_MTIME_SKEW_SECONDS,
+    UTF16HeaderCache,
+    parse_eve_log_filename,
+    scan_eve_log_entries,
+)
 import logging
 
 logger = logging.getLogger(__name__)
@@ -17,15 +22,7 @@ class FleetDetector:
     """
 
     def __init__(self):
-        self._listener_cache = {}
-
-    def _file_cache_key(self, filepath: str):
-        try:
-            path = Path(filepath)
-            stat = path.stat()
-            return (str(path), stat.st_size, stat.st_mtime)
-        except OSError:
-            return None
+        self._header_cache = UTF16HeaderCache()
 
     def parse_listener_from_log(self, filepath: str) -> Optional[str]:
         """
@@ -38,28 +35,8 @@ class FleetDetector:
         Returns:
             Character name or None if not found
         """
-        cache_key = self._file_cache_key(filepath)
-        if cache_key in self._listener_cache:
-            return self._listener_cache[cache_key]
-
-        listener = None
-        try:
-            with open(filepath, 'r', encoding='utf-16-le', errors='replace') as f:
-                for _ in range(15):
-                    line = f.readline()
-                    if not line:
-                        break
-                    if 'Listener:' in line:
-                        parts = line.split('Listener:')
-                        if len(parts) > 1:
-                            listener = parts[1].strip()
-                            break
-        except (OSError, UnicodeError):
-            pass
-
-        if cache_key is not None:
-            self._listener_cache[cache_key] = listener
-        return listener
+        header = self._header_cache.read(filepath)
+        return (header.listener_name or None) if header is not None else None
 
     def parse_timestamp_from_filename(self, filename: str) -> Optional[float]:
         """
@@ -71,20 +48,18 @@ class FleetDetector:
         Returns:
             Unix timestamp or None if parsing fails
         """
-        # Pattern: Fleet_YYYYMMDD_HHMMSS[_CharID].txt
-        pattern = r'Fleet_(\d{8})_(\d{6})(?:_\d+)?\.txt$'
-        match = re.search(pattern, filename)
-        if match:
-            date_str = match.group(1)  # YYYYMMDD
-            time_str = match.group(2)  # HHMMSS
-            try:
-                dt = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
-                return dt.timestamp()
-            except ValueError:
-                pass
+        parsed = parse_eve_log_filename(filename)
+        if parsed is not None and parsed.channel_name.casefold() == "fleet":
+            return parsed.started_time
         return None
 
-    def scan_active_fleets(self, log_dir: str, active_threshold_seconds: int = 1800) -> Dict[str, FleetInfo]:
+    def scan_active_fleets(
+        self,
+        log_dir: str,
+        active_threshold_seconds: int = 1800,
+        *,
+        entries: Iterable[EVELogEntry] | None = None,
+    ) -> Dict[str, FleetInfo]:
         """
         Scan all Fleet chat logs and return active ones.
 
@@ -98,49 +73,51 @@ class FleetDetector:
         """
         result = {}
         current_time = time.time()
+        snapshot = entries if entries is not None else scan_eve_log_entries(log_dir)
+        for entry in snapshot:
+            if not (
+                entry.name.startswith("Fleet_")
+                and entry.name.endswith(".txt")
+            ):
+                continue
 
-        try:
-            with os.scandir(log_dir) as entries:
-                for entry in entries:
-                    if entry.is_file() and entry.name.startswith("Fleet_") and entry.name.endswith(".txt"):
-                        try:
-                            mtime = entry.stat().st_mtime
+            # Check if active (modified within threshold).
+            age_seconds = current_time - entry.mtime
+            if (
+                age_seconds < -EVE_LOG_FUTURE_MTIME_SKEW_SECONDS
+                or age_seconds > active_threshold_seconds
+            ):
+                continue
 
-                            # Check if active (modified within threshold)
-                            age_seconds = current_time - mtime
-                            if age_seconds > active_threshold_seconds:
-                                continue  # Skip inactive logs
+            header = self._header_cache.read(
+                entry.path,
+                entry.size,
+                entry.mtime_ns,
+            )
+            listener_name = (
+                header.listener_name if header is not None else ""
+            )
+            if not listener_name:
+                logger.debug("Could not parse listener from %s", entry.name)
+                continue
 
-                            # Parse listener name from log header
-                            listener_name = self.parse_listener_from_log(entry.path)
-                            if not listener_name:
-                                logger.debug(f"Could not parse listener from {entry.name}")
-                                continue
+            parsed = entry.filename
+            created_time = (
+                parsed.started_time
+                if parsed is not None
+                and parsed.channel_name.casefold() == "fleet"
+                else entry.ctime
+            )
 
-                            # Parse creation time from filename
-                            created_time = self.parse_timestamp_from_filename(entry.name)
-                            if not created_time:
-                                # Fallback to file ctime
-                                created_time = entry.stat().st_ctime
-
-                            # Use log path as unique ID
-                            fleet_id = entry.path
-
-                            result[fleet_id] = FleetInfo(
-                                fleet_id=fleet_id,
-                                listener_name=listener_name,
-                                log_path=entry.path,
-                                log_mtime=mtime,
-                                created_time=created_time,
-                                is_active=True
-                            )
-
-                        except OSError as e:
-                            logger.debug(f"Error processing {entry.name}: {e}")
-                            continue
-        except OSError as e:
-            logger.error(f"Error scanning fleet logs: {e}")
-            return {}
+            # Use log path as unique ID.
+            result[entry.path] = FleetInfo(
+                fleet_id=entry.path,
+                listener_name=listener_name,
+                log_path=entry.path,
+                log_mtime=entry.mtime,
+                created_time=created_time,
+                is_active=True,
+            )
 
         return result
 
