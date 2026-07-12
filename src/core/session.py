@@ -261,7 +261,7 @@ class ChatSession(QObject):
         self._start_log_watcher()
         if self.is_running:
             self.poll_timer.start(self._poll_interval_ms())
-            self._poll_log()
+            self._poll_log(trigger="watcher")
 
     def update_session_states(self, states: dict):
         """Pass enabled states to overlay."""
@@ -270,13 +270,27 @@ class ChatSession(QObject):
             simple_states = {k: v.get('enabled', False) for k, v in states.items()}
             self.overlay.update_session_states(simple_states)
 
-    def _poll_log(self):
+    def _poll_log(self, trigger="timer"):
         """Internal: Poll log file for new lines."""
         if not self.tailer:
             return
 
         new_lines = self.tailer.read_new_lines()
         if new_lines:
+            try:
+                file_age_ms = max(
+                    0.0,
+                    (time.time() - self.log_path.stat().st_mtime) * 1000,
+                )
+            except OSError:
+                file_age_ms = -1.0
+            logger.info(
+                "[%s] Read %s new chat line(s) via %s (file age %.0f ms)",
+                self.session_id,
+                len(new_lines),
+                trigger,
+                file_age_ms,
+            )
             # Emit to worker with session_id
             self.lines_ready.emit(self.session_id, self.source_id, new_lines)
 

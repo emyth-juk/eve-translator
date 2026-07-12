@@ -68,13 +68,25 @@ class FleetLogTailer:
             # File might have been locked or deleted momentarily
             return []
 
-        # Read new lines
+        # Read only complete lines. EVE can flush a UTF-16 message body before
+        # its trailing CRLF; advancing past that partial record would make the
+        # parser discard it permanently on the next poll.
         try:
             self.file_handle.seek(self.last_position)
-            lines = self.file_handle.readlines()
+            lines = []
+            while True:
+                line_start = self.file_handle.tell()
+                line = self.file_handle.readline()
+                if not line:
+                    break
+                if not line.endswith('\n'):
+                    self.file_handle.seek(line_start)
+                    break
+                stripped = line.rstrip('\r\n')
+                if stripped:
+                    lines.append(stripped)
             self.last_position = self.file_handle.tell()
-            # rstrip to remove newline characters, but keep indentation if any
-            return [line.rstrip('\r\n') for line in lines]
+            return lines
         except (UnicodeError, OSError):
             # Encoding or IO error, potentially due to partial write
             return []

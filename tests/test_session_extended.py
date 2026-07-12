@@ -318,7 +318,7 @@ class TestSessionConfigUpdate(unittest.TestCase):
         session._handle_debounced_file_change()
 
         session._start_log_watcher.assert_called_once()
-        session._poll_log.assert_called_once()
+        session._poll_log.assert_called_once_with(trigger="watcher")
 
 
 if __name__ == '__main__':

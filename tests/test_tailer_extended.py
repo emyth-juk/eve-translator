@@ -32,7 +32,7 @@ class TestFleetLogTailer(unittest.TestCase):
                 "[ 2025.12.16 08:25:00 ] Player1 > Hello fleet",
                 "[ 2025.12.16 08:25:05 ] Player2 > o7",
             ]
-        content = "\r\n".join(lines)
+        content = "\r\n".join(lines) + "\r\n"
         with open(path, 'w', encoding='utf-16-le') as f:
             f.write(content)
         return path
@@ -86,10 +86,32 @@ class TestFleetLogTailer(unittest.TestCase):
 
         # Append new content
         with open(path, 'a', encoding='utf-16-le') as f:
-            f.write("\r\n[ 2025.12.16 08:26:00 ] Player3 > New message")
+            f.write("[ 2025.12.16 08:26:00 ] Player3 > New message\r\n")
 
         lines = tailer.read_new_lines()
         self.assertTrue(any("New message" in line for line in lines))
+        tailer.close()
+
+    def test_read_new_lines_waits_for_partial_utf16_record(self):
+        path = self._create_log()
+        tailer = FleetLogTailer(path)
+        tailer.seek_to_end()
+        initial_position = tailer.last_position
+
+        with open(path, 'a', encoding='utf-16-le') as f:
+            f.write("[ 2025.12.16 08:26:00 ] Player3 > Align to")
+            f.flush()
+
+        self.assertEqual(tailer.read_new_lines(), [])
+        self.assertEqual(tailer.last_position, initial_position)
+
+        with open(path, 'a', encoding='utf-16-le') as f:
+            f.write(" the gate\r\n")
+
+        self.assertEqual(
+            tailer.read_new_lines(),
+            ["[ 2025.12.16 08:26:00 ] Player3 > Align to the gate"],
+        )
         tailer.close()
 
     def test_read_new_lines_empty_when_no_new_content(self):
@@ -229,7 +251,7 @@ class TestFleetLogTailer(unittest.TestCase):
 
         # Simulate new message arriving
         with open(path, 'a', encoding='utf-16-le') as f:
-            f.write("\r\n[ 2025.12.16 09:00:00 ] FC > Align to gate")
+            f.write("[ 2025.12.16 09:00:00 ] FC > Align to gate\r\n")
 
         lines = tailer.read_new_lines()
         self.assertTrue(len(lines) >= 1)
@@ -237,7 +259,7 @@ class TestFleetLogTailer(unittest.TestCase):
 
         # Another message
         with open(path, 'a', encoding='utf-16-le') as f:
-            f.write("\r\n[ 2025.12.16 09:00:05 ] FC > Jump jump jump")
+            f.write("[ 2025.12.16 09:00:05 ] FC > Jump jump jump\r\n")
 
         lines = tailer.read_new_lines()
         self.assertTrue(any("Jump jump jump" in l for l in lines))

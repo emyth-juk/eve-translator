@@ -268,7 +268,10 @@ class SettingsDialog(QDialog):
         self.spin_poll.setSuffix(" sec")
         self.spin_poll.valueChanged.connect(self._notify_change)
         
-        lbl_hint = QLabel("Setting this to 2.0s might improve performance.")
+        lbl_hint = QLabel(
+            "Lower values reduce worst-case HUD delay; 1.0s is balanced. "
+            "File watching may deliver lines sooner."
+        )
         lbl_hint.setStyleSheet("color: gray; font-style: italic;")
         
         form_perf.addRow("Log Poll Interval:", self.spin_poll)
