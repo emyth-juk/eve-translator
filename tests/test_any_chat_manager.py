@@ -6,6 +6,7 @@ from src.app_config import get_default_config
 from src.core.channel_info import ChatChannelInfo
 from src.core.character_info import CharacterInfo
 from src.main import SessionRuntimeState, TranslatorManager
+from src.services.log_discovery import parse_eve_log_filename
 from src.services.scan_state import ChatScanState
 
 
@@ -173,15 +174,19 @@ def test_sync_scan_passes_known_inactive_characters_explicitly(tmp_path):
         ),
     }
     detector = MagicMock()
-    detector.parse_filename.return_value = ("Local", "1", 1000.0)
     detector.scan_channels.return_value = {}
     manager.any_chat_detector = detector
 
     manager._scan_channels()
 
+    parsed = parse_eve_log_filename("Local_20260712_120000_1.txt")
+    assert parsed is not None
     detector.scan_channels.assert_called_once_with(
         str(tmp_path),
-        active_characters={"active": 1000.0, "inactive": False},
+        active_characters={
+            "active": parsed.started_time,
+            "inactive": False,
+        },
     )
 
 
