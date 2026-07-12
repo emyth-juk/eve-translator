@@ -1,8 +1,8 @@
 -r requirements.txt
 
-pytest==9.0.2
-pytest-cov==7.0.0
+pytest==9.1.1
+pytest-cov==7.1.0
 pytest-qt==4.5.0
-ruff==0.15.5
-pyinstaller==6.17.0
-pillow==12.0.0
+ruff==0.15.21
+pyinstaller==6.21.0
+pillow==12.3.0

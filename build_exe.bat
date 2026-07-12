@@ -11,16 +11,27 @@ if not defined VERSION (
 
 echo Building EVE Fleet Chat Translator v%VERSION%...
 
+python -m pip install --upgrade pip==26.1.2 || exit /b 1
 python -m pip install -r requirements-build.txt || exit /b 1
 python -m PyInstaller --clean --noconfirm --onefile --windowed ^
   --name "EVETranslator_v%VERSION%" ^
   --icon "src\assets\icon.ico" ^
   --version-file "packaging\windows_version_info.txt" ^
+  --additional-hooks-dir "packaging\hooks" ^
   --add-data "src\assets\icon.png;src\assets" ^
   --add-data "data;data" ^
   --collect-data "langdetect" ^
   --hidden-import "PySide6" ^
+  --exclude-module "PySide6.QtNetwork" ^
+  --exclude-module "setuptools" ^
+  --exclude-module "packaging" ^
+  --exclude-module "wheel" ^
+  --exclude-module "typing_extensions" ^
   src\main.py || exit /b 1
 
-echo Build Complete. Check dist\EVETranslator_v%VERSION%.exe
+python scripts\package_windows_release.py ^
+  --executable "dist\EVETranslator_v%VERSION%.exe" ^
+  --version "%VERSION%" || exit /b 1
+
+echo Build Complete. Release: dist\EVETranslator_v%VERSION%_windows_x64.zip
 pause
