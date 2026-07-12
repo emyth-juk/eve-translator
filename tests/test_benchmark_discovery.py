@@ -1,11 +1,17 @@
 import io
 import os
+from datetime import datetime, timezone
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
 from scripts import benchmark_discovery as benchmark
-from src.services.chat_discovery import ChatDiscoveryError, ChatDiscoveryResult
+from src.services.chat_discovery import (
+    ChatDiscoveryError,
+    ChatDiscoveryResult,
+    ChatDiscoveryWorker,
+)
 
 
 class _FakeSignal:
@@ -51,6 +57,34 @@ def _successful_result(generation, log_dir):
 def _clock(*values):
     iterator = iter(values)
     return lambda: next(iterator)
+
+
+def _write_eve_log(
+    directory,
+    filename,
+    *,
+    channel_id,
+    channel_name,
+    listener,
+    started,
+    messages=(),
+):
+    path = directory / filename
+    path.write_text(
+        "\r\n".join(
+            [
+                "",
+                f"Channel ID:      {channel_id}",
+                f"Channel Name:    {channel_name}",
+                f"Listener:        {listener}",
+                f"Session started: {started}",
+                "",
+                *messages,
+            ]
+        ),
+        encoding="utf-16",
+    )
+    return path
 
 
 def test_run_benchmark_reuses_worker_and_reports_timings_and_counts(tmp_path):
@@ -126,3 +160,82 @@ def test_cli_rejects_missing_log_directory(tmp_path):
 
     assert exit_code == 2
     assert "chat log directory does not exist" in stderr.getvalue()
+
+
+def test_real_worker_warm_scan_reuses_all_unchanged_header_caches(tmp_path):
+    now = datetime.now(timezone.utc)
+    compact_started = now.strftime("%Y%m%d_%H%M%S")
+    header_started = now.strftime("%Y.%m.%d %H:%M:%S")
+    character_id = "2112345678"
+    listener = "Benchmark Pilot"
+    local_path = _write_eve_log(
+        tmp_path,
+        f"Local_{compact_started}_{character_id}.txt",
+        channel_id="(None)",
+        channel_name="Local",
+        listener=listener,
+        started=header_started,
+        messages=(
+            f"[ {header_started} ] EVE System > Channel changed to Local : Jita",
+            f"[ {header_started} ] {listener} > clear on undock",
+        ),
+    )
+    custom_path = _write_eve_log(
+        tmp_path,
+        f"Alliance_Intel_{compact_started}_{character_id}.txt",
+        channel_id="player_alliance_intel",
+        channel_name="Alliance Intel",
+        listener=listener,
+        started=header_started,
+        messages=(f"[ {header_started} ] Scout One > hostile in M-O",),
+    )
+    fleet_path = _write_eve_log(
+        tmp_path,
+        f"Fleet_{compact_started}.txt",
+        channel_id="(None)",
+        channel_name="Fleet",
+        listener=listener,
+        started=header_started,
+        messages=(f"[ {header_started} ] FC > align sun",),
+    )
+
+    worker = ChatDiscoveryWorker()
+    # Avoid making this filesystem/cache integration test depend on the
+    # developer machine having a matching EVE window open.
+    worker.local_detector.is_character_window_open = lambda _name: False
+    results = []
+    worker.result_ready.connect(results.append)
+
+    with patch("builtins.open", wraps=open) as cold_open:
+        worker.scan(1, str(tmp_path), 1_800)
+
+    assert cold_open.call_count >= 4
+    assert len(results) == 1
+    cold = results[0]
+    assert cold.succeeded, cold.error
+    assert set(cold.character_registry) == {character_id}
+    assert cold.character_registry[character_id].latest_log_path == str(local_path)
+    assert cold.character_registry[character_id].system_name == "Jita"
+    assert cold.character_registry[character_id].is_active is True
+    assert len(cold.channel_registry) == 1
+    cold_channel = next(iter(cold.channel_registry.values()))
+    assert cold_channel.log_path == str(custom_path)
+    assert cold_channel.is_active is True
+    assert len(cold.fleet_registry) == 1
+    cold_fleet = next(iter(cold.fleet_registry.values()))
+    assert cold_fleet.log_path == str(fleet_path)
+    assert cold_fleet.is_active is True
+
+    with patch(
+        "builtins.open",
+        side_effect=AssertionError("warm discovery reopened an unchanged log"),
+    ) as forbidden_open:
+        worker.scan(2, str(tmp_path), 1_800)
+
+    forbidden_open.assert_not_called()
+    assert len(results) == 2
+    warm = results[1]
+    assert warm.succeeded, warm.error
+    assert dict(warm.character_registry) == dict(cold.character_registry)
+    assert dict(warm.channel_registry) == dict(cold.channel_registry)
+    assert dict(warm.fleet_registry) == dict(cold.fleet_registry)
