@@ -81,6 +81,10 @@ from src.services.hotkeys import (
     LOCK_HOTKEY_ID,
     WindowsGlobalHotkey,
 )
+from src.services.single_instance import (
+    SingleInstanceGuard,
+    show_already_running_message,
+)
 from src.services.local_detector import LocalChatDetector
 from src.services.channel_detector import AnyChatDetector
 from src.services.chat_discovery import (
@@ -206,6 +210,7 @@ class TranslatorManager(QObject):
         self.settings_dialog = None
         self._provider_status_snapshot = {}
         self._shutting_down = False
+        self.app.aboutToQuit.connect(self.shutdown)
 
         # Shared Processing Components
         parser = LineParser()
@@ -352,7 +357,10 @@ class TranslatorManager(QObject):
         self.discovery_retry_timer.setSingleShot(True)
         self.discovery_retry_timer.setTimerType(Qt.TimerType.CoarseTimer)
         self.discovery_retry_timer.timeout.connect(self._periodic_scan)
-        self.discovery_thread = QThread(self)
+        # Keep the thread lifetime explicit, matching the processing workers.
+        # aboutToQuit is wired to shutdown so Qt never owns/destroys it while
+        # filesystem work is still in flight.
+        self.discovery_thread = QThread()
         self.discovery_worker = ChatDiscoveryWorker()
         self.discovery_worker.moveToThread(self.discovery_thread)
         self.chat_discovery_requested.connect(
@@ -845,6 +853,7 @@ class TranslatorManager(QObject):
         self.tray_icon.messageClicked.connect(self.open_settings_dialog)
         self._update_tray_menu()
         self.tray_icon.show()
+        hotkey_failures = []
         self.hotkey = WindowsGlobalHotkey(
             self.app,
             self.toggle_overlay_lock,
@@ -852,13 +861,12 @@ class TranslatorManager(QObject):
             hotkey_id=LOCK_HOTKEY_ID,
         )
         if not self.hotkey.register():
-            self.tray_icon.showMessage(
-                "Global overlay shortcut unavailable",
-                f"{self.hotkey.error or 'The key combination is already in use.'} "
-                "Use Lock overlays from the tray menu.",
-                QSystemTrayIcon.MessageIcon.Warning,
-                12000,
-            )
+            hotkey_failures.append((
+                "Overlay lock",
+                chord,
+                self.hotkey,
+                self.lock_overlays_action,
+            ))
         self.compose_hotkey = WindowsGlobalHotkey(
             self.app,
             self.open_compose_dialog,
@@ -866,10 +874,40 @@ class TranslatorManager(QObject):
             hotkey_id=COMPOSE_HOTKEY_ID,
         )
         if not self.compose_hotkey.register():
+            hotkey_failures.append((
+                "Compose translation",
+                compose_chord,
+                self.compose_hotkey,
+                self.compose_action,
+            ))
+
+        if hotkey_failures:
+            details = []
+            for feature, failed_chord, hotkey, action in hotkey_failures:
+                error = hotkey.error or (
+                    f"{failed_chord} is already in use by another application."
+                )
+                details.append(f"{feature}: {error}")
+                action.setToolTip(
+                    f"{error} Use this tray action instead."
+                )
+                logger.warning(
+                    "%s global shortcut unavailable "
+                    "(chord=%s, error_code=%s): %s",
+                    feature,
+                    failed_chord,
+                    getattr(hotkey, 'error_code', None),
+                    error,
+                )
+            title = (
+                "Global shortcut unavailable"
+                if len(hotkey_failures) == 1
+                else "Global shortcuts unavailable"
+            )
             self.tray_icon.showMessage(
-                "Compose shortcut unavailable",
-                f"{self.compose_hotkey.error or 'The key combination is already in use.'} "
-                "Use Compose translation from the tray menu.",
+                title,
+                "\n".join(details)
+                + "\nThe corresponding tray actions remain available.",
                 QSystemTrayIcon.MessageIcon.Warning,
                 12000,
             )
@@ -2402,7 +2440,40 @@ class TranslatorManager(QObject):
     def run(self):
         sys.exit(self.app.exec())
 
+
+def run_application(
+    *,
+    guard=None,
+    manager_factory=TranslatorManager,
+    already_running_notifier=show_already_running_message,
+    logging_setup=setup_logging,
+) -> int:
+    """Run one translator process and release all process-wide resources."""
+    instance_guard = guard if guard is not None else SingleInstanceGuard()
+    acquired = instance_guard.acquire()
+    if not acquired and instance_guard.already_running:
+        already_running_notifier()
+        return 0
+
+    logging_setup()
+    if not acquired:
+        logging.warning(
+            "Single-instance guard unavailable; continuing without it: %s",
+            instance_guard.error or "unknown error",
+        )
+
+    manager = None
+    try:
+        manager = manager_factory()
+        return int(manager.app.exec())
+    finally:
+        if manager is not None and not getattr(
+            manager,
+            '_shutting_down',
+            False,
+        ):
+            manager.shutdown()
+        instance_guard.release()
+
 if __name__ == "__main__":
-    setup_logging()
-    manager = TranslatorManager()
-    manager.run()
+    raise SystemExit(run_application())

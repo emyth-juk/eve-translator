@@ -6,12 +6,14 @@ import pytest
 
 from src.services.hotkeys import (
     COMPOSE_HOTKEY_ID,
+    ERROR_HOTKEY_ALREADY_REGISTERED,
     HOTKEY_ID,
     MOD_CONTROL,
     MOD_NOREPEAT,
     MOD_SHIFT,
     WM_HOTKEY,
     WindowsGlobalHotkey,
+    format_hotkey_registration_error,
     parse_hotkey,
 )
 
@@ -55,6 +57,35 @@ def test_registration_native_event_and_idempotent_unregister():
     hotkey.unregister()
     app.removeNativeEventFilter.assert_called_once_with(hotkey)
     user32.UnregisterHotKey.assert_called_once_with(None, HOTKEY_ID)
+
+
+def test_registration_conflict_preserves_code_and_names_the_chord():
+    user32 = MagicMock()
+    user32.RegisterHotKey.return_value = False
+    hotkey = WindowsGlobalHotkey(
+        MagicMock(),
+        MagicMock(),
+        chord="Ctrl+Shift+L",
+        user32=user32,
+    )
+
+    with patch(
+        "src.services.hotkeys.ctypes.get_last_error",
+        return_value=ERROR_HOTKEY_ALREADY_REGISTERED,
+    ):
+        assert hotkey.register() is False
+
+    assert hotkey.error_code == ERROR_HOTKEY_ALREADY_REGISTERED
+    assert hotkey.error == (
+        "Ctrl+Shift+L is already in use by another application."
+    )
+
+
+def test_unknown_registration_failure_keeps_windows_error_code():
+    message = format_hotkey_registration_error("Ctrl+Shift+T", 5)
+
+    assert "Ctrl+Shift+T" in message
+    assert "error 5" in message
 
 
 def test_wrong_native_message_does_nothing():

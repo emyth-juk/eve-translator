@@ -104,6 +104,7 @@ Speaker roles are exact, local mappings. The app never infers authority from a n
 - Waiting sessions start automatically when their log appears. Settings is always available from the tray.
 - **Lock overlays** enables true click-through for all overlays. The global shortcut uses Windows `RegisterHotKey`, not a keyboard hook; the tray remains the recovery path if the shortcut is unavailable.
 - **Compose translation** opens a separate review-and-copy window. Its global shortcut also uses `RegisterHotKey`; no keystrokes or clipboard contents are injected into EVE.
+- Only one translator process runs at a time. Launching it again reports that the existing instance is already available in the system tray instead of stealing its shortcuts.
 
 ### Features
 - **Auto-Switching**: Local overlay detects system changes and updates automatically.

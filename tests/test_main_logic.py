@@ -642,6 +642,47 @@ class TestSessionRuntimeState(unittest.TestCase):
         tray_cls.return_value.show.assert_called_once_with()
         self.assertIs(mgr.lock_overlays_action, lock_action)
 
+    def test_hotkey_failures_are_logged_and_shown_in_one_warning(self):
+        from src.main import COMPOSE_HOTKEY_ID, LOCK_HOTKEY_ID
+
+        mgr = self._make_manager()
+        mgr.app = MagicMock()
+        actions = [MagicMock() for _ in range(7)]
+        lock_hotkey = MagicMock(
+            error="Ctrl+Shift+L is already in use by another application.",
+            error_code=1409,
+        )
+        compose_hotkey = MagicMock(
+            error="Ctrl+Shift+T is already in use by another application.",
+            error_code=1409,
+        )
+        lock_hotkey.register.return_value = False
+        compose_hotkey.register.return_value = False
+
+        with patch('src.main.QSystemTrayIcon') as tray_cls, \
+                patch('src.main.QMenu'), \
+                patch('src.main.QAction', side_effect=actions), \
+                patch('src.main.QIcon'), \
+                patch(
+                    'src.main.WindowsGlobalHotkey',
+                    side_effect=[lock_hotkey, compose_hotkey],
+                ) as hotkey_cls, \
+                patch('src.main.logger') as logger:
+            mgr._setup_system_tray()
+
+        tray = tray_cls.return_value
+        tray.showMessage.assert_called_once()
+        title, message = tray.showMessage.call_args.args[:2]
+        self.assertEqual(title, "Global shortcuts unavailable")
+        self.assertIn("Overlay lock: Ctrl+Shift+L", message)
+        self.assertIn("Compose translation: Ctrl+Shift+T", message)
+        self.assertIn("tray actions remain available", message)
+        self.assertEqual(logger.warning.call_count, 2)
+        self.assertEqual(
+            [call.kwargs['hotkey_id'] for call in hotkey_cls.call_args_list],
+            [LOCK_HOTKEY_ID, COMPOSE_HOTKEY_ID],
+        )
+
     def test_interaction_lock_is_applied_to_every_live_overlay(self):
         mgr = self._make_manager()
         mgr.overlay_locked = False

@@ -62,6 +62,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Switching Any Chat sources no longer restores stale channel metadata, and a failed source start can no longer be reported as Active.
 - Any Chat activity now tolerates the login boundary, accepts current log writes as positive evidence, and fails closed for characters Local has explicitly found offline.
 - EVE log timestamps are consistently interpreted as UTC, while implausibly future-dated files no longer keep Fleet, Local, or Any Chat active after a clock correction.
+- A second app launch now exits with a clear already-running message instead of competing for both global hotkeys and showing misleading shortcut warnings.
+- Global shortcut conflicts now preserve the Windows error, identify the affected action and chord, and appear in one combined notification while tray actions remain usable.
+- Persistent chat-log discovery failures preserve the last-good sources, use bounded retry backoff, and become visible Error states instead of silent Waiting states.
 
 ## [1.3] - 2026-06-29
 

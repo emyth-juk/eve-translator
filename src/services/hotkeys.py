@@ -11,6 +11,7 @@ from PySide6.QtCore import QAbstractNativeEventFilter, QTimer
 
 
 WM_HOTKEY = 0x0312
+ERROR_HOTKEY_ALREADY_REGISTERED = 1409
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
@@ -50,6 +51,27 @@ def parse_hotkey(chord: str) -> tuple[int, int]:
     return modifiers, virtual_key
 
 
+def format_hotkey_registration_error(chord: str, error_code: int) -> str:
+    """Translate a Win32 registration failure into an actionable message."""
+    if error_code == ERROR_HOTKEY_ALREADY_REGISTERED:
+        return f"{chord} is already in use by another application."
+    if error_code:
+        formatter = getattr(ctypes, "FormatError", None)
+        detail = ""
+        if callable(formatter):
+            try:
+                detail = str(formatter(error_code) or "").strip().rstrip(".")
+            except (OSError, ValueError):
+                detail = ""
+        if detail:
+            return (
+                f"Windows could not register {chord}: {detail} "
+                f"(error {error_code})."
+            )
+        return f"Windows could not register {chord} (error {error_code})."
+    return f"Windows could not register {chord}."
+
+
 class WindowsGlobalHotkey(QAbstractNativeEventFilter):
     """Observe one declared key chord using RegisterHotKey, never a key hook."""
 
@@ -77,12 +99,14 @@ class WindowsGlobalHotkey(QAbstractNativeEventFilter):
         self.registered = False
         self.installed = False
         self.error = ''
+        self.error_code: int | None = None
 
     def register(self) -> bool:
         if self.registered:
             return True
         if os.name != 'nt' and self._user32 is None:
             self.error = 'Global shortcuts are only supported on Windows.'
+            self.error_code = None
             return False
         try:
             modifiers, virtual_key = parse_hotkey(self.chord)
@@ -91,17 +115,26 @@ class WindowsGlobalHotkey(QAbstractNativeEventFilter):
             register_hotkey = self._user32.RegisterHotKey
             register_hotkey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
             register_hotkey.restype = wintypes.BOOL
+            set_last_error = getattr(ctypes, 'set_last_error', None)
+            if callable(set_last_error):
+                set_last_error(0)
             if not register_hotkey(None, self.hotkey_id, modifiers, virtual_key):
-                error_code = ctypes.get_last_error()
-                self.error = f"Windows could not register {self.chord} (error {error_code})."
+                get_last_error = getattr(ctypes, 'get_last_error', lambda: 0)
+                self.error_code = int(get_last_error() or 0)
+                self.error = format_hotkey_registration_error(
+                    self.chord,
+                    self.error_code,
+                )
                 return False
             self.app.installNativeEventFilter(self)
             self.installed = True
             self.registered = True
             self.error = ''
+            self.error_code = None
             return True
         except (AttributeError, OSError, ValueError) as exc:
             self.error = str(exc)
+            self.error_code = None
             return False
 
     def nativeEventFilter(self, event_type, message):
