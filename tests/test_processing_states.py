@@ -1,6 +1,6 @@
 from datetime import datetime
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 from src.core.message import ProcessedMessage, TranslationState
 from src.core.tokenizer import EVELinkTokenizer
@@ -409,6 +409,52 @@ def test_scheduler_initializes_sde_index_before_translation_work():
     loader.assert_called_once_with("generated.json")
     service.set_entity_index.assert_called_once_with(loaded_index)
     assert ready == [loaded_index]
+
+
+def test_scheduler_translates_outbound_compose_request_and_reports_failures():
+    service = MagicMock()
+    service.entity_index = None
+    service.translate_message.side_effect = [
+        ("Hallo fleet", True, "DeepL"),
+        ("Hello fleet", False, "Google"),
+    ]
+    scheduler = TranslationScheduler(service)
+    completed = []
+    failed = []
+    scheduler.compose_translation_ready.connect(
+        lambda request_id, text: completed.append((request_id, text))
+    )
+    scheduler.compose_translation_failed.connect(
+        lambda request_id, error: failed.append((request_id, error))
+    )
+
+    scheduler.translate_composed_message(1, "Hello fleet", "en", "de")
+    scheduler.translate_composed_message(2, "Hello fleet", "en", "de")
+
+    assert completed == [(1, "Hallo fleet")]
+    assert failed == [(2, "Google could not translate this message.")]
+    assert service.translate_message.call_args_list == [
+        call("Hello fleet", "de", source_lang="en"),
+        call("Hello fleet", "de", source_lang="en"),
+    ]
+
+
+def test_scheduler_refreshes_provider_usage_without_gui_thread_network_call():
+    service = MagicMock()
+    service.entity_index = None
+    service.get_provider_usage.return_value = {
+        'provider': 'deepl', 'available': True, 'used': 80, 'limit': 100,
+    }
+    scheduler = TranslationScheduler(service)
+    emitted = []
+    scheduler.provider_usage_ready.connect(emitted.append)
+
+    scheduler.refresh_provider_usage()
+
+    service.get_provider_usage.assert_called_once_with(refresh=True)
+    assert emitted == [{
+        'provider': 'deepl', 'available': True, 'used': 80, 'limit': 100,
+    }]
 
 
 def replace_job(job, **changes):

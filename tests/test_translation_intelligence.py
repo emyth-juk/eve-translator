@@ -501,6 +501,35 @@ def test_partial_batch_failure_falls_back_only_for_failed_item_in_order():
     assert provider.single_calls == [("second", "en", "fr", "prior")]
 
 
+def test_consented_provider_fallback_handles_only_failed_batch_items():
+    primary = BatchProvider(response=["batch:first", None, "batch:third"])
+    primary.name = "DeepL"
+    fallback = SingleProvider()
+    fallback.name = "Google"
+    service = TranslationService(provider_factories={
+        'deepl': lambda _key: primary,
+        'google': lambda _key: fallback,
+    })
+    service.set_config({
+        'translation_provider': 'deepl',
+        'provider_fallback_enabled': True,
+        'deepl_api_key': 'consented-key',
+        'target_language': 'en',
+    })
+
+    results = service.translate_batch_messages(
+        ["first", "second", "third"], "en", "fr", context="prior"
+    )
+
+    assert results == [
+        ("batch:first", True, "DeepL"),
+        ("translated:second", True, "Google"),
+        ("batch:third", True, "DeepL"),
+    ]
+    assert primary.single_calls == []
+    assert fallback.calls == [("second", "en", "fr")]
+
+
 def test_wrong_batch_result_count_falls_back_all_without_reordering():
     provider = BatchProvider(response=["only one"])
     service = TranslationService(provider=provider)

@@ -16,7 +16,10 @@ MOD_CONTROL = 0x0002
 MOD_SHIFT = 0x0004
 MOD_WIN = 0x0008
 MOD_NOREPEAT = 0x4000
-HOTKEY_ID = 0x455645  # "EVE"
+# RegisterHotKey IDs for a NULL window handle must stay in 0x0000-0xBFFF.
+LOCK_HOTKEY_ID = 0x4556
+COMPOSE_HOTKEY_ID = 0x4557
+HOTKEY_ID = LOCK_HOTKEY_ID  # Backward-compatible public name.
 
 _MODIFIERS = {
     'alt': MOD_ALT,
@@ -50,11 +53,26 @@ def parse_hotkey(chord: str) -> tuple[int, int]:
 class WindowsGlobalHotkey(QAbstractNativeEventFilter):
     """Observe one declared key chord using RegisterHotKey, never a key hook."""
 
-    def __init__(self, app, callback: Callable[[], None], chord='Ctrl+Shift+L', user32=None):
+    def __init__(
+        self,
+        app,
+        callback: Callable[[], None],
+        chord='Ctrl+Shift+L',
+        user32=None,
+        *,
+        hotkey_id: int = HOTKEY_ID,
+    ):
         super().__init__()
+        if (
+            isinstance(hotkey_id, bool)
+            or not isinstance(hotkey_id, int)
+            or not 0 < hotkey_id <= 0xBFFF
+        ):
+            raise ValueError("hotkey_id must be between 1 and 0xBFFF")
         self.app = app
         self.callback = callback
         self.chord = chord
+        self.hotkey_id = hotkey_id
         self._user32 = user32
         self.registered = False
         self.installed = False
@@ -73,7 +91,7 @@ class WindowsGlobalHotkey(QAbstractNativeEventFilter):
             register_hotkey = self._user32.RegisterHotKey
             register_hotkey.argtypes = [wintypes.HWND, ctypes.c_int, wintypes.UINT, wintypes.UINT]
             register_hotkey.restype = wintypes.BOOL
-            if not register_hotkey(None, HOTKEY_ID, modifiers, virtual_key):
+            if not register_hotkey(None, self.hotkey_id, modifiers, virtual_key):
                 error_code = ctypes.get_last_error()
                 self.error = f"Windows could not register {self.chord} (error {error_code})."
                 return False
@@ -100,7 +118,7 @@ class WindowsGlobalHotkey(QAbstractNativeEventFilter):
             ).contents
         except (TypeError, ValueError, ctypes.ArgumentError):
             return False
-        if msg.message == WM_HOTKEY and int(msg.wParam) == HOTKEY_ID:
+        if msg.message == WM_HOTKEY and int(msg.wParam) == self.hotkey_id:
             QTimer.singleShot(0, self.callback)
         return False
 
@@ -113,7 +131,7 @@ class WindowsGlobalHotkey(QAbstractNativeEventFilter):
                 unregister = self._user32.UnregisterHotKey
                 unregister.argtypes = [wintypes.HWND, ctypes.c_int]
                 unregister.restype = wintypes.BOOL
-                unregister(None, HOTKEY_ID)
+                unregister(None, self.hotkey_id)
             finally:
                 self.registered = False
 

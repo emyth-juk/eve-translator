@@ -75,9 +75,14 @@ from src.services.processing import (
 )
 from src.services.scan_state import ChatScanState
 from src.services.translator import TranslationService
-from src.services.hotkeys import WindowsGlobalHotkey
+from src.services.hotkeys import (
+    COMPOSE_HOTKEY_ID,
+    LOCK_HOTKEY_ID,
+    WindowsGlobalHotkey,
+)
 from src.services.local_detector import LocalChatDetector
 from src.gui.settings import SettingsDialog
+from src.gui.compose import ComposeDialog
 from src.version import __version__
 
 DIR_SCAN_DEBOUNCE_MS = 500
@@ -101,6 +106,8 @@ class TranslatorManager(QObject):
     """
 
     worker_config_changed = Signal(int, dict)
+    compose_translation_requested = Signal(int, str, str, str)
+    provider_usage_requested = Signal()
 
     def _get_scan_state(self):
         if not hasattr(self, '_scan_state'):
@@ -162,6 +169,9 @@ class TranslatorManager(QObject):
         # never relaunch an unrecoverable click-through overlay.
         self.overlay_locked = False
         self.hotkey = None
+        self.compose_hotkey = None
+        self.compose_dialog = None
+        self.settings_dialog = None
 
         # Shared Processing Components
         parser = LineParser()
@@ -218,6 +228,21 @@ class TranslatorManager(QObject):
             self.translation_scheduler.queue_job
         )
         self.translation_scheduler.message_ready.connect(self._route_message)
+        self.compose_translation_requested.connect(
+            self.translation_scheduler.translate_composed_message
+        )
+        self.provider_usage_requested.connect(
+            self.translation_scheduler.refresh_provider_usage
+        )
+        self.translation_scheduler.compose_translation_ready.connect(
+            self._finish_compose_translation
+        )
+        self.translation_scheduler.compose_translation_failed.connect(
+            self._fail_compose_translation
+        )
+        self.translation_scheduler.provider_usage_ready.connect(
+            self._provider_usage_ready
+        )
         self.thread.start()
         self.translation_thread.start()
 
@@ -442,6 +467,16 @@ class TranslatorManager(QObject):
         self.lock_overlays_action.triggered.connect(self.set_overlay_locked)
         self.tray_menu.addAction(self.lock_overlays_action)
 
+        compose_chord = self.config.get('shared', {}).get(
+            'compose_hotkey', 'Ctrl+Shift+T'
+        )
+        self.compose_action = QAction(
+            f"Compose translation â€” {compose_chord}",
+            self.tray_menu,
+        )
+        self.compose_action.triggered.connect(self.open_compose_dialog)
+        self.tray_menu.addAction(self.compose_action)
+
         self.tray_menu.addSeparator()
 
         self.settings_action = QAction("Settings", self.tray_menu)
@@ -461,12 +496,27 @@ class TranslatorManager(QObject):
             self.app,
             self.toggle_overlay_lock,
             chord=chord,
+            hotkey_id=LOCK_HOTKEY_ID,
         )
         if not self.hotkey.register():
             self.tray_icon.showMessage(
                 "Global overlay shortcut unavailable",
                 f"{self.hotkey.error or 'The key combination is already in use.'} "
                 "Use Lock overlays from the tray menu.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                12000,
+            )
+        self.compose_hotkey = WindowsGlobalHotkey(
+            self.app,
+            self.open_compose_dialog,
+            chord=compose_chord,
+            hotkey_id=COMPOSE_HOTKEY_ID,
+        )
+        if not self.compose_hotkey.register():
+            self.tray_icon.showMessage(
+                "Compose shortcut unavailable",
+                f"{self.compose_hotkey.error or 'The key combination is already in use.'} "
+                "Use Compose translation from the tray menu.",
                 QSystemTrayIcon.MessageIcon.Warning,
                 12000,
             )
@@ -502,6 +552,79 @@ class TranslatorManager(QObject):
         # Initial broadcast of state to any active sessions (including those just started)
         self._broadcast_session_states()
         self._sessions_initialized = True
+
+    def _compose_provider_label(self) -> str:
+        service = getattr(self, 'translation_service', None)
+        status = (
+            service.get_provider_status()
+            if service is not None and hasattr(service, 'get_provider_status')
+            else {}
+        )
+        primary = str(status.get('name') or 'configured cloud provider')
+        fallback = status.get('fallback')
+        if isinstance(fallback, dict) and fallback.get('enabled'):
+            return f"{primary} provider with consented {fallback.get('name')} fallback"
+        return f"{primary} provider"
+
+    @Slot()
+    def open_compose_dialog(self) -> None:
+        # As with the lock shortcut, defer native hotkey actions while another
+        # modal or popup owns input.
+        if QApplication.activeModalWidget() or QApplication.activePopupWidget():
+            return
+        dialog = getattr(self, 'compose_dialog', None)
+        if dialog is None:
+            dialog = ComposeDialog(
+                source_language='auto',
+                target_language=self.config.get('shared', {}).get(
+                    'target_language', 'en'
+                ),
+                provider_label=self._compose_provider_label(),
+            )
+            dialog.translation_requested.connect(
+                self.compose_translation_requested.emit
+            )
+            self.compose_dialog = dialog
+        else:
+            dialog.set_provider_label(self._compose_provider_label())
+        dialog.present()
+
+    @Slot(int, str)
+    def _finish_compose_translation(self, request_id: int, text: str) -> None:
+        dialog = getattr(self, 'compose_dialog', None)
+        if dialog is not None:
+            dialog.finish_translation(request_id, text)
+
+    @Slot(int, str)
+    def _fail_compose_translation(self, request_id: int, error: str) -> None:
+        dialog = getattr(self, 'compose_dialog', None)
+        if dialog is not None:
+            dialog.fail_translation(request_id, error)
+
+    @Slot(dict)
+    def _provider_usage_ready(self, usage: dict) -> None:
+        dialog = getattr(self, 'settings_dialog', None)
+        if dialog is not None:
+            dialog.set_provider_usage(usage)
+        used = usage.get('used') if isinstance(usage, dict) else None
+        limit = usage.get('limit') if isinstance(usage, dict) else None
+        if (
+            isinstance(used, int)
+            and not isinstance(used, bool)
+            and isinstance(limit, int)
+            and not isinstance(limit, bool)
+            and limit > 0
+            and used / limit >= 0.8
+        ):
+            tray = getattr(self, 'tray_icon', None)
+            if tray is not None:
+                tray.showMessage(
+                    "DeepL quota warning",
+                    f"{used:,} of {limit:,} characters used ({used / limit:.1%}).",
+                    QSystemTrayIcon.MessageIcon.Warning,
+                    10000,
+                )
+        self._update_tray_menu()
 
     def start_session(self, session_id):
         if session_id in self.sessions and self.sessions[session_id]:
@@ -586,6 +709,10 @@ class TranslatorManager(QObject):
                 parent=None,
                 translation_service=getattr(self, 'translation_service', None),
             )
+            self.settings_dialog = dlg
+            dlg.provider_usage_requested.connect(
+                self.provider_usage_requested.emit
+            )
             
             # Connect live preview
             dlg.settings_changed.connect(self.preview_settings)
@@ -633,6 +760,11 @@ class TranslatorManager(QObject):
                 self._apply_scanner_config()
 
                 self._save_config()
+                compose_dialog = getattr(self, 'compose_dialog', None)
+                if compose_dialog is not None:
+                    compose_dialog.set_provider_label(
+                        self._compose_provider_label()
+                    )
             else:
                 # Cancelled: Restore original config
                 logger.info("Settings cancelled. Restoring original config.")
@@ -646,7 +778,10 @@ class TranslatorManager(QObject):
                 # cancelled cloud-provider choice cannot return after restart.
                 self._save_config()
 
+            self.settings_dialog = None
+
         except Exception as e:
+            self.settings_dialog = None
             logger.error(f"Error opening settings: {e}")
             traceback.print_exc()
 
@@ -1033,6 +1168,33 @@ class TranslatorManager(QObject):
         tooltip_parts = [
             provider_labels.get(provider_mode, 'Translation: configuration error')
         ]
+        service = getattr(self, 'translation_service', None)
+        get_usage = getattr(service, 'get_provider_usage', None)
+        if callable(get_usage):
+            usage = get_usage(refresh=False)
+            if provider_mode == 'deepl':
+                used = usage.get('used') if isinstance(usage, dict) else None
+                limit = usage.get('limit') if isinstance(usage, dict) else None
+                if (
+                    isinstance(used, int)
+                    and not isinstance(used, bool)
+                    and isinstance(limit, int)
+                    and not isinstance(limit, bool)
+                    and limit > 0
+                ):
+                    tooltip_parts.append(
+                        f"DeepL quota: {used:,}/{limit:,} ({used / limit:.0%})"
+                    )
+            elif provider_mode == 'google':
+                estimated = (
+                    usage.get('estimated_characters')
+                    if isinstance(usage, dict)
+                    else None
+                )
+                if isinstance(estimated, int) and not isinstance(estimated, bool):
+                    tooltip_parts.append(
+                        f"Google local estimate: {estimated:,} characters"
+                    )
         tooltip_parts.append(
             f"Overlays: {'Locked' if getattr(self, 'overlay_locked', False) else 'Interactive'}"
         )
@@ -1471,6 +1633,12 @@ class TranslatorManager(QObject):
         hotkey = getattr(self, 'hotkey', None)
         if hotkey is not None:
             hotkey.unregister()
+        compose_hotkey = getattr(self, 'compose_hotkey', None)
+        if compose_hotkey is not None:
+            compose_hotkey.unregister()
+        compose_dialog = getattr(self, 'compose_dialog', None)
+        if compose_dialog is not None:
+            compose_dialog.close()
         # Stop sessions WITHOUT changing enabled state
         for sid in list(self.sessions.keys()):
             session = self.sessions.get(sid)

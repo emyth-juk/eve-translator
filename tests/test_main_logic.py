@@ -23,11 +23,11 @@ class TestSharedConfigKeys(unittest.TestCase):
         expected = {
             'opacity', 'font_size', 'auto_scroll',
             'ignored_languages', 'target_language', 'translation_provider',
-            'provider_choice_confirmed', 'deepl_api_key',
+            'provider_choice_confirmed', 'provider_fallback_enabled', 'deepl_api_key',
             'color_default', 'color_translated', 'color_highlight', 'log_dir',
             'fleet_inactive_threshold', 'fleet_auto_switch', 'fleet_scan_interval',
             'fleet_history_lines', 'polling_interval',
-            'speaker_roles', 'global_hotkey',
+            'speaker_roles', 'global_hotkey', 'compose_hotkey',
             'entity_protection', 'entity_index_path', 'burst_optimization',
             'burst_batch_size', 'context_assist', 'context_messages',
             'active_doctrine_pack',
@@ -376,6 +376,7 @@ class TestSessionRuntimeState(unittest.TestCase):
         fleet_action = MagicMock()
         local_action = MagicMock()
         lock_action = MagicMock()
+        compose_action = MagicMock()
         settings_action = MagicMock()
         exit_action = MagicMock()
 
@@ -388,6 +389,7 @@ class TestSessionRuntimeState(unittest.TestCase):
                 fleet_action,
                 local_action,
                 lock_action,
+                compose_action,
                 settings_action,
                 exit_action,
             ]
@@ -395,6 +397,10 @@ class TestSessionRuntimeState(unittest.TestCase):
             mgr._setup_system_tray()
 
         self.assertIs(mgr.settings_action, settings_action)
+        self.assertIs(mgr.compose_action, compose_action)
+        compose_action.triggered.connect.assert_called_once_with(
+            mgr.open_compose_dialog
+        )
         settings_action.triggered.connect.assert_called_once_with(mgr.open_settings_dialog)
         menu_cls.return_value.addAction.assert_any_call(settings_action)
         tray_cls.return_value.messageClicked.connect.assert_called_once_with(

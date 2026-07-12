@@ -5,6 +5,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src.services.hotkeys import (
+    COMPOSE_HOTKEY_ID,
     HOTKEY_ID,
     MOD_CONTROL,
     MOD_NOREPEAT,
@@ -66,3 +67,35 @@ def test_wrong_native_message_does_nothing():
     hotkey.nativeEventFilter(b"windows_dispatcher_MSG", ctypes.addressof(message))
 
     callback.assert_not_called()
+
+
+def test_distinct_valid_hotkey_ids_route_only_their_own_event():
+    lock_callback = MagicMock()
+    compose_callback = MagicMock()
+    lock = WindowsGlobalHotkey(
+        MagicMock(), lock_callback, user32=MagicMock(), hotkey_id=HOTKEY_ID
+    )
+    compose = WindowsGlobalHotkey(
+        MagicMock(), compose_callback, user32=MagicMock(),
+        hotkey_id=COMPOSE_HOTKEY_ID,
+    )
+    message = wintypes.MSG()
+    message.message = WM_HOTKEY
+    message.wParam = COMPOSE_HOTKEY_ID
+
+    with patch('src.services.hotkeys.QTimer.singleShot', side_effect=lambda _ms, fn: fn()):
+        lock.nativeEventFilter(
+            b"windows_dispatcher_MSG", ctypes.addressof(message)
+        )
+        compose.nativeEventFilter(
+            b"windows_dispatcher_MSG", ctypes.addressof(message)
+        )
+
+    lock_callback.assert_not_called()
+    compose_callback.assert_called_once_with()
+
+
+@pytest.mark.parametrize("hotkey_id", [0, -1, 0xC000, True, "4557"])
+def test_hotkey_id_must_fit_win32_application_range(hotkey_id):
+    with pytest.raises(ValueError):
+        WindowsGlobalHotkey(MagicMock(), MagicMock(), hotkey_id=hotkey_id)

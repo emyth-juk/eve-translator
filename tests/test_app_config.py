@@ -44,8 +44,32 @@ class TestConfigStore(unittest.TestCase):
         self.assertEqual(config['shared']['translation_provider'], 'disabled')
         self.assertFalse(config['shared']['provider_choice_confirmed'])
         self.assertEqual(config['shared']['deepl_api_key'], '')
+        self.assertFalse(config['shared']['provider_fallback_enabled'])
         self.assertNotIn('interaction_locked', config['shared'])
         self.assertEqual(config['shared']['global_hotkey'], 'Ctrl+Shift+L')
+        self.assertEqual(config['shared']['compose_hotkey'], 'Ctrl+Shift+T')
+
+    def test_disabled_provider_clears_fallback_consent(self):
+        config = get_default_config()
+        config['shared']['provider_fallback_enabled'] = True
+
+        self.assertTrue(self.store.save(config))
+        loaded = self.store.load()
+
+        self.assertEqual(loaded['shared']['translation_provider'], 'disabled')
+        self.assertFalse(loaded['shared']['provider_fallback_enabled'])
+
+    def test_enabled_provider_preserves_fallback_consent(self):
+        config = get_default_config()
+        config['shared']['translation_provider'] = 'deepl'
+        config['shared']['deepl_api_key'] = 'configured-key'
+        config['shared']['provider_fallback_enabled'] = True
+
+        self.assertTrue(self.store.save(config))
+        loaded = self.store.load()
+
+        self.assertEqual(loaded['shared']['translation_provider'], 'deepl')
+        self.assertTrue(loaded['shared']['provider_fallback_enabled'])
 
     def test_automatic_save_does_not_silence_provider_setup_guidance(self):
         config = get_default_config()

@@ -20,6 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Explicit Disabled, Google, and DeepL provider selection with cloud-use explanations.
 - Masked DeepL key entry, reveal control, and a provider connection test using only a built-in phrase.
 - Pending and failed translation states that keep the original message visible.
+- Manual outbound compose window with source/target selection, asynchronous translation, stale-result protection, and explicit clipboard copy.
+- DeepL quota refresh, Google local character estimates, and warnings when DeepL usage reaches 80%.
+- Opt-in provider fallback that contacts the second cloud provider only after primary failure and explicit consent.
+- Schema-v2 doctrine correction packs and constrained custom command types with safe categories and display labels.
 
 ### Changed
 - Original chat lines now reach the HUD before provider work and remain visible after translation.
@@ -32,6 +36,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Settings can now be opened directly from the system tray.
 - First-run provider guidance remains active until the player saves an explicit choice.
 - Provider calls and connection tests have responsiveness deadlines, and Settings validates DeepL keys and target-language codes before saving.
+- Generated SDE loading now runs on the translation thread, and warm cache hits bypass lexicon/entity preprocessing.
+- Correction memory now uses one guarded SQLite connection, scoped/global lookup in one query, and a bounded positive/negative cache.
 
 ### Fixed
 - Vanilla SDE names now outrank shorter player aliases by full span, including unchanged or ambiguous locale names that act as no-op guards.
@@ -45,6 +51,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Saving a provider change now defers unstarted chat lines until the new choice is active, preventing an old provider from receiving the rest of a queued batch.
 - Active overlays return to Waiting when their tracked log goes inactive and recover to Active when it resumes.
 - Malformed numeric and text settings are normalized at the config boundary instead of breaking startup or Settings.
+- Provider-altered EVE placeholders tolerate safe case/spacing changes while missing or duplicated entities still fail closed to the original.
+- Google network calls now have real connect/read timeouts, DeepL's outer deadline matches its bounded SDK retries, and provider status snapshots are atomic.
+- Internal translation `TypeError` failures no longer trigger duplicate calls or escape the scheduler.
+- All built-in combat phrases share one classifier, preventing short calls such as `regroup`, `star burst`, and `bubble up` from being misdetected and sent unnecessarily.
 
 ## [1.3] - 2026-06-29
 

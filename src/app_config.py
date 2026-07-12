@@ -35,11 +35,11 @@ DISPLAY_MODES = frozenset({
 SHARED_CONFIG_KEYS = frozenset({
     'opacity', 'font_size', 'auto_scroll',
     'ignored_languages', 'target_language', 'translation_provider',
-    'provider_choice_confirmed', 'deepl_api_key',
+    'provider_choice_confirmed', 'provider_fallback_enabled', 'deepl_api_key',
     'color_default', 'color_translated', 'color_highlight', 'log_dir',
     'fleet_inactive_threshold', 'fleet_auto_switch', 'fleet_scan_interval',
     'fleet_history_lines', 'polling_interval',
-    'speaker_roles', 'global_hotkey',
+    'speaker_roles', 'global_hotkey', 'compose_hotkey',
     'entity_protection', 'entity_index_path', 'burst_optimization',
     'burst_batch_size', 'context_assist', 'context_messages',
     'active_doctrine_pack',
@@ -222,6 +222,13 @@ def normalize_config(config: dict) -> dict:
     shared['provider_choice_confirmed'] = _config_bool(
         shared.get('provider_choice_confirmed'), False
     )
+    shared['provider_fallback_enabled'] = _config_bool(
+        shared.get('provider_fallback_enabled'), False
+    )
+    if shared[TRANSLATION_PROVIDER_KEY] == TRANSLATION_PROVIDER_DISABLED:
+        # Fallback is explicit cloud-provider consent and has no meaning when
+        # translation itself is disabled. Fail closed for edited JSON too.
+        shared['provider_fallback_enabled'] = False
     shared['deepl_api_key'] = _config_text(shared.get('deepl_api_key')).strip()
 
     shared['color_default'] = _config_text(
@@ -262,6 +269,10 @@ def normalize_config(config: dict) -> dict:
     shared.pop('interaction_locked', None)
     hotkey = _config_text(shared.get('global_hotkey'), 'Ctrl+Shift+L').strip()
     shared['global_hotkey'] = hotkey or 'Ctrl+Shift+L'
+    compose_hotkey = _config_text(
+        shared.get('compose_hotkey'), 'Ctrl+Shift+T'
+    ).strip()
+    shared['compose_hotkey'] = compose_hotkey or 'Ctrl+Shift+T'
     shared['entity_protection'] = _config_bool(
         shared.get('entity_protection'), True
     )
@@ -367,6 +378,7 @@ def get_default_config(legacy_overlay: Mapping[str, Any] | None = None) -> dict:
             'target_language': legacy_overlay.get('target_language', 'en'),
             'translation_provider': legacy_provider,
             'provider_choice_confirmed': False,
+            'provider_fallback_enabled': False,
             'deepl_api_key': legacy_overlay.get('deepl_api_key', ''),
             'color_default': legacy_overlay.get('color_default', '#e0e0e0'),
             'color_translated': legacy_overlay.get('color_translated', '#00ffff'),
@@ -379,6 +391,7 @@ def get_default_config(legacy_overlay: Mapping[str, Any] | None = None) -> dict:
             'polling_interval': 1.0,
             'speaker_roles': {},
             'global_hotkey': 'Ctrl+Shift+L',
+            'compose_hotkey': 'Ctrl+Shift+T',
             'entity_protection': True,
             'entity_index_path': '',
             'burst_optimization': True,

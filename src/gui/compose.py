@@ -1,0 +1,380 @@
+"""Manual outbound translation dialog.
+
+The dialog deliberately stops at the clipboard boundary: it asks the
+application's translation worker for a result and lets the pilot explicitly
+copy that result.  It never sends keystrokes or text to the EVE client.
+"""
+
+from __future__ import annotations
+
+import re
+
+from PySide6.QtCore import Qt, Signal, Slot
+from PySide6.QtGui import QCloseEvent, QKeySequence, QShortcut
+from PySide6.QtWidgets import (
+    QApplication,
+    QComboBox,
+    QDialog,
+    QHBoxLayout,
+    QLabel,
+    QPushButton,
+    QTextEdit,
+    QVBoxLayout,
+    QWidget,
+)
+
+from src.version import __version__
+
+
+LANGUAGE_CODE_PATTERN = re.compile(r"^[a-z]{2,3}(?:-[a-z]{2,4})?$")
+
+# These cover the languages most often encountered in public EVE fleets while
+# leaving both boxes editable for any provider-supported ISO language code.
+COMMON_LANGUAGES = (
+    ("English", "en"),
+    ("German", "de"),
+    ("French", "fr"),
+    ("Spanish", "es"),
+    ("Portuguese", "pt"),
+    ("Russian", "ru"),
+    ("Ukrainian", "uk"),
+    ("Polish", "pl"),
+    ("Italian", "it"),
+    ("Dutch", "nl"),
+    ("Swedish", "sv"),
+    ("Turkish", "tr"),
+    ("Chinese", "zh"),
+    ("Japanese", "ja"),
+    ("Korean", "ko"),
+)
+
+
+def _normalized_language_code(combo: QComboBox, *, allow_auto: bool) -> str:
+    """Return the selected item data or an editable ISO-style value."""
+    item_data = combo.currentData()
+    selected_text = combo.itemText(combo.currentIndex())
+    if (
+        isinstance(item_data, str)
+        and item_data
+        and combo.currentText() == selected_text
+    ):
+        return item_data
+
+    value = combo.currentText().strip().lower().replace("_", "-")
+    if allow_auto and value in {"", "auto", "detect", "detect automatically"}:
+        return "auto"
+    return value
+
+
+class ComposeDialog(QDialog):
+    """Translate text for manual copy-and-paste into EVE fleet chat.
+
+    ``translation_requested`` is intentionally transport-agnostic.  The main
+    application connects it to its existing asynchronous translation worker,
+    then calls :meth:`finish_translation` or :meth:`fail_translation` on the
+    GUI thread.  Request IDs suppress late results from superseded work.
+    """
+
+    translation_requested = Signal(int, str, str, str)
+
+    def __init__(
+        self,
+        parent: QWidget | None = None,
+        *,
+        source_language: str = "auto",
+        target_language: str = "en",
+        provider_label: str = "configured cloud provider",
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(f"Outbound Fleet Translation - v{__version__}")
+        self.setMinimumSize(540, 480)
+        self.resize(640, 590)
+
+        self._request_counter = 0
+        self._active_request_id: int | None = None
+        self._last_completed_request_id: int | None = None
+
+        layout = QVBoxLayout(self)
+
+        heading = QLabel("Compose for fleet chat", self)
+        heading.setStyleSheet("font-size: 16px; font-weight: bold;")
+        layout.addWidget(heading)
+
+        self.notice_label = QLabel(self)
+        self.notice_label.setObjectName("composePrivacyNotice")
+        self.notice_label.setWordWrap(True)
+        self.notice_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.notice_label.setStyleSheet("color: #777;")
+        layout.addWidget(self.notice_label)
+        self.set_provider_label(provider_label)
+
+        language_row = QHBoxLayout()
+        source_label = QLabel("&From:", self)
+        self.source_language_combo = self._make_language_combo(include_auto=True)
+        self.source_language_combo.setObjectName("composeSourceLanguage")
+        source_label.setBuddy(self.source_language_combo)
+        language_row.addWidget(source_label)
+        language_row.addWidget(self.source_language_combo, 1)
+
+        target_label = QLabel("&To:", self)
+        self.target_language_combo = self._make_language_combo(include_auto=False)
+        self.target_language_combo.setObjectName("composeTargetLanguage")
+        target_label.setBuddy(self.target_language_combo)
+        language_row.addWidget(target_label)
+        language_row.addWidget(self.target_language_combo, 1)
+        layout.addLayout(language_row)
+
+        source_text_label = QLabel("&Message to translate:", self)
+        self.source_text_edit = QTextEdit(self)
+        self.source_text_edit.setObjectName("composeSourceText")
+        self.source_text_edit.setAcceptRichText(False)
+        self.source_text_edit.setPlaceholderText("Type or paste the fleet message here...")
+        self.source_text_edit.setAccessibleName("Message to translate")
+        source_text_label.setBuddy(self.source_text_edit)
+        layout.addWidget(source_text_label)
+        layout.addWidget(self.source_text_edit, 2)
+
+        action_row = QHBoxLayout()
+        self.translate_button = QPushButton("&Translate", self)
+        self.translate_button.setObjectName("composeTranslateButton")
+        self.translate_button.setDefault(True)
+        self.translate_button.setEnabled(False)
+        self.translate_button.clicked.connect(self.request_translation)
+        action_row.addStretch()
+        action_row.addWidget(self.translate_button)
+        layout.addLayout(action_row)
+
+        self.status_label = QLabel("Ready", self)
+        self.status_label.setObjectName("composeStatus")
+        self.status_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.status_label.setWordWrap(True)
+        self.status_label.setAccessibleName("Translation status")
+        layout.addWidget(self.status_label)
+
+        output_label = QLabel("Translated &message:", self)
+        self.output_text_edit = QTextEdit(self)
+        self.output_text_edit.setObjectName("composeOutputText")
+        self.output_text_edit.setAcceptRichText(False)
+        self.output_text_edit.setReadOnly(True)
+        self.output_text_edit.setPlaceholderText("The translation will appear here.")
+        self.output_text_edit.setAccessibleName("Translated message")
+        output_label.setBuddy(self.output_text_edit)
+        layout.addWidget(output_label)
+        layout.addWidget(self.output_text_edit, 2)
+
+        footer_row = QHBoxLayout()
+        self.copy_button = QPushButton("&Copy translation", self)
+        self.copy_button.setObjectName("composeCopyButton")
+        self.copy_button.setEnabled(False)
+        self.copy_button.clicked.connect(self.copy_translation)
+        footer_row.addWidget(self.copy_button)
+        footer_row.addStretch()
+        self.close_button = QPushButton("C&lose", self)
+        self.close_button.clicked.connect(self.reject)
+        footer_row.addWidget(self.close_button)
+        layout.addLayout(footer_row)
+
+        self._set_language(self.source_language_combo, source_language, allow_auto=True)
+        self._set_language(self.target_language_combo, target_language, allow_auto=False)
+
+        self.source_text_edit.textChanged.connect(self._request_input_changed)
+        self.source_language_combo.currentTextChanged.connect(self._request_input_changed)
+        self.target_language_combo.currentTextChanged.connect(self._request_input_changed)
+
+        self.translate_shortcuts = (
+            QShortcut(QKeySequence("Ctrl+Return"), self),
+            QShortcut(QKeySequence("Ctrl+Enter"), self),
+        )
+        for shortcut in self.translate_shortcuts:
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(self.request_translation)
+
+        self.copy_shortcut = QShortcut(QKeySequence("Ctrl+Shift+C"), self)
+        self.copy_shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+        self.copy_shortcut.activated.connect(self.copy_translation)
+
+        self.setTabOrder(self.source_language_combo, self.target_language_combo)
+        self.setTabOrder(self.target_language_combo, self.source_text_edit)
+        self.setTabOrder(self.source_text_edit, self.translate_button)
+        self.setTabOrder(self.translate_button, self.output_text_edit)
+        self.setTabOrder(self.output_text_edit, self.copy_button)
+        self.setTabOrder(self.copy_button, self.close_button)
+
+        self._refresh_request_action()
+
+    @staticmethod
+    def _make_language_combo(*, include_auto: bool) -> QComboBox:
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        if include_auto:
+            combo.addItem("Detect automatically", "auto")
+        for name, code in COMMON_LANGUAGES:
+            combo.addItem(f"{name} ({code})", code)
+        combo.setAccessibleDescription(
+            "Choose a language or type a provider-supported ISO language code."
+        )
+        return combo
+
+    @staticmethod
+    def _set_language(combo: QComboBox, value: str, *, allow_auto: bool) -> None:
+        code = str(value or ("auto" if allow_auto else "en")).strip().lower()
+        code = code.replace("_", "-")
+        index = combo.findData(code)
+        if index >= 0:
+            combo.setCurrentIndex(index)
+        else:
+            combo.setEditText(code)
+
+    @property
+    def active_request_id(self) -> int | None:
+        return self._active_request_id
+
+    @property
+    def request_in_flight(self) -> bool:
+        return self._active_request_id is not None
+
+    @property
+    def last_completed_request_id(self) -> int | None:
+        return self._last_completed_request_id
+
+    @Slot(str)
+    def set_provider_label(self, provider_label: str) -> None:
+        provider = str(provider_label or "configured cloud provider").strip()
+        self.notice_label.setText(
+            f"Privacy: this text is sent to your {provider}. Nothing is posted "
+            "to EVE; copying and pasting are always manual."
+        )
+
+    def source_language(self) -> str:
+        return _normalized_language_code(self.source_language_combo, allow_auto=True)
+
+    def target_language(self) -> str:
+        return _normalized_language_code(self.target_language_combo, allow_auto=False)
+
+    @Slot()
+    def present(self) -> None:
+        """Show and focus the dialog from a tray action or global hotkey."""
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+        self.raise_()
+        self.activateWindow()
+        self.source_text_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+
+    @Slot()
+    def request_translation(self) -> int | None:
+        """Emit one asynchronous translation request and return its ID."""
+        text = self.source_text_edit.toPlainText().strip()
+        source = self.source_language()
+        target = self.target_language()
+        if not text:
+            self._set_error("Enter a message before translating.")
+            self._refresh_request_action()
+            return None
+        if source != "auto" and not LANGUAGE_CODE_PATTERN.fullmatch(source):
+            self._set_error("Enter a valid source language code, such as en or pt-BR.")
+            self._refresh_request_action()
+            return None
+        if not LANGUAGE_CODE_PATTERN.fullmatch(target):
+            self._set_error("Enter a valid target language code, such as en or pt-BR.")
+            self._refresh_request_action()
+            return None
+
+        self._request_counter += 1
+        request_id = self._request_counter
+        self._active_request_id = request_id
+        self.output_text_edit.clear()
+        self.copy_button.setEnabled(False)
+        self.status_label.setStyleSheet("color: #777;")
+        self.status_label.setText("Translating...")
+        self.translate_button.setText("Translate &again")
+        self.translation_requested.emit(request_id, text, source, target)
+        return request_id
+
+    @Slot(int, str)
+    def finish_translation(self, request_id: int, translated_text: str) -> bool:
+        """Display the current request's result; ignore superseded responses."""
+        if request_id != self._active_request_id:
+            return False
+        result = str(translated_text or "").strip()
+        if not result:
+            return self.fail_translation(request_id, "The provider returned an empty translation.")
+
+        self._active_request_id = None
+        self._last_completed_request_id = request_id
+        self.output_text_edit.setPlainText(result)
+        self.copy_button.setEnabled(True)
+        self.status_label.setStyleSheet("color: #2e7d32;")
+        self.status_label.setText("Translation ready - review it, then copy it manually.")
+        self.translate_button.setText("&Translate")
+        self._refresh_request_action()
+        return True
+
+    @Slot(int, str)
+    def fail_translation(self, request_id: int, error_message: str) -> bool:
+        """Display a safe current-request error; ignore superseded responses."""
+        if request_id != self._active_request_id:
+            return False
+        self._active_request_id = None
+        message = str(error_message or "Translation failed.").strip()
+        self._set_error(message[:500])
+        self.translate_button.setText("&Translate")
+        self._refresh_request_action()
+        return True
+
+    @Slot()
+    def copy_translation(self) -> bool:
+        """Copy only after the pilot explicitly invokes this action."""
+        translated_text = self.output_text_edit.toPlainText()
+        if not translated_text:
+            return False
+        QApplication.clipboard().setText(translated_text)
+        self.status_label.setStyleSheet("color: #2e7d32;")
+        self.status_label.setText("Copied. Paste it into EVE when you are ready.")
+        return True
+
+    @Slot()
+    def _request_input_changed(self) -> None:
+        # Editing any request field makes an in-flight response stale.  The
+        # worker may still finish, but its old request ID can no longer update
+        # the dialog.
+        request_was_active = self._active_request_id is not None
+        result_was_visible = bool(self.output_text_edit.toPlainText())
+        if request_was_active:
+            self._active_request_id = None
+        if request_was_active or result_was_visible:
+            self.output_text_edit.clear()
+            self.copy_button.setEnabled(False)
+            self.status_label.setStyleSheet("color: #777;")
+            self.status_label.setText("Message changed - translate again when ready.")
+            self.translate_button.setText("&Translate")
+        elif self.status_label.text() != "Ready":
+            self.status_label.setStyleSheet("")
+            self.status_label.setText("Ready")
+        self._refresh_request_action()
+
+    def _refresh_request_action(self) -> None:
+        text_present = bool(self.source_text_edit.toPlainText().strip())
+        source = self.source_language()
+        target = self.target_language()
+        source_valid = source == "auto" or bool(LANGUAGE_CODE_PATTERN.fullmatch(source))
+        target_valid = bool(LANGUAGE_CODE_PATTERN.fullmatch(target))
+        self.translate_button.setEnabled(text_present and source_valid and target_valid)
+
+    def _set_error(self, message: str) -> None:
+        self.status_label.setStyleSheet("color: #c0392b;")
+        self.status_label.setText(message)
+
+    def _invalidate_pending_request(self) -> None:
+        self._active_request_id = None
+        self.translate_button.setText("&Translate")
+
+    def reject(self) -> None:
+        self._invalidate_pending_request()
+        super().reject()
+
+    def closeEvent(self, event: QCloseEvent) -> None:
+        self._invalidate_pending_request()
+        super().closeEvent(event)

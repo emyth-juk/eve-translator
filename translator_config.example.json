@@ -11,6 +11,7 @@
         "target_language": "en",
         "translation_provider": "disabled",
         "provider_choice_confirmed": false,
+        "provider_fallback_enabled": false,
         "deepl_api_key": "YOUR_DESCRIBED_DEEPL_API_KEY_HERE",
         "color_default": "#e0e0e0",
         "color_translated": "#00ffff",
@@ -20,6 +21,7 @@
             "example scout": "scout"
         },
         "global_hotkey": "Ctrl+Shift+L",
+        "compose_hotkey": "Ctrl+Shift+T",
         "entity_protection": true,
         "entity_index_path": "",
         "burst_optimization": true,

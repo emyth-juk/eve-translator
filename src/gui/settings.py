@@ -9,7 +9,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QSlider, QSpinBox, QCheckBox, QPushButton,
                                QColorDialog, QFormLayout, QGroupBox, QWidget, QTabWidget,
                                QFileDialog, QLineEdit, QComboBox, QMessageBox)
-from PySide6.QtCore import QObject, Qt, QTimer, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor
 from src.app_config import (
     DISPLAY_MODE_BILINGUAL,
@@ -35,6 +35,7 @@ class ProviderTestSignals(QObject):
 class SettingsDialog(QDialog):
     # Signal carrying the updated config dict (full structure)
     settings_changed = Signal(dict)
+    provider_usage_requested = Signal()
 
     def __init__(self, full_config, parent=None, translation_service=None):
         super().__init__(parent)
@@ -171,6 +172,23 @@ class SettingsDialog(QDialog):
         self.lbl_provider_hint.setStyleSheet("color: gray; font-style: italic;")
         form_beh.addRow("", self.lbl_provider_hint)
 
+        self.chk_provider_fallback = QCheckBox()
+        self.chk_provider_fallback.setChecked(
+            self.config['shared'].get('provider_fallback_enabled') is True
+        )
+        form_beh.addRow(self.chk_provider_fallback)
+
+        self.lbl_provider_fallback = QLabel(
+            "If enabled, the same message will be sent to the second cloud "
+            "provider only after the primary provider fails. If Context assist "
+            "is enabled, its same-channel context lines follow that request."
+        )
+        self.lbl_provider_fallback.setWordWrap(True)
+        self.lbl_provider_fallback.setStyleSheet(
+            "color: gray; font-style: italic;"
+        )
+        form_beh.addRow("", self.lbl_provider_fallback)
+
         target_language = self._config_text(
             self.config['shared'].get('target_language', 'en'),
             default='en',
@@ -206,15 +224,31 @@ class SettingsDialog(QDialog):
         provider_test_row.addWidget(self.lbl_provider_test, 1)
         form_beh.addRow("", provider_test_row)
 
+        self.btn_refresh_provider_usage = QPushButton("Refresh Usage")
+        self.btn_refresh_provider_usage.clicked.connect(
+            self._request_provider_usage
+        )
+        self.lbl_provider_usage = QLabel("")
+        self.lbl_provider_usage.setWordWrap(True)
+
+        provider_usage_row = QHBoxLayout()
+        provider_usage_row.addWidget(self.btn_refresh_provider_usage)
+        provider_usage_row.addWidget(self.lbl_provider_usage, 1)
+        form_beh.addRow("Usage:", provider_usage_row)
+
         self.lbl_provider_validation = QLabel("")
         self.lbl_provider_validation.setWordWrap(True)
         self.lbl_provider_validation.setStyleSheet("color: #c0392b;")
         form_beh.addRow("", self.lbl_provider_validation)
 
         self.combo_provider.currentIndexChanged.connect(self._provider_mode_changed)
+        self.chk_provider_fallback.toggled.connect(
+            self._provider_fallback_changed
+        )
         self.edit_deepl.textChanged.connect(self._provider_input_changed)
         self.edit_target.textChanged.connect(self._provider_input_changed)
         self._update_provider_controls()
+        self._show_provider_usage_idle()
         
         layout.addWidget(grp_beh)
         
@@ -405,6 +439,10 @@ class SettingsDialog(QDialog):
             correction_count = 0
         self.lbl_correction_count = QLabel(f"{correction_count:,} exact local corrections")
         form_local.addRow("Correction memory:", self.lbl_correction_count)
+        self.btn_export_corrections = QPushButton("Export corrections ZIPâ€¦")
+        self.btn_export_corrections.setEnabled(memory is not None and correction_count > 0)
+        self.btn_export_corrections.clicked.connect(self._export_correction_pack)
+        form_local.addRow("Share corrections:", self.btn_export_corrections)
 
         self.lbl_doctrine = QLabel()
         self.lbl_doctrine.setWordWrap(True)
@@ -458,6 +496,55 @@ class SettingsDialog(QDialog):
         self._refresh_doctrine_label()
         self._notify_change()
 
+    def _export_correction_pack(self):
+        memory = getattr(self._translation_service, 'translation_memory', None)
+        if memory is None:
+            QMessageBox.warning(
+                self,
+                "Corrections unavailable",
+                "No local correction memory is available to export.",
+            )
+            return
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export exact corrections",
+            "eve-fleet-corrections.zip",
+            "Doctrine packs (*.zip)",
+        )
+        if not filename:
+            return
+        destination = Path(filename)
+        if destination.suffix.casefold() != '.zip':
+            destination = destination.with_suffix('.zip')
+        pack_id = re.sub(r'[^a-z0-9._-]+', '-', destination.stem.casefold())
+        pack_id = pack_id.strip('._-')[:64] or 'fleet-corrections'
+        doctrine_scope = ''
+        active = self.config['shared'].get('active_doctrine_pack', '')
+        if active:
+            try:
+                from src.core.doctrine import load_doctrine_pack
+                doctrine_scope = load_doctrine_pack(active).scope
+            except Exception:
+                doctrine_scope = ''
+        try:
+            from src.core.doctrine import export_correction_pack
+            exported = export_correction_pack(
+                memory,
+                destination,
+                pack_id=pack_id,
+                name="EVE Fleet Corrections",
+                doctrine_scope=doctrine_scope,
+                overwrite=True,
+            )
+        except Exception as exc:
+            QMessageBox.warning(self, "Correction export failed", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "Corrections exported",
+            f"Exported {len(exported.corrections):,} exact corrections as a safe doctrine pack.",
+        )
+
     def _make_color_btn(self, shared_key, initial_hex):
         btn = QPushButton()
         btn.setStyleSheet(f"background-color: {initial_hex};")
@@ -487,6 +574,13 @@ class SettingsDialog(QDialog):
         self._cancel_provider_test()
         self.lbl_provider_test.clear()
         self._update_provider_controls()
+        self._show_provider_usage_idle()
+        self._notify_change()
+
+    def _provider_fallback_changed(self, *args):
+        self._cancel_provider_test()
+        self.lbl_provider_test.clear()
+        self._update_provider_controls()
         self._notify_change()
 
     def _provider_input_changed(self, *args):
@@ -503,7 +597,32 @@ class SettingsDialog(QDialog):
 
     def _update_provider_controls(self):
         provider_mode = self._selected_provider_mode()
-        uses_deepl = provider_mode == TRANSLATION_PROVIDER_DEEPL
+        if provider_mode == TRANSLATION_PROVIDER_DISABLED:
+            if self.chk_provider_fallback.isChecked():
+                self.chk_provider_fallback.setChecked(False)
+            self.chk_provider_fallback.setText(
+                "Provider fallback unavailable while translation is disabled"
+            )
+            self.chk_provider_fallback.setEnabled(False)
+        elif provider_mode == TRANSLATION_PROVIDER_GOOGLE:
+            self.chk_provider_fallback.setText(
+                "Fallback to DeepL after Google fails"
+            )
+            self.chk_provider_fallback.setEnabled(True)
+        else:
+            self.chk_provider_fallback.setText(
+                "Fallback to Google after DeepL fails"
+            )
+            self.chk_provider_fallback.setEnabled(True)
+
+        fallback_enabled = self.chk_provider_fallback.isChecked()
+        uses_deepl = (
+            provider_mode == TRANSLATION_PROVIDER_DEEPL
+            or (
+                provider_mode == TRANSLATION_PROVIDER_GOOGLE
+                and fallback_enabled
+            )
+        )
         if not uses_deepl and self.chk_reveal_deepl.isChecked():
             # Never leave a stored DeepL key visible after switching providers.
             self.chk_reveal_deepl.setChecked(False)
@@ -512,6 +631,9 @@ class SettingsDialog(QDialog):
         self.btn_test_provider.setEnabled(
             provider_mode != TRANSLATION_PROVIDER_DISABLED
             and not self._provider_test_running
+        )
+        self.btn_refresh_provider_usage.setEnabled(
+            provider_mode != TRANSLATION_PROVIDER_DISABLED
         )
 
         if provider_mode == TRANSLATION_PROVIDER_DISABLED:
@@ -522,7 +644,11 @@ class SettingsDialog(QDialog):
                 "Google translation sends message text to a cloud service. "
                 "The provider test sends only a built-in test phrase."
             )
-            placeholder = "Stored for DeepL; not used by Google"
+            placeholder = (
+                "Required for DeepL fallback"
+                if fallback_enabled
+                else "Stored for DeepL; not used by Google"
+            )
         else:
             hint = (
                 "DeepL translation sends message text to DeepL. "
@@ -547,11 +673,133 @@ class SettingsDialog(QDialog):
         ):
             return "Enter a target language such as en, de, zh, or pt-BR."
         if (
-            provider_mode == TRANSLATION_PROVIDER_DEEPL
+            (
+                provider_mode == TRANSLATION_PROVIDER_DEEPL
+                or (
+                    provider_mode == TRANSLATION_PROVIDER_GOOGLE
+                    and self.chk_provider_fallback.isChecked()
+                )
+            )
             and not self.edit_deepl.text().strip()
         ):
+            if provider_mode == TRANSLATION_PROVIDER_GOOGLE:
+                return "A DeepL API key is required for Google fallback."
             return "A DeepL API key is required before saving DeepL."
         return ""
+
+    def _show_provider_usage_idle(self):
+        provider_mode = self._selected_provider_mode()
+        self.lbl_provider_usage.setStyleSheet("color: gray;")
+        if provider_mode == TRANSLATION_PROVIDER_DISABLED:
+            message = "Usage unavailable while translation is disabled."
+        elif provider_mode == TRANSLATION_PROVIDER_GOOGLE:
+            message = (
+                "Local runtime estimate not refreshed. Google provides no "
+                "provider usage limit."
+            )
+        else:
+            message = "DeepL usage not refreshed."
+        self.lbl_provider_usage.setText(message)
+
+    def _request_provider_usage(self):
+        if self._selected_provider_mode() == TRANSLATION_PROVIDER_DISABLED:
+            self._show_provider_usage_idle()
+            return
+        self.lbl_provider_usage.setStyleSheet("color: gray;")
+        self.lbl_provider_usage.setText("Refreshing provider usage...")
+        self.provider_usage_requested.emit()
+
+    @staticmethod
+    def _usage_count(value):
+        if isinstance(value, bool):
+            return None
+        try:
+            count = int(value)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return count if count >= 0 else None
+
+    @Slot(dict)
+    def set_provider_usage(self, usage):
+        """Render an asynchronous provider-usage snapshot safely.
+
+        DeepL accepts ``used``/``limit`` (or its SDK-style
+        ``character_count``/``character_limit`` aliases). Google accepts
+        ``estimated_characters`` and is always labelled as a local estimate.
+        """
+        if not isinstance(usage, dict):
+            usage = {}
+
+        selected_provider = self._selected_provider_mode()
+        provider = usage.get('provider', selected_provider)
+        if provider not in {
+            TRANSLATION_PROVIDER_DISABLED,
+            TRANSLATION_PROVIDER_GOOGLE,
+            TRANSLATION_PROVIDER_DEEPL,
+        }:
+            provider = selected_provider
+
+        # Do not let a slow response overwrite the status for a newly selected
+        # provider.
+        if provider != selected_provider:
+            return
+
+        if usage.get('error') or usage.get('unavailable') or usage.get('available') is False:
+            self.lbl_provider_usage.setStyleSheet("color: #c0392b;")
+            self.lbl_provider_usage.setText(
+                "Provider usage is unavailable. Check the connection and try again."
+            )
+            return
+
+        if provider == TRANSLATION_PROVIDER_DEEPL:
+            used = self._usage_count(
+                usage.get('used', usage.get('character_count'))
+            )
+            limit = self._usage_count(
+                usage.get('limit', usage.get('character_limit'))
+            )
+            if used is None or limit is None or limit == 0:
+                self.lbl_provider_usage.setStyleSheet("color: #c0392b;")
+                self.lbl_provider_usage.setText(
+                    "DeepL usage is unavailable. Check the connection and try again."
+                )
+                return
+
+            percent = used / limit * 100
+            warning = percent >= 80
+            message = (
+                f"DeepL: {used:,} / {limit:,} characters used "
+                f"({percent:.1f}%)."
+            )
+            if warning:
+                message += " Warning: quota usage is at or above 80%."
+            self.lbl_provider_usage.setStyleSheet(
+                "color: #c0392b;" if warning else "color: #2e8b57;"
+            )
+            self.lbl_provider_usage.setText(message)
+            return
+
+        if provider == TRANSLATION_PROVIDER_GOOGLE:
+            estimated = self._usage_count(
+                usage.get(
+                    'estimated_characters',
+                    usage.get('character_count', usage.get('used')),
+                )
+            )
+            if estimated is None:
+                self.lbl_provider_usage.setStyleSheet("color: #c0392b;")
+                self.lbl_provider_usage.setText(
+                    "Google usage estimate is unavailable. Try again."
+                )
+                return
+            self.lbl_provider_usage.setStyleSheet("color: gray;")
+            self.lbl_provider_usage.setText(
+                f"Google local runtime estimate: {estimated:,} characters. "
+                "Estimate only; Google provides no provider usage limit."
+            )
+            return
+
+        self._show_provider_usage_idle()
 
     def _test_provider(self):
         provider_mode = self._selected_provider_mode()
@@ -662,6 +910,10 @@ class SettingsDialog(QDialog):
         self.config['shared']['auto_scroll'] = self.chk_autoscroll.isChecked()
         self.config['shared']['target_language'] = self.edit_target.text().strip() or 'en'
         self.config['shared']['translation_provider'] = self._selected_provider_mode()
+        self.config['shared']['provider_fallback_enabled'] = (
+            self._selected_provider_mode() != TRANSLATION_PROVIDER_DISABLED
+            and self.chk_provider_fallback.isChecked()
+        )
         self.config['shared']['deepl_api_key'] = self.edit_deepl.text().strip()
 
         ign_raw = self.edit_ignored.text()

@@ -413,6 +413,9 @@ class TranslationScheduler(QObject):
 
     message_ready = Signal(object)
     entity_index_ready = Signal(object)
+    compose_translation_ready = Signal(int, str)
+    compose_translation_failed = Signal(int, str)
+    provider_usage_ready = Signal(dict)
 
     def __init__(
         self,
@@ -475,6 +478,65 @@ class TranslationScheduler(QObject):
                 else None
             )
         self.entity_index_ready.emit(self._entity_index)
+
+    @Slot()
+    def refresh_provider_usage(self) -> None:
+        get_usage = getattr(self.translator_service, 'get_provider_usage', None)
+        if not callable(get_usage):
+            self.provider_usage_ready.emit({'available': False, 'error': True})
+            return
+        try:
+            usage = get_usage(refresh=True)
+        except Exception as exc:
+            logger.error("Unexpected provider usage failure: %s", type(exc).__name__)
+            usage = {'available': False, 'error': True}
+        self.provider_usage_ready.emit(
+            usage if isinstance(usage, dict) else {'available': False, 'error': True}
+        )
+
+    @Slot(int, str, str, str)
+    def translate_composed_message(
+        self,
+        request_id: int,
+        text: str,
+        source_language: str,
+        target_language: str,
+    ) -> None:
+        """Translate manual outbound text without automating EVE input."""
+
+        if self._config_update_pending():
+            self.compose_translation_failed.emit(
+                request_id,
+                "Provider settings are changing. Try again in a moment.",
+            )
+            return
+        message = str(text or '').strip()
+        if not message:
+            self.compose_translation_failed.emit(request_id, "Enter a message first.")
+            return
+        if len(message) > 5_000:
+            self.compose_translation_failed.emit(
+                request_id,
+                "Outbound messages are limited to 5,000 characters.",
+            )
+            return
+        try:
+            translated, success, provider = self.translator_service.translate_message(
+                message,
+                target_language,
+                source_lang=source_language,
+            )
+        except Exception as exc:
+            logger.error("Unexpected outbound translation failure: %s", type(exc).__name__)
+            translated, success, provider = message, False, "Translation provider"
+        if success and isinstance(translated, str) and translated.strip():
+            self.compose_translation_ready.emit(request_id, translated)
+            return
+        provider_label = str(provider or "Translation provider").strip()
+        self.compose_translation_failed.emit(
+            request_id,
+            f"{provider_label} could not translate this message.",
+        )
 
     @Slot(dict)
     def update_config(self, config):

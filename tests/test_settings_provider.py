@@ -2,8 +2,9 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -44,7 +45,67 @@ def test_settings_default_to_disabled_and_mask_api_key():
     assert dialog.btn_test_provider.isEnabled() is False
     assert dialog.edit_deepl.echoMode() == QLineEdit.EchoMode.Password
     assert dialog.edit_deepl.isEnabled() is False
+    assert dialog.chk_provider_fallback.isChecked() is False
+    assert dialog.chk_provider_fallback.isEnabled() is False
+    assert dialog.btn_refresh_provider_usage.isEnabled() is False
 
+    dialog.close()
+
+
+def test_google_fallback_requires_deepl_key_and_records_explicit_consent():
+    dialog = SettingsDialog(get_default_config())
+    dialog.combo_provider.setCurrentIndex(dialog.combo_provider.findData('google'))
+
+    assert dialog.chk_provider_fallback.isEnabled() is True
+    assert dialog.edit_deepl.isEnabled() is False
+
+    dialog.chk_provider_fallback.setChecked(True)
+
+    assert dialog.edit_deepl.isEnabled() is True
+    assert dialog.btn_save.isEnabled() is False
+    assert 'DeepL API key is required' in dialog.lbl_provider_validation.text()
+    assert 'same message will be sent to the second cloud provider' in (
+        dialog.lbl_provider_fallback.text()
+    )
+
+    dialog.edit_deepl.setText('fallback-key')
+
+    assert dialog.btn_save.isEnabled() is True
+    settings = dialog.get_settings()['shared']
+    assert settings['translation_provider'] == 'google'
+    assert settings['provider_fallback_enabled'] is True
+    assert settings['deepl_api_key'] == 'fallback-key'
+    dialog.close()
+
+
+def test_disabled_provider_cannot_retain_fallback_consent():
+    config = get_default_config()
+    config['shared']['translation_provider'] = 'google'
+    config['shared']['provider_fallback_enabled'] = True
+    config['shared']['deepl_api_key'] = 'fallback-key'
+    dialog = SettingsDialog(config)
+
+    dialog.combo_provider.setCurrentIndex(dialog.combo_provider.findData('disabled'))
+
+    assert dialog.chk_provider_fallback.isChecked() is False
+    assert dialog.chk_provider_fallback.isEnabled() is False
+    assert dialog.get_settings()['shared']['provider_fallback_enabled'] is False
+    dialog.close()
+
+
+def test_deepl_fallback_is_google_and_needs_no_additional_credential():
+    config = get_default_config()
+    config['shared']['translation_provider'] = 'deepl'
+    config['shared']['deepl_api_key'] = 'primary-key'
+    dialog = SettingsDialog(config)
+
+    dialog.chk_provider_fallback.setChecked(True)
+
+    assert dialog.chk_provider_fallback.text() == (
+        'Fallback to Google after DeepL fails'
+    )
+    assert dialog.btn_save.isEnabled() is True
+    assert dialog.get_settings()['shared']['provider_fallback_enabled'] is True
     dialog.close()
 
 
@@ -221,3 +282,121 @@ def test_closing_dialog_invalidates_an_in_flight_provider_test():
     dialog.reject()
     assert dialog._provider_test_running is False
     release.set()
+
+
+def test_refresh_usage_emits_request_and_shows_loading_state():
+    config = get_default_config()
+    config['shared']['translation_provider'] = 'google'
+    dialog = SettingsDialog(config)
+    requests = []
+    dialog.provider_usage_requested.connect(lambda: requests.append(True))
+
+    dialog.btn_refresh_provider_usage.click()
+
+    assert requests == [True]
+    assert dialog.lbl_provider_usage.text() == 'Refreshing provider usage...'
+    dialog.close()
+
+
+def test_deepl_usage_shows_exact_counts_percent_and_threshold_warning():
+    config = get_default_config()
+    config['shared']['translation_provider'] = 'deepl'
+    config['shared']['deepl_api_key'] = 'primary-key'
+    dialog = SettingsDialog(config)
+
+    dialog.set_provider_usage({
+        'provider': 'deepl',
+        'used': 800_000,
+        'limit': 1_000_000,
+    })
+
+    usage_text = dialog.lbl_provider_usage.text()
+    assert '800,000 / 1,000,000 characters used' in usage_text
+    assert '(80.0%)' in usage_text
+    assert 'Warning' in usage_text
+    dialog.close()
+
+
+def test_deepl_usage_accepts_sdk_field_names_without_warning_below_threshold():
+    config = get_default_config()
+    config['shared']['translation_provider'] = 'deepl'
+    config['shared']['deepl_api_key'] = 'primary-key'
+    dialog = SettingsDialog(config)
+
+    dialog.set_provider_usage({
+        'provider': 'deepl',
+        'character_count': 799,
+        'character_limit': 1_000,
+    })
+
+    usage_text = dialog.lbl_provider_usage.text()
+    assert '799 / 1,000 characters used' in usage_text
+    assert '(79.9%)' in usage_text
+    assert 'Warning' not in usage_text
+    dialog.close()
+
+
+def test_google_usage_is_clearly_a_local_estimate_without_provider_limit():
+    config = get_default_config()
+    config['shared']['translation_provider'] = 'google'
+    dialog = SettingsDialog(config)
+
+    dialog.set_provider_usage({
+        'provider': 'google',
+        'estimated_characters': 12_345,
+    })
+
+    usage_text = dialog.lbl_provider_usage.text()
+    assert 'local runtime estimate: 12,345 characters' in usage_text
+    assert 'Estimate only' in usage_text
+    assert 'no provider usage limit' in usage_text
+    dialog.close()
+
+
+def test_usage_error_is_generic_and_stale_provider_response_is_ignored():
+    config = get_default_config()
+    config['shared']['translation_provider'] = 'google'
+    dialog = SettingsDialog(config)
+
+    dialog.set_provider_usage({'provider': 'google', 'error': 'secret-key leaked'})
+
+    assert 'secret-key' not in dialog.lbl_provider_usage.text()
+    assert 'unavailable' in dialog.lbl_provider_usage.text()
+    previous = dialog.lbl_provider_usage.text()
+
+    dialog.set_provider_usage({
+        'provider': 'deepl',
+        'used': 1,
+        'limit': 100,
+    })
+
+    assert dialog.lbl_provider_usage.text() == previous
+    dialog.close()
+
+
+def test_correction_export_creates_doctrine_zip_without_glossary_conversion():
+    service = MagicMock()
+    service.entity_index = None
+    service.translation_memory.count.return_value = 2
+    dialog = SettingsDialog(get_default_config(), translation_service=service)
+    exported = SimpleNamespace(corrections=(object(), object()))
+
+    with patch(
+        'src.gui.settings.QFileDialog.getSaveFileName',
+        return_value=('C:/tmp/My Fleet Corrections.zip', 'Doctrine packs (*.zip)'),
+    ), patch(
+        'src.core.doctrine.export_correction_pack',
+        return_value=exported,
+    ) as export, patch('src.gui.settings.QMessageBox.information') as information:
+        dialog.btn_export_corrections.click()
+
+    export.assert_called_once_with(
+        service.translation_memory,
+        Path('C:/tmp/My Fleet Corrections.zip'),
+        pack_id='my-fleet-corrections',
+        name='EVE Fleet Corrections',
+        doctrine_scope='',
+        overwrite=True,
+    )
+    assert '2 exact corrections' in information.call_args.args[2]
+    dialog.close()

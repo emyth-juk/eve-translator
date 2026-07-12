@@ -72,6 +72,36 @@ class TestTranslatorErrors(unittest.TestCase):
             timeout=(GOOGLE_CONNECT_TIMEOUT_SECONDS, GOOGLE_READ_TIMEOUT_SECONDS),
         )
 
+    def test_google_usage_is_a_local_count_of_started_requests(self):
+        with patch('src.services.translator.GoogleTranslator') as MockGT:
+            MockGT.return_value.translate.return_value = "bonjour"
+            provider = GoogleTransProvider()
+
+            self.assertEqual(
+                provider.get_usage(),
+                {'available': True, 'estimated_characters': 0},
+            )
+            self.assertEqual(provider.translate("Hello", "fr"), "bonjour")
+
+        self.assertEqual(
+            provider.get_usage(),
+            {'available': True, 'estimated_characters': 5},
+        )
+
+    def test_deepl_usage_returns_exact_character_limit_snapshot(self):
+        with patch.dict('sys.modules', {'deepl': MagicMock()}):
+            import deepl
+
+            deepl.Translator.return_value.get_usage.return_value = SimpleNamespace(
+                character=SimpleNamespace(count=800, limit=1000)
+            )
+            provider = DeepLProvider("dummy-key")
+
+            self.assertEqual(
+                provider.get_usage(refresh=True),
+                {'available': True, 'used': 800, 'limit': 1000},
+            )
+
     def test_google_request_stops_blocking_after_deadline(self):
         release_request = threading.Event()
         with patch('src.services.translator.GoogleTranslator') as MockGT:

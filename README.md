@@ -18,6 +18,8 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 - Immediate originals while translation runs; translated lines always keep the original visible.
 - EVE-aware translation using language-pair glossaries, 46,000+ protected SDE names/aliases, and ID-linked locale mappings for 6,263 published inventory types; player aliases remain glossary-driven.
 - Local exact corrections, safe importable doctrine packs, provider-native burst batching, and opt-in context assist.
+- Outbound fleet-message composer with manual clipboard copy only; it never types into or automates EVE.
+- DeepL quota display, a Google local character estimate, and an optional explicitly consented second-provider fallback.
 - Explicit DeepL Free/Pro or Google provider selection; cloud translation is off until you choose one.
 - Auto-detects your active character log and updates Local automatically.
 - Always-on-top windows you can drag, resize, and right-click for quick actions.
@@ -45,6 +47,7 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 5. Point to your chat logs if needed: Settings → Log Directory (default is usually auto-detected).
 6. Use it in game: position the overlays, adjust opacity/font size, and right-click for options (Settings, Export Logs, Toggle Sessions).
 7. When positioned, use **Lock overlays** in the tray or **Ctrl+Shift+L** while EVE has focus to pass mouse input through both overlays.
+8. Use **Compose translation** in the tray or **Ctrl+Shift+T** to translate an outgoing call, review it, and copy it manually into EVE.
 
 ## First-Time Setup Details
 - Config file location: `%USERPROFILE%\.eve_translator\translator_config.json` (auto-created).  
@@ -52,11 +55,14 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 - First-run provider guidance returns on later launches until you open Settings and save an explicit choice, including Disabled.
 - Provider test: sends only a built-in connection-test phrase, never fleet chat.
 - Context assist is off by default. When enabled with a provider that supports native context, recent lines from only the same channel/log source are also sent to that provider.
+- Provider fallback is off by default. Enabling it explicitly consents to sending a failed messageâ€”and enabled context-assist linesâ€”to the other cloud provider only after the primary provider fails.
+- **Refresh Usage** reads exact DeepL character usage. Google does not expose an account quota through this integration, so its figure is clearly labelled as a local runtime estimate.
 - Colors and UI: set default/translated/highlight colors in Settings; changes are live.  
 - Translation Intelligence: manage SDE name protection, burst optimization, context consent, exact local corrections, and one active doctrine pack.
 - Glossaries are selected from the detected source and target language pair. User overrides go in `%USERPROFILE%\.eve_translator\glossaries\`.
 - Ignored-language entries are matched by base language: `zh` ignores Chinese, `ja` ignores Japanese, and `ko` ignores Korean independently; regional forms such as `pt-BR` match `pt`.
 - Corrections are exact, language-pair scoped, and stored locally in `%USERPROFILE%\.eve_translator\translation_memory.sqlite3`.
+- Local corrections can be exported as schema-v2 doctrine ZIPs; full messages remain exact corrections and are never converted into substring glossary rules.
 - Doctrine packs are data-only ZIPs validated before installation under `%USERPROFILE%\.eve_translator\doctrines\`; they cannot grant FC/scout trust. See `data/doctrines/README.md` for the pack schema.
 - Logs: app logs live in `%USERPROFILE%\.eve_translator\logs\`.
 
@@ -93,6 +99,7 @@ Speaker roles are exact, local mappings. The app never infers authority from a n
 - **Error**: the log or session could not be opened; hover the tray action for details.
 - Waiting sessions start automatically when their log appears. Settings is always available from the tray.
 - **Lock overlays** enables true click-through for both overlays. The global shortcut uses Windows `RegisterHotKey`, not a keyboard hook; the tray remains the recovery path if the shortcut is unavailable.
+- **Compose translation** opens a separate review-and-copy window. Its global shortcut also uses `RegisterHotKey`; no keystrokes or clipboard contents are injected into EVE.
 
 ### Features
 - **Auto-Switching**: Local overlay detects system changes and updates automatically.

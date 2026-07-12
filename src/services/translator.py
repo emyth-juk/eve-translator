@@ -179,6 +179,11 @@ class TranslationProvider(ABC):
         """Whether the provider has a non-translated context parameter."""
         return False
 
+    def get_usage(self, *, refresh: bool = False) -> dict:
+        """Return a safe provider-specific usage snapshot without message data."""
+
+        return {'available': False}
+
     @abstractmethod
     def translate(
         self,
@@ -276,6 +281,8 @@ class GoogleTransProvider(TranslationProvider):
         self._http_session = requests.Session()
         self._timeout_requests = _TimeoutRequests(self._http_session)
         self._call_runner = _BoundedCallRunner("google")
+        self._usage_lock = threading.Lock()
+        self._estimated_characters = 0
 
     @property
     def name(self) -> str:
@@ -320,6 +327,8 @@ class GoogleTransProvider(TranslationProvider):
                     original_requests = deep_translator_google.requests
                     deep_translator_google.requests = self._timeout_requests
                     try:
+                        with self._usage_lock:
+                            self._estimated_characters += len(text)
                         return self.translator.translate(text)
                     finally:
                         deep_translator_google.requests = original_requests
@@ -330,6 +339,15 @@ class GoogleTransProvider(TranslationProvider):
             # without risking credential or message disclosure.
             logger.error("Translation Error (Google): %s", type(exc).__name__)
             return None
+
+    def get_usage(self, *, refresh: bool = False) -> dict:
+        del refresh
+        with self._usage_lock:
+            estimated = self._estimated_characters
+        return {
+            'available': True,
+            'estimated_characters': estimated,
+        }
 
 
 class DeepLProvider(TranslationProvider):
@@ -350,6 +368,8 @@ class DeepLProvider(TranslationProvider):
         self._call_runner = _BoundedCallRunner(
             "deepl", timeout_seconds=DEEPL_CALL_TIMEOUT_SECONDS
         )
+        self._usage_lock = threading.Lock()
+        self._usage_snapshot = {'available': False}
 
     @property
     def name(self) -> str:
@@ -443,6 +463,36 @@ class DeepLProvider(TranslationProvider):
             logger.error("Translation Error (DeepL batch): %s", type(exc).__name__)
             return None
 
+    def get_usage(self, *, refresh: bool = False) -> dict:
+        if refresh:
+            try:
+                usage = self._call_runner.run(self.translator.get_usage)
+                character = getattr(usage, 'character', None)
+                count = getattr(character, 'count', None)
+                limit = getattr(character, 'limit', None)
+                if (
+                    isinstance(count, int)
+                    and not isinstance(count, bool)
+                    and isinstance(limit, int)
+                    and not isinstance(limit, bool)
+                    and count >= 0
+                    and limit > 0
+                ):
+                    snapshot = {
+                        'available': True,
+                        'used': count,
+                        'limit': limit,
+                    }
+                else:
+                    snapshot = {'available': False}
+            except Exception as exc:
+                logger.error("DeepL usage request failed: %s", type(exc).__name__)
+                snapshot = {'available': False, 'error': True}
+            with self._usage_lock:
+                self._usage_snapshot = snapshot
+        with self._usage_lock:
+            return dict(self._usage_snapshot)
+
 
 ProviderFactory = Callable[[str], TranslationProvider]
 
@@ -464,6 +514,12 @@ class _PreparedTranslation:
     request_text: str
     tokens: Mapping[str, str]
     cache_key: tuple
+
+
+@dataclass(frozen=True)
+class _CachedTranslation:
+    text: str
+    provider_name: str
 
 
 class TranslationService:
@@ -489,6 +545,9 @@ class TranslationService:
         self.provider = provider or DisabledTranslationProvider()
         self._provider_mode = self.provider.name.lower()
         self._deepl_api_key = ""
+        self._fallback_provider: TranslationProvider | None = None
+        self._fallback_mode = TRANSLATION_PROVIDER_DISABLED
+        self._fallback_enabled = False
         self._translation_cache = OrderedDict()
         self._glossary_factory = glossary_factory
         self._glossaries: dict[tuple[str, str], EVEGlossary] = {}
@@ -524,12 +583,58 @@ class TranslationService:
         with self._provider_lock:
             mode = self._provider_mode
             provider = self.provider
-        return {
+            fallback_enabled = self._fallback_enabled
+            fallback_mode = self._fallback_mode
+            fallback_provider = self._fallback_provider
+        primary_available = bool(getattr(provider, 'available', True))
+        fallback_available = bool(
+            fallback_enabled
+            and fallback_provider is not None
+            and getattr(fallback_provider, 'available', True)
+        )
+        reason = getattr(provider, 'unavailable_reason', '')
+        if not primary_available and fallback_available:
+            reason = (
+                f"{provider.name} is unavailable; consented "
+                f"{fallback_provider.name} fallback is ready."
+            )
+        status = {
             'mode': mode,
             'name': provider.name,
-            'available': bool(getattr(provider, 'available', True)),
-            'reason': getattr(provider, 'unavailable_reason', ''),
+            'available': primary_available or fallback_available,
+            'reason': reason,
         }
+        if fallback_enabled:
+            status['fallback'] = {
+                'enabled': True,
+                'mode': fallback_mode,
+                'name': (
+                    fallback_provider.name
+                    if fallback_provider is not None
+                    else 'Unavailable'
+                ),
+                'available': fallback_available,
+                'primary_available': primary_available,
+            }
+        return status
+
+    def get_provider_usage(self, *, refresh: bool = True) -> dict:
+        """Return primary-provider usage; call from the scheduler thread."""
+
+        with self._provider_lock:
+            mode = self._provider_mode
+            provider = self.provider
+        get_usage = getattr(provider, 'get_usage', None)
+        if not callable(get_usage):
+            return {'provider': mode, 'available': False}
+        try:
+            usage = get_usage(refresh=refresh)
+        except Exception as exc:
+            logger.error("Provider usage failed: %s", type(exc).__name__)
+            usage = {'available': False, 'error': True}
+        snapshot = dict(usage) if isinstance(usage, Mapping) else {}
+        snapshot['provider'] = mode
+        return snapshot
 
     def set_config(self, config: dict):
         """Apply translation settings without enabling a cloud provider implicitly."""
@@ -540,7 +645,11 @@ class TranslationService:
             self._clear_translation_cache()
 
         provider_mode = resolve_translation_provider(config)
-        self.set_provider(provider_mode, config.get('deepl_api_key', ''))
+        self._configure_providers(
+            provider_mode,
+            config.get('deepl_api_key', ''),
+            fallback_enabled=config.get('provider_fallback_enabled') is True,
+        )
 
     def set_translation_memory(self, translation_memory: Any) -> None:
         self.translation_memory = translation_memory
@@ -558,7 +667,8 @@ class TranslationService:
         self.doctrine_pack = doctrine_pack
         self._clear_translation_cache()
 
-    def set_provider(self, provider_mode: str, deepl_api_key: str = ""):
+    @staticmethod
+    def _normalized_provider_mode(provider_mode: str) -> str:
         normalized_mode = (
             provider_mode.strip().lower()
             if isinstance(provider_mode, str)
@@ -566,56 +676,120 @@ class TranslationService:
         )
         if normalized_mode not in TRANSLATION_PROVIDER_MODES:
             normalized_mode = TRANSLATION_PROVIDER_DISABLED
+        return normalized_mode
+
+    def _build_provider(
+        self,
+        normalized_mode: str,
+        normalized_key: str,
+    ) -> TranslationProvider:
+        if normalized_mode == TRANSLATION_PROVIDER_DISABLED:
+            return DisabledTranslationProvider()
+        if normalized_mode == TRANSLATION_PROVIDER_DEEPL and not normalized_key:
+            return UnavailableTranslationProvider(
+                "DeepL", "DeepL API key is required."
+            )
+        try:
+            factory_key = (
+                normalized_key
+                if normalized_mode == TRANSLATION_PROVIDER_DEEPL
+                else ""
+            )
+            return self._provider_factories[normalized_mode](factory_key)
+        except Exception as exc:
+            logger.error(
+                "Could not initialize %s provider: %s",
+                normalized_mode,
+                type(exc).__name__,
+            )
+            display_name = (
+                "DeepL"
+                if normalized_mode == TRANSLATION_PROVIDER_DEEPL
+                else "Google"
+            )
+            return UnavailableTranslationProvider(
+                display_name,
+                f"{display_name} could not be initialized.",
+            )
+
+    def _configure_providers(
+        self,
+        provider_mode: str,
+        deepl_api_key: str = "",
+        *,
+        fallback_enabled: bool = False,
+    ) -> None:
+        normalized_mode = self._normalized_provider_mode(provider_mode)
         normalized_key = _normalize_api_key(deepl_api_key)
+        fallback_enabled = bool(
+            fallback_enabled
+            and normalized_mode
+            in {TRANSLATION_PROVIDER_GOOGLE, TRANSLATION_PROVIDER_DEEPL}
+        )
+        fallback_mode = TRANSLATION_PROVIDER_DISABLED
+        if fallback_enabled:
+            fallback_mode = (
+                TRANSLATION_PROVIDER_DEEPL
+                if normalized_mode == TRANSLATION_PROVIDER_GOOGLE
+                else TRANSLATION_PROVIDER_GOOGLE
+            )
 
         with self._provider_lock:
             current_mode = self._provider_mode
             current_key = self._deepl_api_key
             current_provider = self.provider
-        key_changed = (
+            current_fallback_mode = self._fallback_mode
+            current_fallback = self._fallback_provider
+
+        primary_key_changed = (
             normalized_mode == TRANSLATION_PROVIDER_DEEPL
             and normalized_key != current_key
         )
-        if normalized_mode == current_mode and not key_changed:
-            if normalized_mode == TRANSLATION_PROVIDER_DISABLED or bool(
-                getattr(current_provider, 'available', True)
-            ):
-                return
+        reuse_primary = (
+            normalized_mode == current_mode
+            and not primary_key_changed
+            and (
+                normalized_mode == TRANSLATION_PROVIDER_DISABLED
+                or bool(getattr(current_provider, 'available', True))
+            )
+        )
+        provider = (
+            current_provider
+            if reuse_primary
+            else self._build_provider(normalized_mode, normalized_key)
+        )
 
-        if normalized_mode == TRANSLATION_PROVIDER_DISABLED:
-            provider = DisabledTranslationProvider()
-        elif normalized_mode == TRANSLATION_PROVIDER_DEEPL and not normalized_key:
-            provider = UnavailableTranslationProvider("DeepL", "DeepL API key is required.")
-        else:
-            try:
-                factory_key = (
-                    normalized_key
-                    if normalized_mode == TRANSLATION_PROVIDER_DEEPL
-                    else ""
-                )
-                provider = self._provider_factories[normalized_mode](factory_key)
-            except Exception as exc:
-                logger.error(
-                    "Could not initialize %s provider: %s",
-                    normalized_mode,
-                    type(exc).__name__,
-                )
-                display_name = (
-                    "DeepL" if normalized_mode == TRANSLATION_PROVIDER_DEEPL else "Google"
-                )
-                provider = UnavailableTranslationProvider(
-                    display_name,
-                    f"{display_name} could not be initialized.",
-                )
+        fallback_key_changed = (
+            fallback_mode == TRANSLATION_PROVIDER_DEEPL
+            and normalized_key != current_key
+        )
+        reuse_fallback = (
+            fallback_enabled
+            and fallback_mode == current_fallback_mode
+            and current_fallback is not None
+            and not fallback_key_changed
+            and bool(getattr(current_fallback, 'available', True))
+        )
+        fallback_provider = None
+        if fallback_enabled:
+            fallback_provider = (
+                current_fallback
+                if reuse_fallback
+                else self._build_provider(fallback_mode, normalized_key)
+            )
 
         logger.info("Translation provider mode changed to %s", normalized_mode)
         with self._provider_lock:
             self.provider = provider
             self._provider_mode = normalized_mode
-            self._deepl_api_key = (
-                normalized_key if normalized_mode == TRANSLATION_PROVIDER_DEEPL else ""
-            )
+            self._deepl_api_key = normalized_key
+            self._fallback_enabled = fallback_enabled
+            self._fallback_mode = fallback_mode
+            self._fallback_provider = fallback_provider
         self._clear_translation_cache()
+
+    def set_provider(self, provider_mode: str, deepl_api_key: str = ""):
+        self._configure_providers(provider_mode, deepl_api_key)
 
     def test_provider(
         self,
@@ -992,17 +1166,31 @@ class TranslationService:
     ):
         normalized_target = _normalize_language_code(target_lang)
         normalized_source = _normalize_language_code(source_lang, default='auto')
+        with self._provider_lock:
+            provider_mode = self._provider_mode
+            provider = self.provider
+            fallback_mode = self._fallback_mode
+            fallback_provider = self._fallback_provider
+            fallback_enabled = self._fallback_enabled
         context_fingerprint = ""
         if (
             isinstance(context, str)
             and context.strip()
-            and bool(getattr(self.provider, 'supports_context', False))
+            and (
+                bool(getattr(provider, 'supports_context', False))
+                or bool(
+                    fallback_enabled
+                    and fallback_provider is not None
+                    and getattr(fallback_provider, 'supports_context', False)
+                )
+            )
         ):
             context_fingerprint = hashlib.sha256(
                 context.strip().encode('utf-8', errors='replace')
             ).hexdigest()[:16]
         return (
-            self._provider_mode,
+            provider_mode,
+            fallback_mode if fallback_enabled else '',
             normalized_target,
             normalized_source,
             lexicon_context,
@@ -1013,12 +1201,23 @@ class TranslationService:
     def _get_cached_translation(self, key):
         if key not in self._translation_cache:
             return None
-        translated = self._translation_cache.pop(key)
-        self._translation_cache[key] = translated
-        return translated
+        cached = self._translation_cache.pop(key)
+        self._translation_cache[key] = cached
+        if isinstance(cached, _CachedTranslation):
+            return cached
+        # Compatibility with pre-feature tests and any in-process cache value.
+        return _CachedTranslation(str(cached), self.provider_name)
 
-    def _store_cached_translation(self, key, translated: str):
-        self._translation_cache[key] = translated
+    def _store_cached_translation(
+        self,
+        key,
+        translated: str,
+        provider_name: str = "",
+    ):
+        self._translation_cache[key] = _CachedTranslation(
+            translated,
+            provider_name or self.provider_name,
+        )
         if len(self._translation_cache) > TRANSLATION_CACHE_SIZE:
             self._translation_cache.popitem(last=False)
 
@@ -1182,23 +1381,47 @@ class TranslationService:
         target_lang: str,
         source_lang: str,
         context: str = None,
-    ) -> Optional[str]:
-        try:
-            if (
-                isinstance(context, str)
-                and context.strip()
-                and bool(getattr(self.provider, 'supports_context', False))
-            ):
-                return self.provider.translate(
-                    text,
-                    target_lang,
-                    source_lang,
-                    context=context.strip(),
+        *,
+        skip_primary: bool = False,
+    ) -> tuple[Optional[str], str]:
+        with self._provider_lock:
+            primary = self.provider
+            fallback = self._fallback_provider if self._fallback_enabled else None
+        providers = [fallback] if skip_primary else [primary, fallback]
+        last_provider_name = primary.name
+        for provider in providers:
+            if provider is None:
+                continue
+            last_provider_name = provider.name
+            try:
+                if (
+                    isinstance(context, str)
+                    and context.strip()
+                    and bool(getattr(provider, 'supports_context', False))
+                ):
+                    translated = provider.translate(
+                        text,
+                        target_lang,
+                        source_lang,
+                        context=context.strip(),
+                    )
+                else:
+                    translated = provider.translate(text, target_lang, source_lang)
+            except Exception as exc:
+                logger.error(
+                    "%s translation provider failed: %s",
+                    provider.name,
+                    type(exc).__name__,
                 )
-            return self.provider.translate(text, target_lang, source_lang)
-        except Exception as exc:
-            logger.error("Translation provider failed: %s", type(exc).__name__)
-            return None
+                translated = None
+            if isinstance(translated, str) and translated.strip():
+                if provider is fallback:
+                    logger.warning(
+                        "Primary translation failed; explicit fallback used %s",
+                        provider.name,
+                    )
+                return translated, provider.name
+        return None, last_provider_name
 
     def _translate_prepared(
         self,
@@ -1209,18 +1432,39 @@ class TranslationService:
     ) -> tuple[str, bool, str]:
         cached = self._get_cached_translation(prepared.cache_key)
         if cached is not None:
-            return cached, True, self.provider.name
-        translated = self._translate_via_provider(
+            return cached.text, True, cached.provider_name
+        translated, provider_name = self._translate_via_provider(
             prepared.request_text,
             target_lang,
             source_lang,
             context,
         )
         restored = self._restore_protected_entities(translated, prepared.tokens)
+        if restored is None:
+            with self._provider_lock:
+                fallback_available = (
+                    self._fallback_enabled and self._fallback_provider is not None
+                )
+            if fallback_available:
+                translated, provider_name = self._translate_via_provider(
+                    prepared.request_text,
+                    target_lang,
+                    source_lang,
+                    context,
+                    skip_primary=True,
+                )
+                restored = self._restore_protected_entities(
+                    translated,
+                    prepared.tokens,
+                )
         if restored is not None:
-            self._store_cached_translation(prepared.cache_key, restored)
-            return restored, True, self.provider.name
-        return prepared.original, False, self.provider.name
+            self._store_cached_translation(
+                prepared.cache_key,
+                restored,
+                provider_name,
+            )
+            return restored, True, provider_name
+        return prepared.original, False, provider_name
 
     def translate_message(
         self,
@@ -1246,7 +1490,7 @@ class TranslationService:
         )
         cached = self._get_cached_translation(cache_key)
         if cached is not None:
-            return cached, True, self.provider.name
+            return cached.text, True, cached.provider_name
         prepared = self._prepare_translation(
             message,
             target_lang,
@@ -1297,7 +1541,7 @@ class TranslationService:
             cache_key = self._message_cache_key(message, target, source, context)
             cached = self._get_cached_translation(cache_key)
             if cached is not None:
-                results[index] = (cached, True, self.provider.name)
+                results[index] = (cached.text, True, cached.provider_name)
                 continue
             prepared = self._prepare_translation(
                 message,
@@ -1309,15 +1553,22 @@ class TranslationService:
             pending.append((index, prepared))
 
         batch_results: list[Any] | None = None
-        if pending and bool(getattr(self.provider, 'supports_batch', False)):
-            translate_batch = getattr(self.provider, 'translate_batch', None)
+        batch_attempted = False
+        with self._provider_lock:
+            primary_provider = self.provider
+            fallback_configured = (
+                self._fallback_enabled and self._fallback_provider is not None
+            )
+        if pending and bool(getattr(primary_provider, 'supports_batch', False)):
+            translate_batch = getattr(primary_provider, 'translate_batch', None)
             if callable(translate_batch):
+                batch_attempted = True
                 try:
                     request_texts = [prepared.request_text for _, prepared in pending]
                     if (
                         isinstance(context, str)
                         and context.strip()
-                        and bool(getattr(self.provider, 'supports_context', False))
+                        and bool(getattr(primary_provider, 'supports_context', False))
                     ):
                         response = translate_batch(
                             request_texts,
@@ -1346,22 +1597,29 @@ class TranslationService:
             )
             restored = self._restore_protected_entities(translated, prepared.tokens)
             if restored is None:
-                translated = self._translate_via_provider(
+                translated, provider_name = self._translate_via_provider(
                     prepared.request_text,
                     target,
                     source,
                     context,
+                    skip_primary=batch_attempted and fallback_configured,
                 )
                 restored = self._restore_protected_entities(translated, prepared.tokens)
+            else:
+                provider_name = primary_provider.name
             if restored is None:
                 results[result_index] = (
                     prepared.original,
                     False,
-                    self.provider.name,
+                    provider_name,
                 )
             else:
-                self._store_cached_translation(prepared.cache_key, restored)
-                results[result_index] = (restored, True, self.provider.name)
+                self._store_cached_translation(
+                    prepared.cache_key,
+                    restored,
+                    provider_name,
+                )
+                results[result_index] = (restored, True, provider_name)
 
         return [
             result
