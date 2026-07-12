@@ -167,6 +167,31 @@ def test_scoped_correction_wins_then_falls_back_to_global(tmp_path):
     )
 
 
+def test_active_doctrine_exact_correction_applies_without_importing_to_memory():
+    class Doctrine:
+        scope = "armor@2"
+        revision = "armor@2:abc"
+        protected_names = ()
+
+        @staticmethod
+        def terms_for(_source, _target):
+            return {}
+
+        @staticmethod
+        def correction_for(text, source, target):
+            if (text, source, target) == ("Ne sautez pas!", "fr", "en"):
+                return "Do not jump!"
+            return None
+
+    provider = SingleProvider()
+    service = TranslationService(provider=provider, doctrine_pack=Doctrine())
+
+    assert service.translate_message("Ne sautez pas!", "en", "fr") == (
+        "Do not jump!", True, "Local correction"
+    )
+    assert provider.calls == []
+
+
 def test_entity_index_is_protected_from_provider_and_restored():
     provider = SingleProvider()
     entity_index = ProtectedEntityIndex([
@@ -352,6 +377,37 @@ def test_cache_key_keeps_different_entities_distinct_after_tokenization():
     assert raven == ("translated:Primary Raven", True, "Single")
     assert jita == ("translated:Primary Jita", True, "Single")
     assert len(provider.calls) == 2
+
+
+def test_warm_cache_hit_bypasses_entity_and_lexicon_preprocessing():
+    class CountingEntityIndex:
+        available = True
+        entity_count = 1
+        metadata = {"asset_sha256": "stable-sde-revision"}
+
+        def __init__(self):
+            self.lexicon_calls = 0
+            self.protect_calls = 0
+
+        def lexicon_terms_for(self, _source, _target):
+            self.lexicon_calls += 1
+            return {"Raven": "Raven"}
+
+        def protect(self, text):
+            self.protect_calls += 1
+            return SimpleNamespace(text=text, tokens={})
+
+    provider = SingleProvider()
+    entity_index = CountingEntityIndex()
+    service = TranslationService(provider=provider, entity_index=entity_index)
+
+    first = service.translate_message("Primary Raven", "fr", "en")
+    second = service.translate_message("Primary Raven", "fr", "en")
+
+    assert first == second == ("translated:Primary Raven", True, "Single")
+    assert len(provider.calls) == 1
+    assert entity_index.lexicon_calls == 1
+    assert entity_index.protect_calls == 1
 
 
 def test_doctrine_terms_precede_glossary_and_protected_names_are_restored():

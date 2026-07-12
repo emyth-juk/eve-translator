@@ -10,6 +10,7 @@ from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 
 from src.app_config import TRANSLATION_PROVIDER_DISABLED, resolve_translation_provider
 from src.core.combat import classify_commands, speaker_role
+from src.core.languages import normalize_locale
 from src.core.message import ProcessedMessage, TranslationState
 
 logger = logging.getLogger(__name__)
@@ -126,18 +127,14 @@ class LogProcessingWorker(QObject):
     def _apply_config(self, config):
         self.config = config.copy() if isinstance(config, dict) else {}
         target_lang = self.config.get('target_language', 'en')
-        self.config['target_language'] = (
-            target_lang.strip().lower().replace('_', '-')
-            if isinstance(target_lang, str) and target_lang.strip()
-            else 'en'
-        )
+        self.config['target_language'] = normalize_locale(target_lang, 'en')
         ignored_languages = self.config.get('ignored_languages', ['en'])
         if isinstance(ignored_languages, str):
             ignored_languages = [ignored_languages]
         elif not isinstance(ignored_languages, (list, tuple, set)):
             ignored_languages = ['en']
         self.config['ignored_languages'] = [
-            language.strip().lower().replace('_', '-')
+            normalize_locale(language)
             for language in ignored_languages
             if isinstance(language, str) and language.strip()
         ]
@@ -199,6 +196,7 @@ class LogProcessingWorker(QObject):
             tokenized.cleaned,
             target_lang=target_lang,
             ignored_langs=ignored,
+            command_matches=commands,
         )
 
         # Establish a linear boundary with request_config_update(): a line that
@@ -414,8 +412,16 @@ class TranslationScheduler(QObject):
     """Own provider calls on a dedicated thread and coalesce safe bursts."""
 
     message_ready = Signal(object)
+    entity_index_ready = Signal(object)
 
-    def __init__(self, translator_service, parent=None):
+    def __init__(
+        self,
+        translator_service,
+        parent=None,
+        *,
+        entity_index_loader=None,
+        entity_index_path=None,
+    ):
         super().__init__(parent)
         self.translator_service = translator_service
         self.config = {
@@ -432,12 +438,43 @@ class TranslationScheduler(QObject):
         self._requested_generation = 0
         self._applied_generation = 0
         self._entity_index = getattr(translator_service, 'entity_index', None)
+        self._entity_index_loader = entity_index_loader
+        self._entity_index_path = entity_index_path
+        self._entity_index_initialized = entity_index_loader is None
         self._doctrine_path = None
         self._flush_timer = QTimer(self)
         self._flush_timer.setSingleShot(True)
         self._flush_timer.setInterval(75)
         self._flush_timer.setTimerType(Qt.TimerType.PreciseTimer)
         self._flush_timer.timeout.connect(self.flush)
+
+    @Slot()
+    def initialize_entity_index(self) -> None:
+        """Load the generated SDE index on the scheduler thread.
+
+        Qt delivers this slot before subsequently queued translation jobs when
+        it is connected to ``QThread.started``. Originals can therefore render
+        immediately while provider work waits for complete entity protection.
+        """
+
+        if self._entity_index_initialized:
+            return
+        self._entity_index_initialized = True
+        try:
+            self._entity_index = self._entity_index_loader(
+                self._entity_index_path or None
+            )
+        except Exception as exc:
+            logger.warning("Could not initialize SDE entity index: %s", type(exc).__name__)
+            self._entity_index = None
+        set_entity_index = getattr(self.translator_service, 'set_entity_index', None)
+        if callable(set_entity_index):
+            set_entity_index(
+                self._entity_index
+                if self.config.get('entity_protection', True)
+                else None
+            )
+        self.entity_index_ready.emit(self._entity_index)
 
     @Slot(dict)
     def update_config(self, config):

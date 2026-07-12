@@ -43,6 +43,7 @@ def test_untranslated_line_emits_structured_original_and_uses_target_language():
         "source text",
         target_lang="en-US",
         ignored_langs={"en"},
+        command_matches=(),
     )
 
 
@@ -387,6 +388,27 @@ def test_scheduler_immediately_retargets_late_stale_job_after_config_applied():
     assert scheduler._jobs[0].target_language == 'de'
     assert scheduler._jobs[0].config_generation == 1
     scheduler.stop()
+
+
+def test_scheduler_initializes_sde_index_before_translation_work():
+    service = MagicMock()
+    service.entity_index = None
+    loaded_index = SimpleNamespace(entity_count=42, available=True)
+    loader = MagicMock(return_value=loaded_index)
+    scheduler = TranslationScheduler(
+        service,
+        entity_index_loader=loader,
+        entity_index_path="generated.json",
+    )
+    ready = []
+    scheduler.entity_index_ready.connect(ready.append)
+
+    scheduler.initialize_entity_index()
+    scheduler.initialize_entity_index()
+
+    loader.assert_called_once_with("generated.json")
+    service.set_entity_index.assert_called_once_with(loaded_index)
+    assert ready == [loaded_index]
 
 
 def replace_job(job, **changes):

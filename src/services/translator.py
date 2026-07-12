@@ -19,6 +19,7 @@ from src.app_config import (
     resolve_translation_provider,
 )
 from src.core.glossary import EVEGlossary
+from src.core.languages import normalize_locale as _normalize_language_code
 from src.core.lexicon import LexiconTerm, LongestLexiconMatcher
 
 logger = logging.getLogger(__name__)
@@ -152,13 +153,6 @@ class _BoundedCallRunner:
         if errors:
             raise errors[0]
         return result[0] if result else None
-
-
-def _normalize_language_code(value, default='en') -> str:
-    if not isinstance(value, str):
-        return default
-    normalized = value.strip().lower().replace('_', '-')
-    return normalized or default
 
 
 class TranslationProvider(ABC):
@@ -909,27 +903,31 @@ class TranslationService:
         source_lang: str,
         target_lang: str,
         glossary: EVEGlossary,
-        doctrine_terms: Mapping[str, str],
-        doctrine_names: Sequence[str],
     ) -> tuple:
         pair = (
             self._glossary_source_code(source_lang),
             _normalize_language_code(target_lang),
         )
         doctrine = self._active_doctrine()
-        doctrine_material = dict(doctrine_terms)
-        doctrine_material.update({
-            f"protected:{index}": value
-            for index, value in enumerate(doctrine_names)
-        })
         entity = self.entity_index
+        entity_metadata = getattr(entity, 'metadata', {})
+        if not isinstance(entity_metadata, Mapping):
+            entity_metadata = {}
+        entity_revision = str(
+            entity_metadata.get('asset_sha256')
+            or getattr(entity, 'revision', '')
+            or getattr(entity, 'sde_version', '')
+            or ''
+        )
+        doctrine_revision = self._doctrine_revision(doctrine)
+        if doctrine is not None and not doctrine_revision:
+            doctrine_revision = f"object:{id(doctrine)}"
         return (
             pair,
             self._glossary_revision(pair, glossary),
             self._doctrine_scope(),
-            self._doctrine_revision(doctrine),
-            self._mapping_digest(doctrine_material),
-            str(getattr(entity, 'sde_version', '') or ''),
+            doctrine_revision,
+            entity_revision,
             int(getattr(entity, 'entity_count', 0) or 0),
             id(entity) if entity is not None else 0,
         )
@@ -942,6 +940,11 @@ class TranslationService:
         doctrine_terms: Mapping[str, str],
     ) -> LongestLexiconMatcher:
         entity_index = self.entity_index
+        key = self._lexicon_context(source_lang, target_lang, glossary)
+        matcher = self._lexicon_matchers.get(key)
+        if matcher is not None:
+            return matcher
+
         entity_terms: Mapping[str, str] = {}
         translations_for = getattr(entity_index, 'lexicon_terms_for', None)
         if not callable(translations_for):
@@ -957,33 +960,22 @@ class TranslationService:
         glossary_terms = getattr(glossary, 'terms', {})
         if not isinstance(glossary_terms, Mapping):
             glossary_terms = {}
-        key = (
-            self._glossary_source_code(source_lang),
-            _normalize_language_code(target_lang),
-            self._mapping_digest(entity_terms),
-            self._mapping_digest(glossary_terms),
-            self._mapping_digest(doctrine_terms),
-            self._doctrine_revision(self._active_doctrine()),
-            id(entity_index) if entity_index is not None else 0,
-        )
-        matcher = self._lexicon_matchers.get(key)
-        if matcher is None:
-            matcher = LongestLexiconMatcher([
-                *(
-                    LexiconTerm(source, target, 0)
-                    for source, target in entity_terms.items()
-                ),
-                *(
-                    LexiconTerm(source, target, 10)
-                    for source, target in glossary_terms.items()
-                    if isinstance(source, str) and isinstance(target, str)
-                ),
-                *(
-                    LexiconTerm(source, target, 20)
-                    for source, target in doctrine_terms.items()
-                ),
-            ])
-            self._lexicon_matchers[key] = matcher
+        matcher = LongestLexiconMatcher([
+            *(
+                LexiconTerm(source, target, 0)
+                for source, target in entity_terms.items()
+            ),
+            *(
+                LexiconTerm(source, target, 10)
+                for source, target in glossary_terms.items()
+                if isinstance(source, str) and isinstance(target, str)
+            ),
+            *(
+                LexiconTerm(source, target, 20)
+                for source, target in doctrine_terms.items()
+            ),
+        ])
+        self._lexicon_matchers[key] = matcher
         return matcher
 
     def _clear_translation_cache(self):
@@ -1038,18 +1030,36 @@ class TranslationService:
     ) -> str | None:
         memory = self.translation_memory
         lookup = getattr(memory, 'lookup', None)
-        if not callable(lookup):
-            return None
         scope = self._doctrine_scope()
-        try:
-            corrected = lookup(message, source_lang, target_lang, scope)
-            if not corrected and scope:
-                corrected = lookup(message, source_lang, target_lang, "")
-        except Exception as exc:
-            logger.warning("Could not read local correction memory: %s", type(exc).__name__)
-            return None
+        corrected = None
+        if callable(lookup):
+            try:
+                corrected = lookup(message, source_lang, target_lang, scope)
+            except Exception as exc:
+                logger.warning(
+                    "Could not read local correction memory: %s",
+                    type(exc).__name__,
+                )
         if isinstance(corrected, str) and corrected.strip():
             return corrected
+
+        doctrine = self._active_doctrine()
+        doctrine_lookup = getattr(doctrine, 'correction_for', None)
+        if callable(doctrine_lookup):
+            try:
+                corrected = doctrine_lookup(
+                    message,
+                    source_lang,
+                    target_lang,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Could not read doctrine correction: %s",
+                    type(exc).__name__,
+                )
+                return None
+            if isinstance(corrected, str) and corrected.strip():
+                return corrected
         return None
 
     def _prepare_translation(
@@ -1058,6 +1068,7 @@ class TranslationService:
         target_lang: str,
         source_lang: str,
         context: str = None,
+        cache_key: tuple | None = None,
     ) -> _PreparedTranslation:
         glossary = self._get_glossary(source_lang, target_lang)
         self.glossary = glossary
@@ -1081,24 +1092,43 @@ class TranslationService:
         ).replace(preprocessed)
         preprocessed, sde_tokens = self._protect_sde_entities(preprocessed)
         tokens = {**doctrine_tokens, **sde_tokens}
-        lexicon_context = self._lexicon_context(
-            source_lang,
-            target_lang,
-            glossary,
-            doctrine_terms,
-            doctrine_names,
-        )
-        return _PreparedTranslation(
-            original=message,
-            request_text=preprocessed,
-            tokens=tokens,
-            cache_key=self._cache_key(
+        if cache_key is None:
+            lexicon_context = self._lexicon_context(
+                source_lang,
+                target_lang,
+                glossary,
+            )
+            cache_key = self._cache_key(
                 message,
                 target_lang,
                 source_lang,
                 lexicon_context,
                 context,
-            ),
+            )
+        return _PreparedTranslation(
+            original=message,
+            request_text=preprocessed,
+            tokens=tokens,
+            cache_key=cache_key,
+        )
+
+    def _message_cache_key(
+        self,
+        message: str,
+        target_lang: str,
+        source_lang: str,
+        context: str = None,
+    ) -> tuple:
+        """Build a cheap stable key before any lexicon/entity preprocessing."""
+
+        glossary = self._get_glossary(source_lang, target_lang)
+        self.glossary = glossary
+        return self._cache_key(
+            message,
+            target_lang,
+            source_lang,
+            self._lexicon_context(source_lang, target_lang, glossary),
+            context,
         )
 
     @staticmethod
@@ -1208,11 +1238,21 @@ class TranslationService:
         corrected = self._lookup_correction(message, source_lang, target_lang)
         if corrected is not None:
             return corrected, True, "Local correction"
+        cache_key = self._message_cache_key(
+            message,
+            target_lang,
+            source_lang,
+            context,
+        )
+        cached = self._get_cached_translation(cache_key)
+        if cached is not None:
+            return cached, True, self.provider.name
         prepared = self._prepare_translation(
             message,
             target_lang,
             source_lang,
             context,
+            cache_key,
         )
         return self._translate_prepared(
             prepared,
@@ -1254,11 +1294,18 @@ class TranslationService:
             if corrected is not None:
                 results[index] = (corrected, True, "Local correction")
                 continue
-            prepared = self._prepare_translation(message, target, source, context)
-            cached = self._get_cached_translation(prepared.cache_key)
+            cache_key = self._message_cache_key(message, target, source, context)
+            cached = self._get_cached_translation(cache_key)
             if cached is not None:
                 results[index] = (cached, True, self.provider.name)
                 continue
+            prepared = self._prepare_translation(
+                message,
+                target,
+                source,
+                context,
+                cache_key,
+            )
             pending.append((index, prepared))
 
         batch_results: list[Any] | None = None

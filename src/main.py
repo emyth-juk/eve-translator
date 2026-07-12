@@ -168,9 +168,10 @@ class TranslatorManager(QObject):
         tokenizer = EVELinkTokenizer()
         detector = LanguageDetector()
         self.translation_memory = TranslationMemory()
-        self.entity_index = ProtectedEntityIndex.load(
-            self.config.get('shared', {}).get('entity_index_path') or None
-        )
+        # The generated SDE artifact is parsed on the translation thread. Keep
+        # an empty index until then so app/tray construction is never delayed,
+        # while queued provider jobs still wait behind complete initialization.
+        self.entity_index = ProtectedEntityIndex.empty()
         translator_service = TranslationService()
         if hasattr(translator_service, 'set_translation_memory'):
             translator_service.set_translation_memory(self.translation_memory)
@@ -189,13 +190,25 @@ class TranslatorManager(QObject):
             defer_translation=True,
         )
         self.translation_thread = QThread()
-        self.translation_scheduler = TranslationScheduler(translator_service)
+        self.translation_scheduler = TranslationScheduler(
+            translator_service,
+            entity_index_loader=ProtectedEntityIndex.load,
+            entity_index_path=(
+                self.config.get('shared', {}).get('entity_index_path') or None
+            ),
+        )
         # Apply the first snapshot before moving the worker. Later updates use
         # the queued signal so provider state is only mutated by its owner thread.
         self.worker.update_config(copy.deepcopy(self.config['shared']))
         self.translation_scheduler.update_config(copy.deepcopy(self.config['shared']))
         self.worker.moveToThread(self.thread)
         self.translation_scheduler.moveToThread(self.translation_thread)
+        self.translation_thread.started.connect(
+            self.translation_scheduler.initialize_entity_index
+        )
+        self.translation_scheduler.entity_index_ready.connect(
+            self._entity_index_initialized
+        )
         self.worker_config_changed.connect(self.worker.apply_queued_config)
         self.worker_config_changed.connect(
             self.translation_scheduler.apply_queued_config
@@ -262,6 +275,14 @@ class TranslatorManager(QObject):
 
     def _get_configured_log_dir(self):
         return self.config['shared'].get('log_dir', '')
+
+    @Slot(object)
+    def _entity_index_initialized(self, index):
+        self.entity_index = index or ProtectedEntityIndex.empty()
+        logger.info(
+            "SDE entity protection ready (%s names)",
+            getattr(self.entity_index, 'entity_count', 0),
+        )
 
     def _configured_scan_interval_ms(self):
         return max(1000, int(self.config['shared'].get('fleet_scan_interval', 10) * 1000))
@@ -1487,6 +1508,10 @@ class TranslatorManager(QObject):
                 logger.error("Translation scheduler did not stop before the shutdown deadline")
                 translation_thread.terminate()
                 translation_thread.wait(1_000)
+        memory = getattr(self, 'translation_memory', None)
+        close_memory = getattr(memory, 'close', None)
+        if callable(close_memory):
+            close_memory()
         self.app.quit()
 
     def run(self):
