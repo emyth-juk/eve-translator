@@ -31,9 +31,23 @@ SHORT_ASCII_ALNUM_LIMIT = 3
 DetectorFactory.seed = 0
 
 EVE_MARKET_PREFIX_PATTERN = re.compile(
-    r'^(?:hypernet|wts|wtb|wtt|zkillboard)\b',
+    r'^(?:wts|wtb|wtt|zkillboard)\b',
     re.IGNORECASE,
 )
+HYPERNET_OFFER_MARKER_PATTERN = re.compile(
+    # EVE link metadata occasionally leaks into the visible label, producing
+    # shapes such as ``HyperNet512offer:`` or ``HyperNetcheap8xoffer:``.
+    r'\bhypernet(?:(?:[a-z0-9]{1,16})|\s+)offer\s*:',
+    re.IGNORECASE,
+)
+HYPERNET_BARE_MARKER_PATTERN = re.compile(
+    r'^[\s\-\u2013\u2014\u2022|]*hypernet\s*:',
+    re.IGNORECASE,
+)
+HYPERNET_MARKET_FILLER_WORDS = frozenset({
+    'b', 'bil', 'cheap', 'each', 'isk', 'left', 'm', 'mil',
+    'node', 'nodes', 'only', 'x',
+})
 EVE_ITEM_SUFFIX_PATTERN = re.compile(
     r'(?:blueprint|skill extractor|skill injector|repairer|booster|hardener|stabilizer)'
     r'(?:\s+x?\s*\d+\w*)?$',
@@ -176,6 +190,39 @@ class LanguageDetector:
             for word in words
         )
         return is_title_cased and bool(EVE_ITEM_SUFFIX_PATTERN.search(text))
+
+    @staticmethod
+    def _looks_like_english_hypernet_offer(text: str) -> bool:
+        """Identify generated HyperNet offer lines without hiding discussion.
+
+        The offer label can be preceded by punctuation and can contain compact
+        EVE-link artifacts.  Once labels are removed, generated offers contain
+        title-cased item names, acronyms and numeric market metadata.  Lowercase
+        prose that is not known market filler keeps the line eligible for normal
+        language detection.
+        """
+
+        has_offer_marker = bool(HYPERNET_OFFER_MARKER_PATTERN.search(text))
+        has_bare_marker = bool(HYPERNET_BARE_MARKER_PATTERN.search(text))
+        if not has_offer_marker and not has_bare_marker:
+            return False
+
+        remainder = HYPERNET_OFFER_MARKER_PATTERN.sub(' ', text)
+        remainder = HYPERNET_BARE_MARKER_PATTERN.sub(' ', remainder)
+        words = re.findall(r"[A-Za-z]+(?:['-][A-Za-z]+)*", remainder)
+        if not words:
+            return False
+
+        has_item_word = False
+        for word in words:
+            if word.casefold() in HYPERNET_MARKET_FILLER_WORDS:
+                continue
+            if word.isupper() or word[0].isupper():
+                has_item_word = True
+                continue
+            return False
+
+        return has_item_word
 
     @staticmethod
     def _commands_cover_text(text: str, command_matches: Iterable[object]) -> bool:
@@ -379,6 +426,13 @@ class LanguageDetector:
         # when the target is different even if their source is generally ignored.
         if command_hint:
             return target_lang != command_hint, command_hint
+
+        # Generated HyperNet offers are English market data, not chat prose.
+        # Check their structure before statistical detection so leading dashes
+        # and leaked link metadata cannot turn ship names into false Norwegian
+        # (or other short-text) detections.
+        if self._looks_like_english_hypernet_offer(s_text):
+            return False, 'market_offer'
 
         # 2. Ignore only a complete phrase match. The previous substring search
         # caused words such as "shield" or "armor" to suppress an entire mixed

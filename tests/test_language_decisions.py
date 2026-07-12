@@ -76,6 +76,65 @@ def test_force_ignore_keyword_must_match_the_complete_message():
         ) == (False, "ignored_keyword")
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "-HyperNet offer: Kronos HyperNet offer: Vargur "
+            "HyperNet offer: Widow"
+        ),
+        "-HyperNet offer: PNI HyperNet offer: Odysseus",
+        "-HyperNet512offer: Marshal HyperNetcheap8xoffer: Marshal",
+        "cheap node! HyperNet offer: Marshal HyperNet offer: Marshal",
+        "HyperNet offer: Revelation Navy Issue 11/16",
+        "- Revelation Navy Issue Phoenix Navy Issue Moros Navy Issue "
+        "HyperNet offer: Minokawa HyperNet offer: Revelation",
+        "HyperNet: Salvation",
+    ],
+)
+def test_generated_english_hypernet_offers_are_ignored(message):
+    with patch("src.core.detector.detect") as mock_detect:
+        detector = LanguageDetector()
+
+        assert detector.should_translate(
+            message,
+            target_lang="de",
+            ignored_langs=set(),
+        ) == (False, "market_offer")
+        mock_detect.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("message", "detected"),
+    [
+        ("HyperNet offer: Kronos is overpriced", "en"),
+        ("Can someone explain this HyperNet offer: Kronos?", "en"),
+        ("HyperNet offers are ruining Jita", "en"),
+        ("HyperNet offer: Kronos ist viel zu teuer", "de"),
+        ("-HyperNet offer: totally fake thing", "en"),
+    ],
+)
+def test_hypernet_discussion_remains_eligible_for_translation(message, detected):
+    with patch("src.core.detector.detect", return_value=detected):
+        detector = LanguageDetector()
+
+        assert detector.should_translate(
+            message,
+            target_lang="fr",
+            ignored_langs=set(),
+        ) == (True, detected)
+
+
+def test_non_latin_hypernet_discussion_keeps_script_priority():
+    detector = LanguageDetector()
+
+    assert detector.should_translate(
+        "\u9700\u8981\u770b\u770b HyperNet offer: Kronos",
+        target_lang="en",
+        ignored_langs={"en"},
+    ) == (True, "zh")
+
+
 def test_general_language_variant_matching_target_is_not_translated():
     with patch("src.core.detector.detect", return_value="pt"):
         detector = LanguageDetector()
