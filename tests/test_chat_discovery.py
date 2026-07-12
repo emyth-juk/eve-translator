@@ -10,6 +10,7 @@ from src.core.character_info import CharacterInfo
 from src.core.fleet_info import FleetInfo
 from src.services.channel_detector import AnyChatDetector
 from src.services.chat_discovery import ChatDiscoveryResult, ChatDiscoveryWorker
+from src.services.log_discovery import parse_eve_timestamp
 from src.services.fleet_detector import FleetDetector
 from src.services.local_detector import LocalChatDetector
 
@@ -83,12 +84,6 @@ def test_scan_orders_detectors_and_emits_one_immutable_snapshot():
         events.append(("local", log_dir))
         return characters
 
-    def parse_filename(filename):
-        events.append(("parse", filename))
-        if filename.endswith("_7.txt"):
-            return "Local", "7", 900.0
-        return None
-
     def scan_channels(log_dir, *, active_characters, entries):
         assert entries == ()
         events.append(("any", log_dir, active_characters))
@@ -100,7 +95,6 @@ def test_scan_orders_detectors_and_emits_one_immutable_snapshot():
         return fleets
 
     local.scan_active_characters.side_effect = scan_local
-    channel.parse_filename.side_effect = parse_filename
     channel.scan_channels.side_effect = scan_channels
     fleet.scan_active_fleets.side_effect = scan_fleets
     entry_scanner = MagicMock(return_value=())
@@ -120,17 +114,19 @@ def test_scan_orders_detectors_and_emits_one_immutable_snapshot():
     entry_scanner.assert_called_once_with("C:/logs")
     assert [event[0] for event in events] == [
         "local",
-        "parse",
-        "parse",
         "any",
         "fleet",
     ]
-    assert events[3] == (
+    assert events[1] == (
         "any",
         "C:/logs",
-        {"7": 900.0, "8": False, "9": None},
+        {
+            "7": parse_eve_timestamp("20260712120000"),
+            "8": False,
+            "9": None,
+        },
     )
-    assert events[4] == ("fleet", "C:/logs", 1_800)
+    assert events[2] == ("fleet", "C:/logs", 1_800)
     assert len(results) == 1
     assert failures == []
     result = results[0]
@@ -195,7 +191,6 @@ def test_later_stage_failure_preserves_completed_registries():
         "7": _character("7", "C:/logs/Local_20260712_120000_7.txt")
     }
     local.scan_active_characters.return_value = characters
-    channel.parse_filename.return_value = ("Local", "7", 900.0)
     channel.scan_channels.side_effect = ValueError("bad header")
     worker = ChatDiscoveryWorker(
         local_detector=local,

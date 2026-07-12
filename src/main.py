@@ -83,7 +83,10 @@ from src.services.hotkeys import (
 )
 from src.services.local_detector import LocalChatDetector
 from src.services.channel_detector import AnyChatDetector
-from src.services.chat_discovery import ChatDiscoveryWorker
+from src.services.chat_discovery import (
+    ChatDiscoveryWorker,
+    active_character_starts,
+)
 from src.services.log_discovery import log_recency_key, normalized_log_path
 from src.gui.settings import SettingsDialog
 from src.gui.compose import ComposeDialog
@@ -94,6 +97,7 @@ WATCHED_DIR_FALLBACK_SECONDS = 60
 WORKER_SHUTDOWN_TIMEOUT_MS = 15_000
 DISCOVERY_RETRY_BASE_MS = 1_000
 DISCOVERY_RETRY_MAX_MS = 10_000
+DISCOVERY_FAILURE_ERROR_THRESHOLD = 3
 SCANNER_CONFIG_KEYS = frozenset({
     'log_dir',
     'fleet_inactive_threshold',
@@ -342,6 +346,8 @@ class TranslatorManager(QObject):
         self._discovery_inflight_signature = None
         self._discovery_request_invalidated = False
         self._discovery_failure_count = 0
+        self._discovery_retry_signature = None
+        self._discovery_error_sessions = set()
         self.discovery_retry_timer = QTimer(self)
         self.discovery_retry_timer.setSingleShot(True)
         self.discovery_retry_timer.setTimerType(Qt.TimerType.CoarseTimer)
@@ -374,13 +380,33 @@ class TranslatorManager(QObject):
             return False
 
         log_dir = self._get_configured_log_dir()
-        if not log_dir or not os.path.isdir(log_dir):
+        if not log_dir:
             return False
 
         threshold = int(
             self.config['shared'].get('fleet_inactive_threshold', 1800)
         )
         signature = (normalized_log_path(log_dir), threshold)
+
+        retry_timer = getattr(self, 'discovery_retry_timer', None)
+        retry_signature = getattr(self, '_discovery_retry_signature', None)
+        if (
+            retry_signature is not None
+            and retry_timer is not None
+            and retry_timer.isActive()
+        ):
+            if signature == retry_signature:
+                # The scheduled retry will see all filesystem changes that
+                # accumulated during the quiet period. Routine timer/watcher
+                # activity must not punch through the failure backoff.
+                return True
+            # A deliberate scanner configuration change targets different
+            # work, so it does not need to wait on the old path's backoff.
+            retry_timer.stop()
+            self._discovery_failure_count = 0
+            self._discovery_retry_signature = None
+            self._clear_discovery_session_errors()
+
         if getattr(self, '_discovery_scan_pending', False):
             self._discovery_rescan_requested = True
             if signature != getattr(
@@ -389,9 +415,11 @@ class TranslatorManager(QObject):
                 None,
             ):
                 self._discovery_request_invalidated = True
+                self._discovery_failure_count = 0
+                self._discovery_retry_signature = None
+                self._clear_discovery_session_errors()
             return True
 
-        retry_timer = getattr(self, 'discovery_retry_timer', None)
         if retry_timer is not None:
             retry_timer.stop()
         self._discovery_generation = (
@@ -426,6 +454,11 @@ class TranslatorManager(QObject):
 
         self._discovery_scan_pending = False
         self._discovery_inflight_generation = None
+        completed_signature = getattr(
+            self,
+            '_discovery_inflight_signature',
+            None,
+        )
         self._discovery_inflight_signature = None
         invalidated = getattr(
             self,
@@ -446,6 +479,8 @@ class TranslatorManager(QObject):
         )
         if getattr(result, 'succeeded', False) and same_directory:
             self._discovery_failure_count = 0
+            self._discovery_retry_signature = None
+            self._clear_discovery_session_errors()
             self._scan_characters(
                 new_registry=dict(result.character_registry)
             )
@@ -467,6 +502,30 @@ class TranslatorManager(QObject):
                 getattr(error, 'exception_type', 'Error'),
                 getattr(error, 'message', ''),
             )
+            exponent = min(self._discovery_failure_count - 1, 4)
+            delay_ms = min(
+                DISCOVERY_RETRY_BASE_MS * (2 ** exponent),
+                DISCOVERY_RETRY_MAX_MS,
+            )
+            self._discovery_retry_signature = completed_signature
+            self._discovery_rescan_requested = False
+            if (
+                self._discovery_failure_count
+                >= DISCOVERY_FAILURE_ERROR_THRESHOLD
+            ):
+                self._surface_discovery_failure(error, delay_ms)
+
+            if not same_directory:
+                # The configured target changed without passing through the
+                # normal invalidation path. Retry that new target immediately.
+                self._discovery_retry_signature = None
+                QTimer.singleShot(0, self._periodic_scan)
+                return
+
+            retry_timer = getattr(self, 'discovery_retry_timer', None)
+            if retry_timer is not None:
+                retry_timer.start(delay_ms)
+            return
 
         immediate_rescan = (
             getattr(self, '_discovery_rescan_requested', False)
@@ -475,15 +534,73 @@ class TranslatorManager(QObject):
         if immediate_rescan:
             self._discovery_rescan_requested = False
             QTimer.singleShot(0, self._periodic_scan)
-        elif getattr(result, 'error', None) is not None:
-            exponent = min(self._discovery_failure_count - 1, 4)
-            delay_ms = min(
-                DISCOVERY_RETRY_BASE_MS * (2 ** exponent),
-                DISCOVERY_RETRY_MAX_MS,
+
+    def _surface_discovery_failure(self, error, retry_delay_ms: int) -> None:
+        """Expose a persistent discovery outage on every enabled session."""
+        stage = str(getattr(error, 'stage', 'unknown') or 'unknown')
+        exception_type = str(
+            getattr(error, 'exception_type', 'Error') or 'Error'
+        )
+        message = str(getattr(error, 'message', '') or '').strip()
+        log_dir = str(self._get_configured_log_dir() or '').strip()
+        stage_labels = {
+            'snapshot': (
+                f'Cannot read EVE chat log folder "{log_dir}"'
+                if log_dir
+                else 'Cannot read the EVE chat log folder'
+            ),
+            'local': 'Could not detect active Local chats',
+            'local-session-starts': 'Could not identify active EVE sessions',
+            'any': 'Could not detect active chat channels',
+            'fleet': 'Could not detect active Fleet chats',
+        }
+        summary = stage_labels.get(stage, 'Chat log discovery failed')
+        reason = exception_type
+        if message:
+            reason = f"{exception_type}: {message}"
+        retry_seconds = max(1, int(round(retry_delay_ms / 1_000)))
+        detail = (
+            f"{summary} ({reason}). "
+            f"Retrying automatically in {retry_seconds}s."
+        )
+
+        error_sessions = getattr(self, '_discovery_error_sessions', None)
+        if error_sessions is None:
+            error_sessions = set()
+            self._discovery_error_sessions = error_sessions
+        for session_id in SESSION_IDS:
+            enabled = (
+                self.config.get('sessions', {})
+                .get(session_id, {})
+                .get('enabled', False)
             )
-            retry_timer = getattr(self, 'discovery_retry_timer', None)
-            if retry_timer is not None:
-                retry_timer.start(delay_ms)
+            if not enabled:
+                continue
+            error_sessions.add(session_id)
+            self._set_session_runtime_state(
+                session_id,
+                SessionRuntimeState.ERROR,
+                detail,
+            )
+
+    def _clear_discovery_session_errors(self) -> None:
+        """Return discovery-owned ERROR sessions to normal recovery flow."""
+        error_sessions = set(
+            getattr(self, '_discovery_error_sessions', set())
+        )
+        self._discovery_error_sessions = set()
+        for session_id in error_sessions:
+            enabled = (
+                self.config.get('sessions', {})
+                .get(session_id, {})
+                .get('enabled', False)
+            )
+            state = (
+                SessionRuntimeState.WAITING
+                if enabled
+                else SessionRuntimeState.DISABLED
+            )
+            self._set_session_runtime_state(session_id, state)
 
     @Slot(object)
     def _entity_index_initialized(self, index):
@@ -1569,7 +1686,11 @@ class TranslatorManager(QObject):
                 .get('enabled', False)
             )
             state_label = state_labels[state]
-            tooltip_parts.append(f"{label}: {state_label}")
+            error = getattr(self, '_session_runtime_errors', {}).get(session_id)
+            tooltip_line = f"{label}: {state_label}"
+            if error:
+                tooltip_line = f"{tooltip_line} - {error}"
+            tooltip_parts.append(tooltip_line)
 
             action = getattr(self, 'session_actions', {}).get(session_id)
             if action is None:
@@ -1577,7 +1698,6 @@ class TranslatorManager(QObject):
             if action is not None:
                 action.setChecked(enabled)
                 action.setText(f"{label} - {state_label}")
-                error = getattr(self, '_session_runtime_errors', {}).get(session_id)
                 action.setToolTip(error or f"{label}: {state_label}")
 
         tray_icon = getattr(self, 'tray_icon', None)
@@ -1755,22 +1875,9 @@ class TranslatorManager(QObject):
             if detector is None:
                 detector = AnyChatDetector()
                 self.any_chat_detector = detector
-            active_characters = {}
-            for character_id, character in getattr(
-                self, 'character_registry', {}
-            ).items():
-                if not getattr(character, 'is_active', False):
-                    # Distinguish a character Local explicitly found inactive
-                    # from one Local discovery has not seen yet. Only the latter
-                    # may use the Any log's own recent mtime as startup evidence.
-                    active_characters[character_id] = False
-                    continue
-                parsed_local = detector.parse_filename(
-                    Path(character.latest_log_path).name
-                )
-                active_characters[character_id] = (
-                    parsed_local[2] if parsed_local is not None else None
-                )
+            active_characters = active_character_starts(
+                getattr(self, 'character_registry', {})
+            )
             new_registry = detector.scan_channels(
                 log_dir,
                 active_characters=active_characters,

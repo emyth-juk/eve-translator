@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import re
 import stat as stat_module
@@ -15,8 +14,6 @@ EVE_FILENAME_CACHE_SIZE = 4_096
 EVE_HEADER_CACHE_SIZE = 2_048
 EVE_HEADER_READ_BYTES = 16_384
 EVE_LOG_FUTURE_MTIME_SKEW_SECONDS = 2.0
-
-logger = logging.getLogger(__name__)
 
 _FILENAME_PATTERN = re.compile(
     r"^(?P<channel>.+)_(?P<date>\d{8})_(?P<time>\d{6})"
@@ -131,40 +128,35 @@ def parse_eve_log_filename(filename: str | os.PathLike[str]) -> EVELogFilename |
 def scan_eve_log_entries(
     log_dir: str | os.PathLike[str],
 ) -> tuple[EVELogEntry, ...]:
-    """Enumerate a directory once and snapshot every regular file once."""
+    """Enumerate a directory once and snapshot every regular file once.
+
+    An empty directory is a successful empty snapshot. Directory access and
+    file metadata failures propagate so callers can preserve their last-good
+    registries and retry instead of mistaking an incomplete scan for logout.
+    Files that disappear while the directory is being enumerated are skipped;
+    that is the expected shape of ordinary EVE log rotation.
+    """
     entries: list[EVELogEntry] = []
-    try:
-        with os.scandir(log_dir) as directory:
-            for entry in directory:
-                try:
-                    entry_stat = entry.stat()
-                except OSError:
-                    continue
-                if not stat_module.S_ISREG(entry_stat.st_mode):
-                    continue
-                entries.append(
-                    EVELogEntry(
-                        name=entry.name,
-                        path=os.path.abspath(entry.path),
-                        size=entry_stat.st_size,
-                        mtime=entry_stat.st_mtime,
-                        mtime_ns=entry_stat.st_mtime_ns,
-                        ctime=entry_stat.st_ctime,
-                        filename=parse_eve_log_filename(entry.name),
-                    )
+    with os.scandir(log_dir) as directory:
+        for entry in directory:
+            try:
+                entry_stat = entry.stat()
+            except FileNotFoundError:
+                continue
+            if not stat_module.S_ISREG(entry_stat.st_mode):
+                continue
+            entries.append(
+                EVELogEntry(
+                    name=entry.name,
+                    path=os.path.abspath(entry.path),
+                    size=entry_stat.st_size,
+                    mtime=entry_stat.st_mtime,
+                    mtime_ns=entry_stat.st_mtime_ns,
+                    ctime=entry_stat.st_ctime,
+                    filename=parse_eve_log_filename(entry.name),
                 )
-    except OSError as exc:
-        logger.error("Error scanning EVE chat logs in %s: %s", log_dir, exc)
-        return ()
-    return tuple(
-        sorted(
-            entries,
-            key=lambda item: (
-                normalized_log_path(item.path),
-                item.path,
-            ),
-        )
-    )
+            )
+    return tuple(entries)
 
 
 class UTF16HeaderCache:

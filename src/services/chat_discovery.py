@@ -18,7 +18,11 @@ from src.core.fleet_info import FleetInfo
 from src.services.channel_detector import AnyChatDetector
 from src.services.fleet_detector import FleetDetector
 from src.services.local_detector import LocalChatDetector
-from src.services.log_discovery import EVELogEntry, scan_eve_log_entries
+from src.services.log_discovery import (
+    EVELogEntry,
+    parse_eve_log_filename,
+    scan_eve_log_entries,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +30,27 @@ logger = logging.getLogger(__name__)
 def _read_only_copy(values: Mapping[str, Any]) -> Mapping[str, Any]:
     """Detach a detector-owned registry and expose it as read-only."""
     return MappingProxyType(dict(values))
+
+
+def active_character_starts(
+    characters: Mapping[str, CharacterInfo],
+) -> dict[str, float | bool | None]:
+    """Map known characters to a Local start or explicit inactivity.
+
+    Both background and synchronous discovery use this function so their
+    startup evidence cannot drift. Filename parsing is independent of the Any
+    detector and uses the shared EVE log parser directly.
+    """
+    active: dict[str, float | bool | None] = {}
+    for character_id, character in characters.items():
+        if not character.is_active:
+            active[str(character_id)] = False
+            continue
+        parsed = parse_eve_log_filename(character.latest_log_path)
+        active[str(character_id)] = (
+            parsed.started_time if parsed is not None else None
+        )
+    return active
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,23 +156,6 @@ class ChatDiscoveryWorker(QObject):
         thread = QThread.currentThread()
         return bool(thread and thread.isInterruptionRequested())
 
-    @staticmethod
-    def _active_character_starts(
-        characters: Mapping[str, CharacterInfo],
-        detector: AnyChatDetector,
-    ) -> dict[str, float | bool | None]:
-        """Map known characters to a Local start or explicit inactivity."""
-        active: dict[str, float | bool | None] = {}
-        for character_id, character in characters.items():
-            if not character.is_active:
-                active[str(character_id)] = False
-                continue
-            parsed = detector.parse_filename(
-                os.path.basename(os.fspath(character.latest_log_path))
-            )
-            active[str(character_id)] = parsed[2] if parsed is not None else None
-        return active
-
     def _cancelled_result(
         self,
         generation: int,
@@ -222,10 +230,7 @@ class ChatDiscoveryWorker(QObject):
                 return
 
             stage = "local-session-starts"
-            active_starts = self._active_character_starts(
-                characters,
-                self.channel_detector,
-            )
+            active_starts = active_character_starts(characters)
 
             stage = "any"
             channels = dict(
@@ -289,4 +294,5 @@ __all__ = [
     "ChatDiscoveryError",
     "ChatDiscoveryResult",
     "ChatDiscoveryWorker",
+    "active_character_starts",
 ]
