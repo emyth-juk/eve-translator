@@ -1487,6 +1487,17 @@ class TranslationService:
         translated: Any,
         tokens: Mapping[str, str],
     ) -> str | None:
+        """Restore provider-safe markers only when every identity is unique.
+
+        Providers sometimes change marker case, wrapper underscore counts, or
+        the separator before the ordinal. Those cosmetic mutations are safe to
+        recover because the reserved family and ordinal still identify exactly
+        one original value. Missing, duplicated, embedded, or otherwise
+        ambiguous markers return ``None``. Callers then discard the complete
+        provider response and show the untouched original; partial restoration
+        is deliberately never accepted.
+        """
+
         if not isinstance(translated, str) or not translated.strip():
             return None
         restored = translated
@@ -1503,20 +1514,20 @@ class TranslationService:
                     return None
                 restored = restored.replace(placeholder, original, 1)
                 continue
-            leading, family, number, trailing = token_match.groups()
+            _leading, family, number, _trailing = token_match.groups()
 
-            def spaced_underscores(value: str) -> str:
-                return r"_\s*" * (len(value) - 1) + r"_"
+            underscore = r"[_\uff3f]"
+            leading_wrapper = rf"(?:{underscore}+(?:\s*{underscore}+)*\s*)?"
+            ordinal_separator = rf"(?:\s*{underscore}+\s*|\s*-\s*|\s+)?"
+            trailing_wrapper = rf"(?:\s*{underscore}+(?:\s*{underscore}+)*)?"
 
             flexible_pattern = re.compile(
                 r"(?<!\w)"
-                + spaced_underscores(leading)
-                + r"\s*"
+                + leading_wrapper
                 + re.escape(family)
-                + r"\s*_\s*"
+                + ordinal_separator
                 + re.escape(number)
-                + r"\s*"
-                + spaced_underscores(trailing)
+                + trailing_wrapper
                 + r"(?!\w)",
                 flags=re.IGNORECASE,
             )

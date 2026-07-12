@@ -25,9 +25,6 @@ class RecordingGlossary:
             for text in ("bonjour", "salut", "hallo")
         }
 
-    def replace_terms(self, text):
-        return f"{self.source_lang}>{self.target_lang}:{text}"
-
 
 class RecordingGlossaryFactory:
     def __init__(self):
@@ -296,6 +293,21 @@ def test_placeholder_restoration_preserves_surrounding_whitespace():
     assert restored == "Primary Raven  now"
 
 
+def test_placeholder_restoration_recovers_only_reserved_identity_mutations():
+    variants = (
+        "Primary EVEENTITY_1 now",
+        "Primary eveentity1 now",
+        "Primary _EVEENTITY-1_ now",
+        "Primary \uff3fEVEENTITY\uff3f1\uff3f now",
+    )
+
+    for translated in variants:
+        assert TranslationService._restore_protected_entities(
+            translated,
+            {"__EVEENTITY_1__": "Raven"},
+        ) == "Primary Raven now"
+
+
 def test_placeholder_restoration_rejects_mixed_duplicate_variants():
     restored = TranslationService._restore_protected_entities(
         "__EVEENTITY_1__ and _ _ eveentity _ 1 _ _",
@@ -337,6 +349,21 @@ def test_missing_or_duplicated_placeholder_fails_closed_to_original():
     assert duplicated.translate_message("Primary Raven", "fr", "en") == (
         "Primary Raven", False, "Single"
     )
+
+
+def test_one_missing_marker_rejects_the_entire_partially_restorable_response():
+    restored = TranslationService._restore_protected_entities(
+        "Primary EVEENTITY_1 and the second protected name disappeared",
+        {
+            "__EVEENTITY_1__": "Raven",
+            "__EVEENTITY_2__": "Jita",
+        },
+    )
+
+    # Returning a partly restored provider response could silently corrupt an
+    # FC call. The translation pipeline treats None as a full fallback to the
+    # untouched original message.
+    assert restored is None
 
 
 def test_same_base_language_uses_local_correction_then_skips_provider():
