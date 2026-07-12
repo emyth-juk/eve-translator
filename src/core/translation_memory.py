@@ -22,6 +22,10 @@ DEFAULT_CACHE_SIZE = 1_024
 _NOT_CACHED = object()
 
 
+class TranslationMemorySchemaError(RuntimeError):
+    """Raised before writes when a correction DB comes from a newer app."""
+
+
 def normalize_correction_text(text: str) -> str:
     normalized = unicodedata.normalize("NFKC", text or "")
     return " ".join(normalized.split())
@@ -117,6 +121,24 @@ class TranslationMemory:
             if self._initialized:
                 return
             connection = self._connection_locked()
+            try:
+                row = connection.execute(
+                    "SELECT value FROM metadata WHERE key = 'schema_version'"
+                ).fetchone()
+            except sqlite3.OperationalError:
+                row = None
+            if row is not None:
+                try:
+                    existing_version = int(row[0])
+                except (TypeError, ValueError) as exc:
+                    raise TranslationMemorySchemaError(
+                        "Correction memory has an invalid schema version"
+                    ) from exc
+                if existing_version > SCHEMA_VERSION:
+                    raise TranslationMemorySchemaError(
+                        "Correction memory was created by a newer EVE Translator "
+                        f"(schema {existing_version}); refusing to downgrade it"
+                    )
             with connection:
                 connection.executescript(
                     """
@@ -141,7 +163,8 @@ class TranslationMemory:
                     """
                 )
                 connection.execute(
-                    "INSERT OR REPLACE INTO metadata(key, value) VALUES('schema_version', ?)",
+                    "INSERT OR REPLACE INTO metadata(key, value) "
+                    "VALUES('schema_version', ?)",
                     (str(SCHEMA_VERSION),),
                 )
             self._initialized = True

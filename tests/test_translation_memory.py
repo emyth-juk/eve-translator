@@ -1,8 +1,13 @@
+import sqlite3
 import threading
 
 import pytest
 
-from src.core.translation_memory import CorrectionEntry, TranslationMemory
+from src.core.translation_memory import (
+    CorrectionEntry,
+    TranslationMemory,
+    TranslationMemorySchemaError,
+)
 
 
 def test_translation_memory_is_exact_and_language_scoped(tmp_path):
@@ -101,3 +106,25 @@ def test_memory_exports_stable_rows_and_bulk_imports(tmp_path):
     assert memory.remember_many(entries) == 2
     assert memory.corrections("") == (entries[0],)
     assert memory.corrections("armor@1") == (entries[1],)
+
+
+def test_newer_memory_schema_is_rejected_without_downgrading_marker(tmp_path):
+    path = tmp_path / "future.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO metadata(key, value) VALUES('schema_version', '2')"
+        )
+    memory = TranslationMemory(path)
+
+    with pytest.raises(TranslationMemorySchemaError, match="refusing to downgrade"):
+        memory.count()
+    memory.close()
+
+    with sqlite3.connect(path) as connection:
+        marker = connection.execute(
+            "SELECT value FROM metadata WHERE key = 'schema_version'"
+        ).fetchone()
+    assert marker == ("2",)

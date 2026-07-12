@@ -164,6 +164,29 @@ class TestConfigStore(unittest.TestCase):
         self.assertEqual(second['shared']['translation_provider'], 'deepl')
         save.assert_not_called()
 
+    def test_newer_primary_schema_is_never_downgraded_or_overwritten(self):
+        future = {
+            'schema_version': CONFIG_SCHEMA_VERSION + 1,
+            'shared': {
+                'target_language': 'xx-future',
+                'translation_provider': 'google',
+            },
+        }
+        self.primary.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.primary, 'w', encoding='utf-8') as config_file:
+            json.dump(future, config_file, indent=2)
+        original = self.primary.read_bytes()
+
+        loaded = self.store.load()
+
+        self.assertEqual(loaded['schema_version'], CONFIG_SCHEMA_VERSION)
+        self.assertEqual(
+            self.store.unsupported_schema_version,
+            CONFIG_SCHEMA_VERSION + 1,
+        )
+        self.assertFalse(self.store.save(loaded))
+        self.assertEqual(self.primary.read_bytes(), original)
+
     def test_invalid_explicit_provider_fails_closed(self):
         with open(self.root / "translator_config.json", 'w', encoding='utf-8') as config_file:
             json.dump({

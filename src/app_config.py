@@ -472,6 +472,8 @@ class ConfigStore:
         self.legacy_dir = Path(legacy_dir) if legacy_dir is not None else Path.cwd()
         self.provider_selection_required = False
         self.migrated_from_implicit_google = False
+        self.unsupported_schema_version: int | None = None
+        self.unsupported_config_path: Path | None = None
 
     @property
     def path(self) -> Path:
@@ -482,6 +484,8 @@ class ConfigStore:
         return Path.home() / CONFIG_DIR_NAME / CONFIG_FILE_NAME
 
     def load(self) -> dict:
+        self.unsupported_schema_version = None
+        self.unsupported_config_path = None
         legacy_overlay = self._read_json(
             self.legacy_dir / LEGACY_OVERLAY_CONFIG_FILE_NAME
         )
@@ -500,9 +504,23 @@ class ConfigStore:
             loaded = self._read_json(candidate)
             if not loaded:
                 continue
-            if (
+            candidate_is_primary = (
                 candidate.resolve(strict=False) == self.path.resolve(strict=False)
-                and _document_schema_version(loaded) == CONFIG_SCHEMA_VERSION
+            )
+            candidate_version = _document_schema_version(loaded)
+            if candidate_version > CONFIG_SCHEMA_VERSION:
+                if candidate_is_primary:
+                    self.unsupported_schema_version = candidate_version
+                    self.unsupported_config_path = candidate
+                logger.error(
+                    "Ignoring config %s with newer schema %s; writes are blocked",
+                    candidate,
+                    candidate_version,
+                )
+                continue
+            if (
+                candidate_is_primary
+                and candidate_version == CONFIG_SCHEMA_VERSION
             ):
                 primary_is_current = True
 
@@ -545,6 +563,13 @@ class ConfigStore:
         return config
 
     def save(self, config: dict) -> bool:
+        if self.unsupported_schema_version is not None:
+            logger.error(
+                "Refusing to overwrite newer config schema %s at %s",
+                self.unsupported_schema_version,
+                self.unsupported_config_path or self.path,
+            )
+            return False
         to_save = copy.deepcopy(config)
         remove_shared_keys_from_sessions(to_save)
         normalize_config(to_save)
