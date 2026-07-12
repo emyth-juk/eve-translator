@@ -6,11 +6,10 @@ import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass
+from html.parser import HTMLParser
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 import requests
-import deep_translator.google as deep_translator_google
-from deep_translator import GoogleTranslator
 
 from src.app_config import (
     TRANSLATION_PROVIDER_DEEPL,
@@ -37,28 +36,85 @@ PROVIDER_USAGE_TIMEOUT_SECONDS = 20.0
 PROVIDER_ORPHAN_COOLDOWN_SECONDS = 120.0
 GOOGLE_CONNECT_TIMEOUT_SECONDS = 4.0
 GOOGLE_READ_TIMEOUT_SECONDS = 8.0
+GOOGLE_MOBILE_TRANSLATE_URL = "https://translate.google.com/m"
 
 
-class _TimeoutRequests:
-    """Minimal requests facade used by deep-translator's Google scraper.
+class _GoogleResultParser(HTMLParser):
+    """Extract the translated text from Google's small mobile response."""
 
-    deep-translator 1.11 does not expose a timeout and calls its module-level
-    ``requests.get`` directly. Supplying a dedicated session here keeps the
-    upstream parsing/validation behavior while enforcing real socket limits.
-    """
+    def __init__(self, result_class: str):
+        super().__init__(convert_charrefs=True)
+        self._result_class = result_class
+        self._result_depth = 0
+        self._matched_result = False
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag, attrs):
+        if self._result_depth:
+            if tag == "div":
+                self._result_depth += 1
+            return
+        if self._matched_result or tag != "div":
+            return
+        attributes = dict(attrs)
+        if self._result_class in attributes.get("class", "").split():
+            self._matched_result = True
+            self._result_depth = 1
+
+    def handle_endtag(self, tag):
+        if self._result_depth and tag == "div":
+            self._result_depth -= 1
+
+    def handle_data(self, data):
+        if self._result_depth:
+            self._parts.append(data)
+
+    @property
+    def result(self) -> Optional[str]:
+        if not self._matched_result:
+            return None
+        # Strip each HTML text segment without inserting artificial separators.
+        return "".join(part.strip() for part in self._parts if part.strip())
+
+
+class _GoogleMobileWebAdapter:
+    """Minimal Google mobile-web client with no scraper dependency."""
 
     def __init__(self, session: requests.Session):
         self._session = session
 
-    def get(self, url, **kwargs):
-        kwargs.setdefault(
-            "timeout",
-            (GOOGLE_CONNECT_TIMEOUT_SECONDS, GOOGLE_READ_TIMEOUT_SECONDS),
+    def translate(self, text: str, *, source_lang: str, target_lang: str) -> str:
+        if not isinstance(text, str):
+            raise TypeError("Google translation text must be a string")
+        if len(text) > 5000:
+            raise ValueError("Google translation text exceeds 5000 characters")
+        text = text.strip()
+        if not text or source_lang == target_lang:
+            return text
+
+        response = self._session.get(
+            GOOGLE_MOBILE_TRANSLATE_URL,
+            params={
+                "sl": source_lang,
+                "tl": target_lang,
+                "q": text,
+            },
+            timeout=(GOOGLE_CONNECT_TIMEOUT_SECONDS, GOOGLE_READ_TIMEOUT_SECONDS),
         )
-        return self._session.get(url, **kwargs)
-
-
-_GOOGLE_TRANSPORT_LOCK = threading.Lock()
+        try:
+            response.raise_for_status()
+            # Google has used both class names. Prefer the legacy primary name,
+            # matching the previous provider path, then use its current fallback.
+            for result_class in ("t0", "result-container"):
+                parser = _GoogleResultParser(result_class)
+                parser.feed(response.text)
+                parser.close()
+                translated = parser.result
+                if translated is not None:
+                    return translated
+            raise ValueError("Google response did not contain a translation")
+        finally:
+            response.close()
 
 
 class ProviderCallTimeout(TimeoutError):
@@ -380,9 +436,8 @@ class MockTranslator(TranslationProvider):
 
 class GoogleTransProvider(TranslationProvider):
     def __init__(self):
-        self.translator = GoogleTranslator(source='auto', target='en')
         self._http_session = requests.Session()
-        self._timeout_requests = _TimeoutRequests(self._http_session)
+        self.translator = _GoogleMobileWebAdapter(self._http_session)
         # Let the transport's 4s connect + 8s read limits fire before the
         # outer guard, leaving headroom for parsing and thread scheduling.
         self._call_runner = _BoundedCallRunner(
@@ -405,8 +460,7 @@ class GoogleTransProvider(TranslationProvider):
 
     @property
     def supports_batch(self) -> bool:
-        # deep-translator's helper loops over requests; it is not a provider
-        # batch and therefore must not be advertised as one.
+        # The mobile endpoint handles one source string per request.
         return False
 
     def request_cancel(self) -> None:
@@ -424,24 +478,18 @@ class GoogleTransProvider(TranslationProvider):
             normalized_source = _normalize_language_code(source_lang, default='auto')
 
             def request():
-                self.translator.target = normalized_target
-                self.translator.source = (
+                request_source = (
                     normalized_source
                     if normalized_source not in {'auto', 'unknown'}
                     else 'auto'
                 )
-                # deep-translator keeps requests as a module global. Serialize
-                # this tiny substitution so another provider instance cannot
-                # observe a half-swapped transport.
-                with _GOOGLE_TRANSPORT_LOCK:
-                    original_requests = deep_translator_google.requests
-                    deep_translator_google.requests = self._timeout_requests
-                    try:
-                        with self._usage_lock:
-                            self._estimated_characters += len(text)
-                        return self.translator.translate(text)
-                    finally:
-                        deep_translator_google.requests = original_requests
+                with self._usage_lock:
+                    self._estimated_characters += len(text)
+                return self.translator.translate(
+                    text,
+                    source_lang=request_source,
+                    target_lang=normalized_target,
+                )
 
             return self._call_runner.run(request)
         except Exception as exc:

@@ -710,8 +710,7 @@ def test_deepl_provider_sends_one_list_request_with_context():
 
 
 def test_google_does_not_claim_loop_batching():
-    with patch('src.services.translator.GoogleTranslator'):
-        provider = GoogleTransProvider()
+    provider = GoogleTransProvider()
 
     assert provider.supports_batch is False
     assert provider.supports_context is False

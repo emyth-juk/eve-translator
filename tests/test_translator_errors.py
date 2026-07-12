@@ -4,10 +4,10 @@ import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
-import deep_translator.google as deep_translator_google
 
 from src.services.translator import (
     GOOGLE_CONNECT_TIMEOUT_SECONDS,
+    GOOGLE_MOBILE_TRANSLATE_URL,
     GOOGLE_READ_TIMEOUT_SECONDS,
     DeepLProvider,
     GoogleTransProvider,
@@ -48,44 +48,92 @@ class TestTranslatorErrors(unittest.TestCase):
 
     def test_google_exception(self):
         """Test Google provider handling network errors."""
-        with patch('src.services.translator.GoogleTranslator') as MockGT:
-            mock_gt_instance = MockGT.return_value
-            mock_gt_instance.translate.side_effect = Exception("Connection Timeout")
-            
-            provider = GoogleTransProvider()
-            result = provider.translate("Hello", "fr")
-            
-            self.assertIsNone(result)
-
-    def test_google_transport_applies_connect_and_read_timeouts(self):
-        with patch('src.services.translator.GoogleTranslator') as MockGT:
-            provider = GoogleTransProvider()
-            provider._http_session.get = MagicMock(
-                return_value=SimpleNamespace(text="bonjour")
-            )
-            MockGT.return_value.translate.side_effect = (
-                lambda _text: deep_translator_google.requests.get(
-                    "https://translate.invalid"
-                ).text
-            )
-
-            assert provider.translate("Hello", "fr") == "bonjour"
-
-        provider._http_session.get.assert_called_once_with(
-            "https://translate.invalid",
-            timeout=(GOOGLE_CONNECT_TIMEOUT_SECONDS, GOOGLE_READ_TIMEOUT_SECONDS),
+        provider = GoogleTransProvider()
+        provider._http_session.get = MagicMock(
+            side_effect=Exception("Connection Timeout")
         )
 
-    def test_google_usage_is_a_local_count_of_started_requests(self):
-        with patch('src.services.translator.GoogleTranslator') as MockGT:
-            MockGT.return_value.translate.return_value = "bonjour"
-            provider = GoogleTransProvider()
+        result = provider.translate("Hello", "fr")
 
-            self.assertEqual(
-                provider.get_usage(),
-                {'available': True, 'estimated_characters': 0},
-            )
-            self.assertEqual(provider.translate("Hello", "fr"), "bonjour")
+        self.assertIsNone(result)
+
+    def test_google_transport_applies_connect_and_read_timeouts(self):
+        provider = GoogleTransProvider()
+        response = MagicMock()
+        response.text = '<div class="result-container">bonjour</div>'
+        provider._http_session.get = MagicMock(return_value=response)
+
+        assert provider.translate("  Hello  ", "fr", "en") == "bonjour"
+
+        provider._http_session.get.assert_called_once_with(
+            GOOGLE_MOBILE_TRANSLATE_URL,
+            params={"sl": "en", "tl": "fr", "q": "Hello"},
+            timeout=(GOOGLE_CONNECT_TIMEOUT_SECONDS, GOOGLE_READ_TIMEOUT_SECONDS),
+        )
+        response.raise_for_status.assert_called_once_with()
+        response.close.assert_called_once_with()
+
+    def test_google_transport_parses_legacy_result_class_and_html_entities(self):
+        provider = GoogleTransProvider()
+        response = MagicMock()
+        response.text = (
+            '<html><div class="result-container">fallback</div>'
+            '<div class="t0">Cream &amp; tea</div></html>'
+        )
+        provider._http_session.get = MagicMock(return_value=response)
+
+        assert provider.translate("Cream and tea", "fr") == "Cream & tea"
+
+    def test_google_transport_rejects_response_without_translation(self):
+        provider = GoogleTransProvider()
+        response = MagicMock()
+        response.text = '<html><div class="error">try later</div></html>'
+        provider._http_session.get = MagicMock(return_value=response)
+
+        assert provider.translate("Hello", "fr") is None
+        response.close.assert_called_once_with()
+
+    def test_google_provider_preserves_normalized_language_codes(self):
+        provider = GoogleTransProvider()
+        provider.translator.translate = MagicMock(return_value="olá")
+
+        assert provider.translate("hello", "PT_BR", "EN_us") == "olá"
+
+        provider.translator.translate.assert_called_once_with(
+            "hello",
+            source_lang="en-us",
+            target_lang="pt-br",
+        )
+
+    def test_google_transport_preserves_empty_and_same_language_shortcuts(self):
+        provider = GoogleTransProvider()
+        provider._http_session.get = MagicMock()
+
+        assert provider.translate("   ", "fr") == ""
+        assert provider.translate("  Hello  ", "en", "en") == "Hello"
+
+        provider._http_session.get.assert_not_called()
+        assert provider.get_usage()["estimated_characters"] == 12
+
+    def test_google_transport_rejects_text_over_5000_characters(self):
+        provider = GoogleTransProvider()
+        provider._http_session.get = MagicMock()
+        text = "x" * 5001
+
+        assert provider.translate(text, "fr") is None
+
+        provider._http_session.get.assert_not_called()
+        assert provider.get_usage()["estimated_characters"] == len(text)
+
+    def test_google_usage_is_a_local_count_of_started_requests(self):
+        provider = GoogleTransProvider()
+        provider.translator.translate = MagicMock(return_value="bonjour")
+
+        self.assertEqual(
+            provider.get_usage(),
+            {'available': True, 'estimated_characters': 0},
+        )
+        self.assertEqual(provider.translate("Hello", "fr"), "bonjour")
 
         self.assertEqual(
             provider.get_usage(),
@@ -108,65 +156,61 @@ class TestTranslatorErrors(unittest.TestCase):
 
     def test_google_request_stops_blocking_after_deadline(self):
         release_request = threading.Event()
-        with patch('src.services.translator.GoogleTranslator') as MockGT:
-            mock_gt_instance = MockGT.return_value
-            mock_gt_instance.translate.side_effect = (
-                lambda _text: release_request.wait(1.0)
-            )
-            provider = GoogleTransProvider()
-            provider._call_runner.timeout_seconds = 0.01
+        provider = GoogleTransProvider()
+        provider.translator.translate = MagicMock(
+            side_effect=lambda *_args, **_kwargs: release_request.wait(1.0)
+        )
+        provider._call_runner.timeout_seconds = 0.01
 
-            result = provider.translate("Hello", "fr")
-            release_request.set()
-            deadline = time.monotonic() + 0.5
-            while not provider.available and time.monotonic() < deadline:
-                time.sleep(0.005)
+        result = provider.translate("Hello", "fr")
+        release_request.set()
+        deadline = time.monotonic() + 0.5
+        while not provider.available and time.monotonic() < deadline:
+            time.sleep(0.005)
 
         self.assertIsNone(result)
         self.assertTrue(provider.available)
 
     def test_timed_out_google_provider_reports_unavailable_until_orphan_finishes(self):
         release_request = threading.Event()
-        with patch('src.services.translator.GoogleTranslator') as MockGT:
-            MockGT.return_value.translate.side_effect = (
-                lambda _text: release_request.wait(1.0)
-            )
-            provider = GoogleTransProvider()
-            provider._call_runner.timeout_seconds = 0.01
+        provider = GoogleTransProvider()
+        provider.translator.translate = MagicMock(
+            side_effect=lambda *_args, **_kwargs: release_request.wait(1.0)
+        )
+        provider._call_runner.timeout_seconds = 0.01
 
-            self.assertIsNone(provider.translate("Hello", "fr"))
-            self.assertFalse(provider.available)
-            self.assertIn("timed out", provider.unavailable_reason)
+        self.assertIsNone(provider.translate("Hello", "fr"))
+        self.assertFalse(provider.available)
+        self.assertIn("timed out", provider.unavailable_reason)
 
-            release_request.set()
-            deadline = time.monotonic() + 0.5
-            while not provider.available and time.monotonic() < deadline:
-                time.sleep(0.005)
+        release_request.set()
+        deadline = time.monotonic() + 0.5
+        while not provider.available and time.monotonic() < deadline:
+            time.sleep(0.005)
 
         self.assertTrue(provider.available)
 
     def test_timed_out_provider_scope_does_not_start_more_orphan_requests(self):
         release_request = threading.Event()
-        with patch('src.services.translator.GoogleTranslator') as MockGT:
-            mock_translator = MockGT.return_value
-            mock_translator.translate.side_effect = (
-                lambda _text: release_request.wait(1.0)
-            )
-            first_provider = GoogleTransProvider()
-            first_provider._call_runner.timeout_seconds = 0.01
+        first_provider = GoogleTransProvider()
+        first_provider.translator.translate = MagicMock(
+            side_effect=lambda *_args, **_kwargs: release_request.wait(1.0)
+        )
+        first_provider._call_runner.timeout_seconds = 0.01
 
-            self.assertIsNone(first_provider.translate("first", "fr"))
-            self.assertEqual(mock_translator.translate.call_count, 1)
+        self.assertIsNone(first_provider.translate("first", "fr"))
+        self.assertEqual(first_provider.translator.translate.call_count, 1)
 
-            replacement_provider = GoogleTransProvider()
-            self.assertFalse(replacement_provider.available)
-            self.assertIsNone(replacement_provider.translate("second", "fr"))
-            self.assertEqual(mock_translator.translate.call_count, 1)
+        replacement_provider = GoogleTransProvider()
+        replacement_provider.translator.translate = MagicMock(return_value="second")
+        self.assertFalse(replacement_provider.available)
+        self.assertIsNone(replacement_provider.translate("second", "fr"))
+        replacement_provider.translator.translate.assert_not_called()
 
-            release_request.set()
-            deadline = time.monotonic() + 0.5
-            while not replacement_provider.available and time.monotonic() < deadline:
-                time.sleep(0.005)
+        release_request.set()
+        deadline = time.monotonic() + 0.5
+        while not replacement_provider.available and time.monotonic() < deadline:
+            time.sleep(0.005)
 
         self.assertTrue(replacement_provider.available)
 
