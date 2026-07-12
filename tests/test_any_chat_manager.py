@@ -4,6 +4,7 @@ from PySide6.QtCore import QObject
 
 from src.app_config import get_default_config
 from src.core.channel_info import ChatChannelInfo
+from src.core.character_info import CharacterInfo
 from src.main import SessionRuntimeState, TranslatorManager
 from src.services.scan_state import ChatScanState
 
@@ -147,6 +148,40 @@ def test_scan_publishes_rotated_source_before_switching_session(tmp_path):
     manager._set_session_runtime_state.assert_called_once_with(
         "any",
         SessionRuntimeState.ACTIVE,
+    )
+
+
+def test_sync_scan_passes_known_inactive_characters_explicitly(tmp_path):
+    manager = _manager()
+    manager.config["shared"]["log_dir"] = str(tmp_path)
+    manager.character_registry = {
+        "active": CharacterInfo(
+            "active",
+            "Online Pilot",
+            str(tmp_path / "Local_20260712_120000_1.txt"),
+            1000.0,
+            "Jita",
+            True,
+        ),
+        "inactive": CharacterInfo(
+            "inactive",
+            "Offline Pilot",
+            str(tmp_path / "Local_20260712_110000_2.txt"),
+            900.0,
+            "Amarr",
+            False,
+        ),
+    }
+    detector = MagicMock()
+    detector.parse_filename.return_value = ("Local", "1", 1000.0)
+    detector.scan_channels.return_value = {}
+    manager.any_chat_detector = detector
+
+    manager._scan_channels()
+
+    detector.scan_channels.assert_called_once_with(
+        str(tmp_path),
+        active_characters={"active": 1000.0, "inactive": False},
     )
 
 

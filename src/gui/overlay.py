@@ -22,6 +22,7 @@ from src.app_config import (
     DISPLAY_MODES,
 )
 from src.core.combat import command_is_trusted, normalize_speaker_name
+from src.core.session_specs import SESSION_SPECS, get_session_spec
 
 from src.version import __version__
 
@@ -63,6 +64,7 @@ class OverlayWindow(QMainWindow):
     def __init__(self, session_id='fleet', initial_config=None):
         super().__init__()
         self.session_id = session_id
+        self.session_spec = get_session_spec(session_id)
         
         # Window Flags for Overlay
         self.setWindowFlags(
@@ -71,11 +73,11 @@ class OverlayWindow(QMainWindow):
             Qt.WindowType.Tool  # Tool window doesn't appear in taskbar usually
         )
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        session_label = {
-            'fleet': 'Fleet',
-            'local': 'Local',
-            'any': 'Any Chat',
-        }.get(session_id, session_id.capitalize())
+        session_label = (
+            self.session_spec.status_label
+            if self.session_spec is not None
+            else session_id.capitalize()
+        )
         self.setWindowTitle(f"EVE Translator v{__version__} - {session_label}")
         
         # Opacity
@@ -138,11 +140,11 @@ class OverlayWindow(QMainWindow):
             'auto_scroll': True,
             'ignored_languages': ['en', 'de'],
             'target_language': 'en',
-            'background_color': {
-                'fleet': '#33001a',
-                'local': '#001a33',
-                'any': '#21173d',
-            }.get(session_id, '#101820'),
+            'background_color': (
+                self.session_spec.background_color
+                if self.session_spec is not None
+                else '#101820'
+            ),
             'display_mode': DISPLAY_MODE_MIRROR,
             'compact_header': True,
             'command_cards': True,
@@ -171,11 +173,11 @@ class OverlayWindow(QMainWindow):
         self.selected_channel_id = self.config.get('channel_selection') or None
         self.interaction_locked = False
         self.overlay_status = OverlayStatus(
-            channel={
-                'fleet': 'Fleet',
-                'local': 'Local',
-                'any': 'Any',
-            }.get(session_id, session_id.capitalize()),
+            channel=(
+                self.session_spec.status_label
+                if self.session_spec is not None
+                else session_id.capitalize()
+            ),
             display_mode=self.config.get('display_mode', DISPLAY_MODE_MIRROR),
         )
         
@@ -215,9 +217,10 @@ class OverlayWindow(QMainWindow):
         
         if x == -1 or y == -1:
             # Stagger default positions if multiple?
-            offset = {'fleet': 0, 'local': 50, 'any': 100}.get(
-                self.session_id,
-                150,
+            offset = (
+                self.session_spec.position_offset
+                if self.session_spec is not None
+                else 150
             )
             x = screen_geo.width() - w - 50 - offset
             y = screen_geo.height() - h - 100 - offset
@@ -466,29 +469,17 @@ class OverlayWindow(QMainWindow):
         # Session Management Submenu
         menu_session = menu.addMenu("Select Target Chat")
         
-        # Fleet
-        is_fleet_active = self.all_session_states.get('fleet', False)
-        # print(f"[Overlay] Context Menu Fleet State: {is_fleet_active} from {self.all_session_states}")
-        
-        act_fleet = QAction("Fleet Chat", self, checkable=True)
-        act_fleet.setChecked(is_fleet_active)
-        act_fleet.triggered.connect(lambda: self.session_toggled.emit('fleet'))
-        menu_session.addAction(act_fleet)
-        
-        # Local
-        is_local_active = self.all_session_states.get('local', False)
-        
-        act_local = QAction("Local Chat", self, checkable=True)
-        act_local.setChecked(is_local_active)
-        act_local.triggered.connect(lambda: self.session_toggled.emit('local'))
-        menu_session.addAction(act_local)
-
-        # Any logged EVE chat other than the dedicated Fleet/Local sources.
-        is_any_active = self.all_session_states.get('any', False)
-        act_any = QAction("Any Chat", self, checkable=True)
-        act_any.setChecked(is_any_active)
-        act_any.triggered.connect(lambda: self.session_toggled.emit('any'))
-        menu_session.addAction(act_any)
+        for spec in SESSION_SPECS:
+            action = QAction(spec.label, self, checkable=True)
+            action.setChecked(
+                bool(self.all_session_states.get(spec.session_id, False))
+            )
+            action.triggered.connect(
+                lambda _checked=False, target=spec.session_id: (
+                    self.session_toggled.emit(target)
+                )
+            )
+            menu_session.addAction(action)
         
         # Character Selection Submenu (Local Only)
         if self.session_id == 'local':

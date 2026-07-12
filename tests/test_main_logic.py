@@ -338,6 +338,216 @@ class TestSessionRuntimeState(unittest.TestCase):
         )
         self.assertIn('Active', mgr.fleet_action.setText.call_args.args[0])
 
+    def test_periodic_scan_dispatches_discovery_off_the_gui_thread(self):
+        mgr = self._make_manager()
+        mgr.config['shared'].update({
+            'log_dir': 'C:/logs',
+            'fleet_inactive_threshold': 900,
+        })
+        mgr.discovery_thread = MagicMock()
+        mgr.discovery_thread.isRunning.return_value = True
+        mgr._discovery_generation = 0
+        mgr._discovery_scan_pending = False
+        mgr._discovery_rescan_requested = False
+        mgr._scan_characters = MagicMock()
+        mgr._scan_channels = MagicMock()
+        mgr._scan_fleets = MagicMock()
+        requests = []
+        mgr.chat_discovery_requested.connect(
+            lambda generation, log_dir, threshold: requests.append(
+                (generation, log_dir, threshold)
+            )
+        )
+
+        with patch('src.main.os.path.isdir', return_value=True):
+            mgr._periodic_scan()
+
+        self.assertEqual(requests, [(1, 'C:/logs', 900)])
+        self.assertTrue(mgr._discovery_scan_pending)
+        mgr._scan_characters.assert_not_called()
+        mgr._scan_channels.assert_not_called()
+        mgr._scan_fleets.assert_not_called()
+
+    def test_discovery_result_is_published_as_one_generation(self):
+        from src.services.chat_discovery import ChatDiscoveryResult
+
+        mgr = self._make_manager()
+        mgr.config['shared']['log_dir'] = 'C:/logs'
+        mgr._discovery_generation = 4
+        mgr._discovery_inflight_generation = 4
+        mgr._discovery_inflight_signature = ('C:/logs', 1800)
+        mgr._discovery_request_invalidated = False
+        mgr._discovery_scan_pending = True
+        mgr._discovery_rescan_requested = False
+        mgr._scan_characters = MagicMock()
+        mgr._scan_channels = MagicMock()
+        mgr._scan_fleets = MagicMock()
+        mgr._recover_waiting_sessions = MagicMock()
+        result = ChatDiscoveryResult(generation=4, log_dir='C:/logs')
+
+        mgr._apply_chat_discovery_result(result)
+
+        self.assertFalse(mgr._discovery_scan_pending)
+        mgr._scan_characters.assert_called_once_with(new_registry={})
+        mgr._scan_channels.assert_called_once_with(new_registry={})
+        mgr._scan_fleets.assert_called_once_with(new_registry={})
+        mgr._recover_waiting_sessions.assert_called_once_with()
+
+    def test_discovery_requests_coalesce_and_config_changes_invalidate(self):
+        mgr = self._make_manager()
+        mgr.config['shared'].update({
+            'log_dir': 'C:/logs',
+            'fleet_inactive_threshold': 900,
+        })
+        mgr.discovery_thread = MagicMock()
+        mgr.discovery_thread.isRunning.return_value = True
+        mgr.discovery_retry_timer = MagicMock()
+        mgr._discovery_generation = 0
+        mgr._discovery_scan_pending = False
+        mgr._discovery_rescan_requested = False
+        mgr._discovery_request_invalidated = False
+        requests = []
+        mgr.chat_discovery_requested.connect(
+            lambda generation, log_dir, threshold: requests.append(
+                (generation, log_dir, threshold)
+            )
+        )
+
+        with patch('src.main.os.path.isdir', return_value=True):
+            self.assertTrue(mgr._request_chat_discovery())
+            self.assertTrue(mgr._request_chat_discovery())
+            mgr.config['shared']['fleet_inactive_threshold'] = 1200
+            self.assertTrue(mgr._request_chat_discovery())
+
+        self.assertEqual(requests, [(1, 'C:/logs', 900)])
+        self.assertTrue(mgr._discovery_rescan_requested)
+        self.assertTrue(mgr._discovery_request_invalidated)
+
+    def test_invalidated_discovery_result_is_not_published(self):
+        from src.services.chat_discovery import ChatDiscoveryResult
+
+        mgr = self._make_manager()
+        mgr.config['shared']['log_dir'] = 'C:/logs'
+        mgr._discovery_generation = 2
+        mgr._discovery_inflight_generation = 2
+        mgr._discovery_inflight_signature = ('C:/logs', 900)
+        mgr._discovery_request_invalidated = True
+        mgr._discovery_scan_pending = True
+        mgr._discovery_rescan_requested = True
+        mgr._scan_characters = MagicMock()
+
+        with patch('src.main.QTimer.singleShot') as single_shot:
+            mgr._apply_chat_discovery_result(
+                ChatDiscoveryResult(generation=2, log_dir='C:/logs')
+            )
+
+        mgr._scan_characters.assert_not_called()
+        self.assertFalse(mgr._discovery_scan_pending)
+        self.assertIsNone(mgr._discovery_inflight_generation)
+        single_shot.assert_called_once_with(0, mgr._periodic_scan)
+
+    def test_discovery_failure_uses_bounded_retry_timer(self):
+        from src.services.chat_discovery import (
+            ChatDiscoveryError,
+            ChatDiscoveryResult,
+        )
+
+        mgr = self._make_manager()
+        mgr.config['shared']['log_dir'] = 'C:/logs'
+        mgr._discovery_generation = 1
+        mgr._discovery_inflight_generation = 1
+        mgr._discovery_inflight_signature = ('C:/logs', 1800)
+        mgr._discovery_request_invalidated = False
+        mgr._discovery_scan_pending = True
+        mgr._discovery_rescan_requested = False
+        mgr._discovery_failure_count = 0
+        mgr.discovery_retry_timer = MagicMock()
+        failure = ChatDiscoveryResult(
+            generation=1,
+            log_dir='C:/logs',
+            error=ChatDiscoveryError('snapshot', 'OSError', 'temporary'),
+        )
+
+        mgr._apply_chat_discovery_result(failure)
+
+        self.assertEqual(mgr._discovery_failure_count, 1)
+        mgr.discovery_retry_timer.start.assert_called_once_with(1000)
+
+    def test_late_discovery_result_is_ignored_during_shutdown(self):
+        from src.services.chat_discovery import ChatDiscoveryResult
+
+        mgr = self._make_manager()
+        mgr._shutting_down = True
+        mgr._discovery_inflight_generation = 1
+        mgr._scan_characters = MagicMock()
+
+        mgr._apply_chat_discovery_result(
+            ChatDiscoveryResult(generation=1, log_dir='C:/logs')
+        )
+
+        mgr._scan_characters.assert_not_called()
+
+    def test_stale_discovery_result_preserves_current_inflight_request(self):
+        from src.services.chat_discovery import ChatDiscoveryResult
+
+        mgr = self._make_manager()
+        mgr._discovery_generation = 2
+        mgr._discovery_inflight_generation = 2
+        mgr._discovery_scan_pending = True
+        mgr._scan_characters = MagicMock()
+
+        mgr._apply_chat_discovery_result(
+            ChatDiscoveryResult(generation=1, log_dir='C:/logs')
+        )
+
+        self.assertTrue(mgr._discovery_scan_pending)
+        self.assertEqual(mgr._discovery_inflight_generation, 2)
+        mgr._scan_characters.assert_not_called()
+
+    def test_shutdown_fences_discovery_events_before_stopping_workers(self):
+        mgr = self._make_manager()
+        mgr._shutting_down = False
+        mgr.scanner_timer = MagicMock()
+        mgr.scan_debounce_timer = MagicMock()
+        mgr.discovery_retry_timer = MagicMock()
+        mgr.log_dir_watcher = MagicMock()
+        mgr.log_dir_watcher.directories.return_value = ['C:/logs']
+        mgr.discovery_worker = MagicMock()
+        mgr.discovery_thread = MagicMock()
+        mgr.discovery_thread.wait.return_value = True
+        mgr.thread = MagicMock()
+        mgr.thread.wait.return_value = True
+        mgr.translation_scheduler = None
+        mgr.translation_thread = MagicMock()
+        mgr.translation_thread.isRunning.return_value = False
+        mgr.translation_thread.wait.return_value = True
+        mgr.translation_memory = MagicMock()
+        mgr.app = MagicMock()
+
+        mgr.shutdown()
+
+        self.assertTrue(mgr._shutting_down)
+        mgr.scanner_timer.stop.assert_called_once_with()
+        mgr.scan_debounce_timer.stop.assert_called_once_with()
+        mgr.discovery_retry_timer.stop.assert_called_once_with()
+        mgr.log_dir_watcher.blockSignals.assert_called_once_with(True)
+        mgr.log_dir_watcher.removePath.assert_called_once_with('C:/logs')
+        mgr.discovery_worker.request_stop.assert_called_once_with()
+        mgr.discovery_thread.quit.assert_called_once_with()
+        mgr.thread.quit.assert_called_once_with()
+        mgr.translation_thread.quit.assert_called_once_with()
+        mgr.app.quit.assert_called_once_with()
+
+    def test_applying_scanner_config_requests_an_immediate_scan(self):
+        mgr = self._make_manager()
+        mgr._configure_log_directory_watcher = MagicMock()
+        mgr._periodic_scan = MagicMock()
+
+        mgr._apply_scanner_config()
+
+        mgr._configure_log_directory_watcher.assert_called_once_with()
+        mgr._periodic_scan.assert_called_once_with()
+
     def test_recovery_checks_all_waiting_sessions(self):
         mgr = self._make_manager(
             fleet_enabled=True,
@@ -1164,10 +1374,33 @@ class TestHandleSessionConfigChange(unittest.TestCase):
 
             mgr._queue_worker_config.assert_not_called()
             mgr._apply_config_update.assert_not_called()
+            mgr._apply_scanner_config.assert_not_called()
             self.assertEqual(
                 mgr.config['sessions']['fleet']['display_mode'],
                 'combat',
             )
+
+    def test_scanner_config_change_requests_discovery(self):
+        with patch('src.main.TranslatorManager.__init__', lambda self: None):
+            from src.main import TranslatorManager
+            mgr = TranslatorManager()
+
+        mgr.config = {
+            'shared': {'fleet_inactive_threshold': 1800},
+            'sessions': {'fleet': {}},
+        }
+        mgr.sessions = {}
+        mgr._save_config = MagicMock()
+        mgr._queue_worker_config = MagicMock()
+        mgr._apply_config_update = MagicMock()
+        mgr._apply_scanner_config = MagicMock()
+
+        mgr._handle_session_config_change(
+            'fleet',
+            {'fleet_inactive_threshold': 900},
+        )
+
+        mgr._apply_scanner_config.assert_called_once_with()
 
     def test_compose_provider_label_changes_only_from_applied_snapshot(self):
         with patch('src.main.TranslatorManager.__init__', lambda self: None):

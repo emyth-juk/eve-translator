@@ -39,6 +39,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Provider calls and connection tests have responsiveness deadlines, and Settings validates DeepL keys and target-language codes before saving.
 - Generated SDE loading now runs on the translation thread, and warm cache hits bypass lexicon/entity preprocessing.
 - Correction memory now uses one guarded SQLite connection, scoped/global lookup in one query, and a bounded positive/negative cache.
+- Fleet, Local, and Any Chat discovery now share one cached directory snapshot on a dedicated worker thread instead of repeatedly scanning on the GUI thread.
+- Built-in session labels, defaults, geometry, log routing, and source-owned metadata now come from one descriptor table.
 
 ### Fixed
 - Vanilla SDE names now outrank shorter player aliases by full span, including unchanged or ambiguous locale names that act as no-op guards.
@@ -57,6 +59,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Internal translation `TypeError` failures no longer trigger duplicate calls or escape the scheduler.
 - All built-in combat phrases share one classifier, preventing short calls such as `regroup`, `star burst`, and `bubble up` from being misdetected and sent unnecessarily.
 - Generated English HyperNet offers, including punctuation-prefixed and link-artifact variants, no longer consume translation quota.
+- Switching Any Chat sources no longer restores stale channel metadata, and a failed source start can no longer be reported as Active.
+- Any Chat activity now tolerates the login boundary, accepts current log writes as positive evidence, and fails closed for characters Local has explicitly found offline.
+- EVE log timestamps are consistently interpreted as UTC, while implausibly future-dated files no longer keep Fleet, Local, or Any Chat active after a clock correction.
 
 ## [1.3] - 2026-06-29
 

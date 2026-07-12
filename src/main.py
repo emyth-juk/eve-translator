@@ -60,6 +60,7 @@ from src.core.tokenizer import EVELinkTokenizer
 from src.core.detector import LanguageDetector
 from src.core.entity_protection import ProtectedEntityIndex
 from src.core.message import ProcessedMessage, TranslationState
+from src.core.session_specs import SESSION_IDS, SESSION_SPECS, SESSION_SPECS_BY_ID
 from src.core.translation_memory import TranslationMemory
 from src.app_config import (
     ConfigStore,
@@ -82,6 +83,8 @@ from src.services.hotkeys import (
 )
 from src.services.local_detector import LocalChatDetector
 from src.services.channel_detector import AnyChatDetector
+from src.services.chat_discovery import ChatDiscoveryWorker
+from src.services.log_discovery import log_recency_key, normalized_log_path
 from src.gui.settings import SettingsDialog
 from src.gui.compose import ComposeDialog
 from src.version import __version__
@@ -89,23 +92,13 @@ from src.version import __version__
 DIR_SCAN_DEBOUNCE_MS = 500
 WATCHED_DIR_FALLBACK_SECONDS = 60
 WORKER_SHUTDOWN_TIMEOUT_MS = 15_000
-SESSION_IDS = ('fleet', 'local', 'any')
-SESSION_LABELS = {
-    'fleet': 'Fleet Chat',
-    'local': 'Local Chat',
-    'any': 'Any Chat',
-}
-SESSION_SOURCE_IDENTITY_KEYS = {
-    'fleet': frozenset({'fleet_id'}),
-    'local': frozenset({'character_id', 'character_name', 'system_name'}),
-    'any': frozenset({
-        'channel_selection',
-        'channel_id',
-        'channel_name',
-        'character_id',
-        'listener_name',
-    }),
-}
+DISCOVERY_RETRY_BASE_MS = 1_000
+DISCOVERY_RETRY_MAX_MS = 10_000
+SCANNER_CONFIG_KEYS = frozenset({
+    'log_dir',
+    'fleet_inactive_threshold',
+    'fleet_scan_interval',
+})
 
 
 class SessionRuntimeState(str, Enum):
@@ -126,6 +119,7 @@ class TranslatorManager(QObject):
     worker_config_changed = Signal(int, dict)
     compose_translation_requested = Signal(int, str, str, str)
     provider_usage_requested = Signal()
+    chat_discovery_requested = Signal(int, str, int)
 
     def _get_scan_state(self):
         if not hasattr(self, '_scan_state'):
@@ -207,6 +201,7 @@ class TranslatorManager(QObject):
         self.compose_dialog = None
         self.settings_dialog = None
         self._provider_status_snapshot = {}
+        self._shutting_down = False
 
         # Shared Processing Components
         parser = LineParser()
@@ -299,6 +294,7 @@ class TranslatorManager(QObject):
 
         # Chat log scan state
         self._scan_state = ChatScanState.from_config(self.config)
+        self._setup_chat_discovery_worker()
 
         # Periodic scanner timer (check every X seconds for characters and fleets)
         # Scan interval is configurable, defaulting to 10s as per user request (legacy default was 30s)
@@ -324,8 +320,9 @@ class TranslatorManager(QObject):
         # Validate Log Directory FIRST (before initializing sessions)
         self._ensure_log_directory()
         self._configure_log_directory_watcher()
-        # Scan only after first-run folder selection has finalized the path, so
-        # session initialization sees the current registry immediately.
+        # Queue discovery only after first-run folder selection finalizes the
+        # path. Enabled sessions begin truthfully in Waiting and recover as soon
+        # as the background snapshot reaches the GUI thread.
         self._periodic_scan()
         # Show provider guidance after modal log setup so the notification is
         # not hidden behind the first-run folder picker.
@@ -336,8 +333,157 @@ class TranslatorManager(QObject):
 
         logger.info("Translator Manager started. Check System Tray.")
 
+    def _setup_chat_discovery_worker(self) -> None:
+        """Keep filesystem discovery and window probing off the GUI thread."""
+        self._discovery_generation = 0
+        self._discovery_scan_pending = False
+        self._discovery_rescan_requested = False
+        self._discovery_inflight_generation = None
+        self._discovery_inflight_signature = None
+        self._discovery_request_invalidated = False
+        self._discovery_failure_count = 0
+        self.discovery_retry_timer = QTimer(self)
+        self.discovery_retry_timer.setSingleShot(True)
+        self.discovery_retry_timer.setTimerType(Qt.TimerType.CoarseTimer)
+        self.discovery_retry_timer.timeout.connect(self._periodic_scan)
+        self.discovery_thread = QThread(self)
+        self.discovery_worker = ChatDiscoveryWorker()
+        self.discovery_worker.moveToThread(self.discovery_thread)
+        self.chat_discovery_requested.connect(
+            self.discovery_worker.scan,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self.discovery_worker.result_ready.connect(
+            self._apply_chat_discovery_result
+        )
+        self.discovery_thread.finished.connect(
+            self.discovery_worker.deleteLater
+        )
+        self.discovery_thread.start()
+
     def _get_configured_log_dir(self):
         return self.config['shared'].get('log_dir', '')
+
+    def _request_chat_discovery(self) -> bool:
+        """Queue at most one scan and remember if another pass is needed."""
+        if getattr(self, '_shutting_down', False):
+            return True
+
+        discovery_thread = getattr(self, 'discovery_thread', None)
+        if discovery_thread is None or not discovery_thread.isRunning():
+            return False
+
+        log_dir = self._get_configured_log_dir()
+        if not log_dir or not os.path.isdir(log_dir):
+            return False
+
+        threshold = int(
+            self.config['shared'].get('fleet_inactive_threshold', 1800)
+        )
+        signature = (normalized_log_path(log_dir), threshold)
+        if getattr(self, '_discovery_scan_pending', False):
+            self._discovery_rescan_requested = True
+            if signature != getattr(
+                self,
+                '_discovery_inflight_signature',
+                None,
+            ):
+                self._discovery_request_invalidated = True
+            return True
+
+        retry_timer = getattr(self, 'discovery_retry_timer', None)
+        if retry_timer is not None:
+            retry_timer.stop()
+        self._discovery_generation = (
+            getattr(self, '_discovery_generation', 0) + 1
+        )
+        self._discovery_scan_pending = True
+        self._discovery_inflight_generation = self._discovery_generation
+        self._discovery_inflight_signature = signature
+        self._discovery_request_invalidated = False
+        self.chat_discovery_requested.emit(
+            self._discovery_generation,
+            log_dir,
+            int(threshold),
+        )
+        return True
+
+    @Slot(object)
+    def _apply_chat_discovery_result(self, result) -> None:
+        """Publish one complete discovery generation on the GUI thread."""
+        if getattr(self, '_shutting_down', False):
+            return
+
+        generation = getattr(result, 'generation', -1)
+        inflight = getattr(self, '_discovery_inflight_generation', None)
+        if generation != inflight:
+            logger.debug(
+                "Ignoring stale chat discovery generation %s (in flight %s)",
+                generation,
+                inflight,
+            )
+            return
+
+        self._discovery_scan_pending = False
+        self._discovery_inflight_generation = None
+        self._discovery_inflight_signature = None
+        invalidated = getattr(
+            self,
+            '_discovery_request_invalidated',
+            False,
+        )
+        self._discovery_request_invalidated = False
+        if invalidated:
+            self._discovery_rescan_requested = False
+            QTimer.singleShot(0, self._periodic_scan)
+            return
+
+        current_log_dir = self._get_configured_log_dir()
+        result_log_dir = getattr(result, 'log_dir', '')
+        same_directory = bool(current_log_dir and result_log_dir) and (
+            normalized_log_path(current_log_dir)
+            == normalized_log_path(result_log_dir)
+        )
+        if getattr(result, 'succeeded', False) and same_directory:
+            self._discovery_failure_count = 0
+            self._scan_characters(
+                new_registry=dict(result.character_registry)
+            )
+            self._scan_channels(
+                new_registry=dict(result.channel_registry)
+            )
+            self._scan_fleets(new_registry=dict(result.fleet_registry))
+            if getattr(self, '_sessions_initialized', True):
+                self._recover_waiting_sessions()
+        elif getattr(result, 'error', None) is not None:
+            self._discovery_failure_count = min(
+                getattr(self, '_discovery_failure_count', 0) + 1,
+                32,
+            )
+            error = result.error
+            logger.error(
+                "Chat discovery failed during %s (%s): %s",
+                getattr(error, 'stage', 'unknown'),
+                getattr(error, 'exception_type', 'Error'),
+                getattr(error, 'message', ''),
+            )
+
+        immediate_rescan = (
+            getattr(self, '_discovery_rescan_requested', False)
+            or not same_directory
+        )
+        if immediate_rescan:
+            self._discovery_rescan_requested = False
+            QTimer.singleShot(0, self._periodic_scan)
+        elif getattr(result, 'error', None) is not None:
+            exponent = min(self._discovery_failure_count - 1, 4)
+            delay_ms = min(
+                DISCOVERY_RETRY_BASE_MS * (2 ** exponent),
+                DISCOVERY_RETRY_MAX_MS,
+            )
+            retry_timer = getattr(self, 'discovery_retry_timer', None)
+            if retry_timer is not None:
+                retry_timer.start(delay_ms)
 
     @Slot(object)
     def _entity_index_initialized(self, index):
@@ -378,17 +524,29 @@ class TranslatorManager(QObject):
         return self._log_dir_watch_active
 
     def _handle_log_directory_changed(self, changed_path: str):
+        if getattr(self, '_shutting_down', False):
+            return
         if changed_path != self._get_configured_log_dir():
             return
         if not self.scan_debounce_timer.isActive():
             self.scan_debounce_timer.start()
 
     def _handle_debounced_directory_scan(self):
+        if getattr(self, '_shutting_down', False):
+            return
         self._configure_log_directory_watcher()
         self._periodic_scan()
 
     def _apply_scanner_config(self):
+        if getattr(self, '_shutting_down', False):
+            return
         self._configure_log_directory_watcher()
+        self._periodic_scan()
+
+    @staticmethod
+    def _scanner_config_signature(config: dict) -> tuple:
+        shared = config.get('shared', {})
+        return tuple(shared.get(key) for key in sorted(SCANNER_CONFIG_KEYS))
 
     def _ensure_log_directory(self):
         """Check if log dir is valid, if not, ask user."""
@@ -447,12 +605,13 @@ class TranslatorManager(QObject):
                 # overlay holds a point-in-time copy, so merging those fields
                 # back after a character/fleet/channel switch can roll the
                 # authoritative selection back to stale metadata.
-                for key in SESSION_SOURCE_IDENTITY_KEYS.get(
-                    session_id,
-                    frozenset(),
-                ):
+                spec = SESSION_SPECS_BY_ID.get(session_id)
+                identity_keys = (
+                    spec.source_identity_keys if spec is not None else ()
+                )
+                for key in identity_keys:
                     filtered_config.pop(key, None)
-                
+
                 # Update with filtered config
                 self.config.setdefault('sessions', {}).setdefault(session_id, {})
                 self.config['sessions'][session_id].update(filtered_config)
@@ -512,20 +671,22 @@ class TranslatorManager(QObject):
         
         self.tray_menu = QMenu()
 
-        self.fleet_action = QAction("Fleet Chat", self.tray_menu, checkable=True)
-        self.fleet_action.setChecked(self.config['sessions']['fleet']['enabled'])
-        self.fleet_action.triggered.connect(lambda: self.toggle_session('fleet'))
-        self.tray_menu.addAction(self.fleet_action)
-
-        self.local_action = QAction("Local Chat", self.tray_menu, checkable=True)
-        self.local_action.setChecked(self.config['sessions']['local']['enabled'])
-        self.local_action.triggered.connect(lambda: self.toggle_session('local'))
-        self.tray_menu.addAction(self.local_action)
-
-        self.any_action = QAction("Any Chat", self.tray_menu, checkable=True)
-        self.any_action.setChecked(self.config['sessions']['any']['enabled'])
-        self.any_action.triggered.connect(lambda: self.toggle_session('any'))
-        self.tray_menu.addAction(self.any_action)
+        self.session_actions = {}
+        for spec in SESSION_SPECS:
+            action = QAction(spec.label, self.tray_menu, checkable=True)
+            action.setChecked(
+                self.config['sessions'][spec.session_id]['enabled']
+            )
+            action.triggered.connect(
+                lambda _checked=False, session_id=spec.session_id: (
+                    self.toggle_session(session_id)
+                )
+            )
+            self.session_actions[spec.session_id] = action
+            # Retain the public attributes used by existing UI tests and
+            # integrations while deriving every action from the descriptor.
+            setattr(self, f"{spec.session_id}_action", action)
+            self.tray_menu.addAction(action)
 
         self.any_source_menu = self.tray_menu.addMenu("Any Chat Source")
         self.any_source_menu.aboutToShow.connect(self._populate_any_source_menu)
@@ -918,17 +1079,26 @@ class TranslatorManager(QObject):
                 
                 # Apply changes to running sessions
                 self._apply_config_update()
-                self._apply_scanner_config()
+                if (
+                    self._scanner_config_signature(original_config)
+                    != self._scanner_config_signature(self.config)
+                ):
+                    self._apply_scanner_config()
 
                 self._save_config()
             else:
                 # Cancelled: Restore original config
                 logger.info("Settings cancelled. Restoring original config.")
+                preview_config = self.config
                 self.config = original_config
                 # Re-apply original config to revert any previews
                 self._queue_worker_config()
                 self._apply_config_update()
-                self._apply_scanner_config()
+                if (
+                    self._scanner_config_signature(preview_config)
+                    != self._scanner_config_signature(self.config)
+                ):
+                    self._apply_scanner_config()
                 # Timers keep running while the modal dialog is open and may
                 # persist preview state. Write the restored config back so a
                 # cancelled cloud-provider choice cannot return after restart.
@@ -1088,11 +1258,19 @@ class TranslatorManager(QObject):
         """
         # Extract shared settings (not position/size which are per-session)
         shared_changed = False
+        scanner_changed = False
         for key in SHARED_CONFIG_KEYS:
             if key in updated_config:
+                value_changed = (
+                    self.config['shared'].get(key) != updated_config[key]
+                )
                 shared_changed = (
                     shared_changed
-                    or self.config['shared'].get(key) != updated_config[key]
+                    or value_changed
+                )
+                scanner_changed = (
+                    scanner_changed
+                    or (value_changed and key in SCANNER_CONFIG_KEYS)
                 )
                 self.config['shared'][key] = updated_config[key]
 
@@ -1110,7 +1288,8 @@ class TranslatorManager(QObject):
             # enqueue it for display-only position or HUD changes.
             self._queue_worker_config()
             self._apply_config_update()
-        self._apply_scanner_config()
+        if scanner_changed:
+            self._apply_scanner_config()
 
         # Save to disk
         self._save_config()
@@ -1294,12 +1473,9 @@ class TranslatorManager(QObject):
         detail = error or provider_reason or (
             f"Translation provider: {provider_status.get('name', 'Disabled')}"
         )
+        spec = SESSION_SPECS_BY_ID.get(session_id)
         session.overlay.update_status(OverlayStatus(
-            channel={
-                'fleet': 'Fleet',
-                'local': 'Local',
-                'any': 'Any Chat',
-            }.get(session_id, session_id),
+            channel=spec.status_label if spec is not None else session_id,
             state=state_labels[state],
             context=context,
             provider=str(provider_status.get('name') or 'Disabled'),
@@ -1316,11 +1492,6 @@ class TranslatorManager(QObject):
             SessionRuntimeState.ACTIVE: 'Active',
             SessionRuntimeState.ERROR: 'Error',
         }
-        action_specs = (
-            ('fleet', 'Fleet Chat', 'fleet_action'),
-            ('local', 'Local Chat', 'local_action'),
-            ('any', 'Any Chat', 'any_action'),
-        )
         provider_mode = (
             self.config.get('shared', {})
             .get('translation_provider', 'disabled')
@@ -1388,7 +1559,9 @@ class TranslatorManager(QObject):
             f"Overlays: {'Locked' if getattr(self, 'overlay_locked', False) else 'Interactive'}"
         )
 
-        for session_id, label, action_name in action_specs:
+        for spec in SESSION_SPECS:
+            session_id = spec.session_id
+            label = spec.label
             state = self._get_session_runtime_state(session_id)
             enabled = (
                 self.config.get('sessions', {})
@@ -1398,7 +1571,9 @@ class TranslatorManager(QObject):
             state_label = state_labels[state]
             tooltip_parts.append(f"{label}: {state_label}")
 
-            action = getattr(self, action_name, None)
+            action = getattr(self, 'session_actions', {}).get(session_id)
+            if action is None:
+                action = getattr(self, f"{session_id}_action", None)
             if action is not None:
                 action.setChecked(enabled)
                 action.setText(f"{label} - {state_label}")
@@ -1434,13 +1609,9 @@ class TranslatorManager(QObject):
                 self.start_session(session_id)
 
     def _get_log_path(self, session_id):
-        if session_id == 'fleet':
-            return self._find_latest_fleet_log()
-        elif session_id == 'local':
-            return self._find_latest_local_log()
-        elif session_id == 'any':
-            return self._find_latest_any_log()
-        return None
+        spec = SESSION_SPECS_BY_ID.get(session_id)
+        finder = getattr(self, spec.log_finder, None) if spec is not None else None
+        return finder() if callable(finder) else None
 
     def _find_latest_fleet_log(self):
         """
@@ -1493,7 +1664,7 @@ class TranslatorManager(QObject):
         log_dir = self._get_configured_log_dir()
         if not log_dir or not os.path.exists(log_dir):
             return None
-            
+
         # Character activity is established by the periodic detector using both
         # recent writes and the presence of an open EVE client window. Historical
         # Local logs remain selectable metadata, but must not make readiness Active.
@@ -1557,11 +1728,14 @@ class TranslatorManager(QObject):
         if not active_channels:
             return None
 
-        channel = max(active_channels, key=lambda item: (
-            item.started_time,
-            item.log_mtime,
-            item.log_path.casefold(),
-        ))
+        channel = max(
+            active_channels,
+            key=lambda item: log_recency_key(
+                item.started_time,
+                item.log_mtime,
+                item.log_path,
+            ),
+        )
         self._get_scan_state().select_channel(channel.selection_id, self.config)
         logger.info(
             "[ANY] Auto-selected chat: %s - %s",
@@ -1570,32 +1744,39 @@ class TranslatorManager(QObject):
         )
         return channel.log_path
 
-    def _scan_channels(self):
-        """Discover arbitrary EVE chats and follow only the selected source."""
-        log_dir = self._get_configured_log_dir()
-        if not log_dir or not os.path.exists(log_dir):
-            return
+    def _scan_channels(self, *, new_registry=None):
+        """Publish arbitrary chats and follow only the selected source."""
+        if new_registry is None:
+            log_dir = self._get_configured_log_dir()
+            if not log_dir or not os.path.exists(log_dir):
+                return
 
-        detector = getattr(self, 'any_chat_detector', None)
-        if detector is None:
-            detector = AnyChatDetector()
-            self.any_chat_detector = detector
-        active_characters = {}
-        for character_id, character in getattr(
-            self, 'character_registry', {}
-        ).items():
-            if not getattr(character, 'is_active', False):
-                continue
-            parsed_local = detector.parse_filename(
-                Path(character.latest_log_path).name
+            detector = getattr(self, 'any_chat_detector', None)
+            if detector is None:
+                detector = AnyChatDetector()
+                self.any_chat_detector = detector
+            active_characters = {}
+            for character_id, character in getattr(
+                self, 'character_registry', {}
+            ).items():
+                if not getattr(character, 'is_active', False):
+                    # Distinguish a character Local explicitly found inactive
+                    # from one Local discovery has not seen yet. Only the latter
+                    # may use the Any log's own recent mtime as startup evidence.
+                    active_characters[character_id] = False
+                    continue
+                parsed_local = detector.parse_filename(
+                    Path(character.latest_log_path).name
+                )
+                active_characters[character_id] = (
+                    parsed_local[2] if parsed_local is not None else None
+                )
+            new_registry = detector.scan_channels(
+                log_dir,
+                active_characters=active_characters,
             )
-            active_characters[character_id] = (
-                parsed_local[2] if parsed_local is not None else None
-            )
-        new_registry = detector.scan_channels(
-            log_dir,
-            active_characters=active_characters,
-        )
+        else:
+            new_registry = dict(new_registry)
         self.channel_registry = new_registry
 
         selected = getattr(self, 'selected_channel_id', None)
@@ -1607,11 +1788,14 @@ class TranslatorManager(QObject):
                 channel for channel in new_registry.values() if channel.is_active
             ]
             if active_channels:
-                channel = max(active_channels, key=lambda item: (
-                    item.started_time,
-                    item.log_mtime,
-                    item.log_path.casefold(),
-                ))
+                channel = max(
+                    active_channels,
+                    key=lambda item: log_recency_key(
+                        item.started_time,
+                        item.log_mtime,
+                        item.log_path,
+                    ),
+                )
                 self._get_scan_state().select_channel(
                     channel.selection_id,
                     self.config,
@@ -1624,8 +1808,8 @@ class TranslatorManager(QObject):
             self._get_scan_state().select_channel(channel.selection_id, self.config)
             current_path = getattr(session, 'log_path', '') if session else ''
             path_changed = bool(session) and (
-                os.path.normcase(os.path.abspath(str(current_path)))
-                != os.path.normcase(os.path.abspath(channel.log_path))
+                normalized_log_path(current_path)
+                != normalized_log_path(channel.log_path)
             )
             if session and path_changed:
                 session.switch_log(channel.log_path)
@@ -1640,17 +1824,19 @@ class TranslatorManager(QObject):
         self._broadcast_channel_list()
 
     def _periodic_scan(self):
-        """
-        Periodic scanner that runs every 30 seconds.
-        Scans active characters, arbitrary channels, and fleets.
-        """
+        """Request event-driven discovery, with a synchronous test fallback."""
+        if getattr(self, '_shutting_down', False):
+            return
+        if self._request_chat_discovery():
+            return
+
         self._scan_characters()
         self._scan_channels()
         self._scan_fleets()
         if getattr(self, '_sessions_initialized', True):
             self._recover_waiting_sessions()
 
-    def _scan_fleets(self):
+    def _scan_fleets(self, *, new_registry=None):
         """
         Periodically scan for active fleet chat logs.
         Updates fleet registry and handles:
@@ -1658,16 +1844,24 @@ class TranslatorManager(QObject):
         - Auto-switch when current fleet becomes inactive (if enabled)
         - Does NOT auto-switch when newer fleets appear
         """
-        log_dir = self._get_configured_log_dir()
-        if not log_dir or not os.path.exists(log_dir):
-            return
-
         from src.services.fleet_detector import FleetDetector
         detector = FleetDetector()
+        if new_registry is None:
+            log_dir = self._get_configured_log_dir()
+            if not log_dir or not os.path.exists(log_dir):
+                return
 
-        # Get user-configured threshold
-        threshold = self.config['shared'].get('fleet_inactive_threshold', 1800)
-        new_registry = detector.scan_active_fleets(log_dir, active_threshold_seconds=threshold)
+            # Get user-configured threshold
+            threshold = self.config['shared'].get(
+                'fleet_inactive_threshold',
+                1800,
+            )
+            new_registry = detector.scan_active_fleets(
+                log_dir,
+                active_threshold_seconds=threshold,
+            )
+        else:
+            new_registry = dict(new_registry)
 
         # Get auto-switch setting
         auto_switch_enabled = self.config['shared'].get('fleet_auto_switch', True)
@@ -1744,7 +1938,7 @@ class TranslatorManager(QObject):
         # Broadcast to overlays (for context menu)
         self._broadcast_fleet_list()
 
-    def _scan_characters(self):
+    def _scan_characters(self, *, new_registry=None):
         """
         Periodically scan for active EVE characters.
         Updates character registry and handles:
@@ -1752,12 +1946,15 @@ class TranslatorManager(QObject):
         - Characters logging out (stale logs)
         - Log file rotations (client restarts)
         """
-        log_dir = self._get_configured_log_dir()
-        if not log_dir or not os.path.exists(log_dir):
-            return
+        if new_registry is None:
+            log_dir = self._get_configured_log_dir()
+            if not log_dir or not os.path.exists(log_dir):
+                return
 
-        detector = LocalChatDetector()
-        new_registry = detector.scan_active_characters(log_dir)
+            detector = LocalChatDetector()
+            new_registry = detector.scan_active_characters(log_dir)
+        else:
+            new_registry = dict(new_registry)
         restart_selected_local = False
         fallback_character_id = None
 
@@ -1933,10 +2130,8 @@ class TranslatorManager(QObject):
         session = getattr(self, 'sessions', {}).get('any')
         if enabled and channel.is_active:
             if session:
-                current = os.path.normcase(
-                    os.path.abspath(str(session.log_path))
-                )
-                selected = os.path.normcase(os.path.abspath(channel.log_path))
+                current = normalized_log_path(session.log_path)
+                selected = normalized_log_path(channel.log_path)
                 if current != selected:
                     session.switch_log(channel.log_path)
                 self._set_session_runtime_state(
@@ -2015,7 +2210,23 @@ class TranslatorManager(QObject):
             )
 
     def shutdown(self):
+        if getattr(self, '_shutting_down', False):
+            return
+        self._shutting_down = True
         logger.info("Shutting down...")
+        for timer_name in (
+            'scanner_timer',
+            'scan_debounce_timer',
+            'discovery_retry_timer',
+        ):
+            timer = getattr(self, timer_name, None)
+            if timer is not None:
+                timer.stop()
+        watcher = getattr(self, 'log_dir_watcher', None)
+        if watcher is not None:
+            watcher.blockSignals(True)
+            for watched in list(watcher.directories()):
+                watcher.removePath(watched)
         hotkey = getattr(self, 'hotkey', None)
         if hotkey is not None:
             hotkey.unregister()
@@ -2039,6 +2250,19 @@ class TranslatorManager(QObject):
                 # We want to preserve user's preference for next startup
 
         self._save_config()
+        discovery_worker = getattr(self, 'discovery_worker', None)
+        discovery_thread = getattr(self, 'discovery_thread', None)
+        if discovery_worker is not None:
+            discovery_worker.request_stop()
+        if discovery_thread is not None:
+            discovery_thread.requestInterruption()
+            discovery_thread.quit()
+            if not discovery_thread.wait(WORKER_SHUTDOWN_TIMEOUT_MS):
+                logger.error(
+                    "Chat discovery did not stop before the shutdown deadline"
+                )
+                discovery_thread.terminate()
+                discovery_thread.wait(1_000)
         self.thread.requestInterruption()
         self.thread.quit()
         if not self.thread.wait(WORKER_SHUTDOWN_TIMEOUT_MS):

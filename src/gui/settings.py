@@ -21,6 +21,7 @@ from src.app_config import (
     normalize_translation_provider_config,
 )
 from src.services.translator import TranslationService
+from src.core.session_specs import SESSION_SPECS
 from src.version import __version__
 
 
@@ -64,20 +65,12 @@ class SettingsDialog(QDialog):
         self._init_shared_tab()
         self.tabs.addTab(self.tab_shared, "General")
         
-        # 2. Fleet Tab
-        self.tab_fleet = QWidget()
-        self._init_session_tab(self.tab_fleet, 'fleet')
-        self.tabs.addTab(self.tab_fleet, "Fleet Overlay")
-        
-        # 3. Local Tab
-        self.tab_local = QWidget()
-        self._init_session_tab(self.tab_local, 'local')
-        self.tabs.addTab(self.tab_local, "Local Overlay")
-
-        # 4. One selected Corp/Alliance/custom chat at a time.
-        self.tab_any = QWidget()
-        self._init_session_tab(self.tab_any, 'any')
-        self.tabs.addTab(self.tab_any, "Any Chat Overlay")
+        # Session tabs share one descriptor-backed order and label source.
+        for spec in SESSION_SPECS:
+            tab = QWidget()
+            setattr(self, f"tab_{spec.session_id}", tab)
+            self._init_session_tab(tab, spec.session_id)
+            self.tabs.addTab(tab, spec.settings_label)
 
         # 5. EVE-aware translation controls stay out of the dense General tab.
         self.tab_intelligence = QWidget()

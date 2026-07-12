@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Mapping
 
 from src.core.languages import normalize_locale
+from src.core.session_specs import SESSION_SPECS, SessionSpec
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,53 @@ SHARED_CONFIG_KEYS = frozenset({
     'burst_batch_size', 'context_assist', 'context_messages',
     'active_doctrine_pack',
 })
+
+
+def _default_session_config(
+    spec: SessionSpec,
+    legacy_overlay: Mapping[str, Any] | None = None,
+) -> dict:
+    legacy = legacy_overlay or {}
+    use_legacy_geometry = spec.session_id == 'fleet'
+    session = {
+        'enabled': spec.default_enabled,
+        'x': (
+            legacy.get('x', spec.default_x)
+            if use_legacy_geometry
+            else spec.default_x
+        ),
+        'y': (
+            legacy.get('y', spec.default_y)
+            if use_legacy_geometry
+            else spec.default_y
+        ),
+        'w': (
+            legacy.get('w', spec.default_width)
+            if use_legacy_geometry
+            else spec.default_width
+        ),
+        'h': (
+            legacy.get('h', spec.default_height)
+            if use_legacy_geometry
+            else spec.default_height
+        ),
+        'background_color': spec.background_color,
+        'title_prefix': spec.title_prefix,
+        'display_mode': DISPLAY_MODE_MIRROR,
+        'compact_header': True,
+        'command_cards': True,
+    }
+    if spec.session_id == 'any':
+        session.update(
+            {
+                'channel_selection': '',
+                'channel_id': '',
+                'channel_name': '',
+                'character_id': '',
+                'listener_name': '',
+            }
+        )
+    return session
 
 
 def resolve_translation_provider(shared_config: Mapping[str, Any]) -> str:
@@ -300,33 +348,8 @@ def normalize_config(config: dict) -> dict:
         sessions = {}
         config['sessions'] = sessions
     session_defaults = {
-        'fleet': {
-            'enabled': True,
-            'x': 100,
-            'y': 100,
-            'w': 300,
-            'h': 200,
-            'background_color': '#33001a',
-            'title_prefix': '[FLEET]',
-        },
-        'local': {
-            'enabled': False,
-            'x': 410,
-            'y': 100,
-            'w': 300,
-            'h': 200,
-            'background_color': '#001a33',
-            'title_prefix': '[LOCAL]',
-        },
-        'any': {
-            'enabled': False,
-            'x': 720,
-            'y': 100,
-            'w': 300,
-            'h': 200,
-            'background_color': '#21173d',
-            'title_prefix': '[ANY]',
-        },
+        spec.session_id: _default_session_config(spec)
+        for spec in SESSION_SPECS
     }
     for session_id, defaults in session_defaults.items():
         session = sessions.setdefault(session_id, {})
@@ -419,47 +442,8 @@ def get_default_config(legacy_overlay: Mapping[str, Any] | None = None) -> dict:
             'active_doctrine_pack': '',
         },
         'sessions': {
-            'fleet': {
-                'enabled': True,
-                'x': legacy_overlay.get('x', 100),
-                'y': legacy_overlay.get('y', 100),
-                'w': legacy_overlay.get('w', 300),
-                'h': legacy_overlay.get('h', 200),
-                'background_color': '#33001a',
-                'title_prefix': '[FLEET]',
-                'display_mode': DISPLAY_MODE_MIRROR,
-                'compact_header': True,
-                'command_cards': True,
-            },
-            'local': {
-                'enabled': False,
-                'x': 410,
-                'y': 100,
-                'w': 300,
-                'h': 200,
-                'background_color': '#001a33',
-                'title_prefix': '[LOCAL]',
-                'display_mode': DISPLAY_MODE_MIRROR,
-                'compact_header': True,
-                'command_cards': True,
-            },
-            'any': {
-                'enabled': False,
-                'x': 720,
-                'y': 100,
-                'w': 300,
-                'h': 200,
-                'background_color': '#21173d',
-                'title_prefix': '[ANY]',
-                'display_mode': DISPLAY_MODE_MIRROR,
-                'compact_header': True,
-                'command_cards': True,
-                'channel_selection': '',
-                'channel_id': '',
-                'channel_name': '',
-                'character_id': '',
-                'listener_name': '',
-            },
+            spec.session_id: _default_session_config(spec, legacy_overlay)
+            for spec in SESSION_SPECS
         },
     }
     return normalize_config(config)
