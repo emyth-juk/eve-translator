@@ -1,18 +1,11 @@
-
 import unittest
-from unittest.mock import MagicMock, patch, PropertyMock
+from unittest.mock import patch
 import time
-from datetime import datetime, timezone
-from pathlib import Path
 
 from src.core.fleet_info import FleetInfo
-from src.services.fleet_detector import FleetDetector
 from src.core.session import ChatSession
 
 class TestFleetFeatures(unittest.TestCase):
-
-    def setUp(self):
-        self.detector = FleetDetector()
 
     def test_fleet_info_is_active(self):
         """Test active status logic based on mtime."""
@@ -56,19 +49,6 @@ class TestFleetFeatures(unittest.TestCase):
         self.assertEqual(old_fleet.listener_name, new_fleet.listener_name)
         self.assertGreater(new_fleet.created_time, old_fleet.created_time)
 
-    def test_timestamp_parsing(self):
-        """Test regex parsing of fleet log filenames."""
-        filename = "Fleet_20251216_082457_1117005149.txt"
-        ts = self.detector.parse_timestamp_from_filename(filename)
-        self.assertIsNotNone(ts)
-        
-        dt = datetime.fromtimestamp(ts, timezone.utc)
-        self.assertEqual(dt.year, 2025)
-        self.assertEqual(dt.month, 12)
-        self.assertEqual(dt.day, 16)
-        self.assertEqual(dt.hour, 8)
-        self.assertEqual(dt.minute, 24)
-        
     @patch('src.core.tailer.FleetLogTailer')
     @patch('src.gui.overlay.OverlayWindow')
     def test_session_history_limit(self, MockOverlay, MockTailer):

@@ -1017,7 +1017,7 @@ class TestSessionRuntimeState(unittest.TestCase):
                 patch('src.services.fleet_detector.FleetDetector') as detector_cls:
             detector = detector_cls.return_value
             detector.scan_active_fleets.return_value = {'new': new_fleet}
-            detector.get_most_recent_fleet.return_value = new_fleet
+            detector_cls.get_most_recent_fleet.return_value = new_fleet
             mgr._scan_fleets()
 
         mgr.switch_fleet.assert_called_once_with('new')

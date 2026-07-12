@@ -7,7 +7,6 @@ from src.services.log_discovery import (
     EVELogEntry,
     EVE_LOG_FUTURE_MTIME_SKEW_SECONDS,
     UTF16HeaderCache,
-    parse_eve_log_filename,
     scan_eve_log_entries,
 )
 import logging
@@ -23,35 +22,6 @@ class FleetDetector:
 
     def __init__(self):
         self._header_cache = UTF16HeaderCache()
-
-    def parse_listener_from_log(self, filepath: str) -> Optional[str]:
-        """
-        Parse listener (character) name from fleet log header.
-        Reads first ~15 lines looking for "Listener: <CharacterName>".
-
-        Args:
-            filepath: Path to fleet log file
-
-        Returns:
-            Character name or None if not found
-        """
-        header = self._header_cache.read(filepath)
-        return (header.listener_name or None) if header is not None else None
-
-    def parse_timestamp_from_filename(self, filename: str) -> Optional[float]:
-        """
-        Extract creation timestamp from fleet log filename.
-
-        Args:
-            filename: e.g., "Fleet_20251216_082457.txt" or "Fleet_20251216_082457_1117005149.txt"
-
-        Returns:
-            Unix timestamp or None if parsing fails
-        """
-        parsed = parse_eve_log_filename(filename)
-        if parsed is not None and parsed.channel_name.casefold() == "fleet":
-            return parsed.started_time
-        return None
 
     def scan_active_fleets(
         self,
@@ -121,7 +91,10 @@ class FleetDetector:
 
         return result
 
-    def get_most_recent_fleet(self, fleets: Dict[str, FleetInfo]) -> Optional[FleetInfo]:
+    @staticmethod
+    def get_most_recent_fleet(
+        fleets: Dict[str, FleetInfo],
+    ) -> Optional[FleetInfo]:
         """
         Get the most recently created fleet from a dict of fleets.
 

@@ -1,9 +1,8 @@
-import os
 import sys
 import time
 from collections.abc import Iterable
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 from src.core.character_info import CharacterInfo
 from src.services.log_discovery import (
@@ -211,79 +210,3 @@ class LocalChatDetector:
             )
 
         return result
-
-    def get_latest_log_for_character(self, log_dir: str, char_id: str) -> Optional[str]:
-        """
-        Get the most recent Local chat log for a specific character.
-        """
-        latest_path = None
-        latest_mtime = 0
-
-        try:
-            with os.scandir(log_dir) as entries:
-                for entry in entries:
-                    if entry.is_file() and entry.name.startswith("Local_") and entry.name.endswith(".txt"):
-                        entry_char_id = self.parse_character_id_from_filename(entry.name)
-                        if entry_char_id == char_id:
-                            try:
-                                mtime = entry.stat().st_mtime
-                                if mtime > latest_mtime:
-                                    latest_mtime = mtime
-                                    latest_path = entry.path
-                            except OSError:
-                                continue
-        except OSError:
-            return None
-        return latest_path
-
-    def find_local_logs(self, log_dir: str) -> List[Tuple[str, float]]:
-        """
-        Find all Local_*.txt files with their modification times.
-        Uses scandir for better performance on large directories.
-        """
-        result = []
-        try:
-            with os.scandir(log_dir) as entries:
-                for entry in entries:
-                    if entry.is_file() and entry.name.startswith("Local_") and entry.name.endswith(".txt"):
-                        try:
-                            # entry.stat().st_mtime is cached on Windows
-                            result.append((entry.path, entry.stat().st_mtime))
-                        except OSError:
-                            continue
-        except OSError:
-             return []
-        return result
-
-    def get_most_recent_local(self, log_dir: str) -> Optional[str]:
-        """
-        Get most recently modified Local chat log efficiently.
-        """
-        most_recent_file = None
-        most_recent_time = 0
-        
-        try:
-            with os.scandir(log_dir) as entries:
-                for entry in entries:
-                    if entry.is_file() and entry.name.startswith("Local_") and entry.name.endswith(".txt"):
-                        try:
-                            # entry.stat().st_mtime is cached on Windows
-                            mtime = entry.stat().st_mtime
-                            if mtime > most_recent_time:
-                                most_recent_time = mtime
-                                most_recent_file = entry.path
-                        except OSError:
-                            continue
-        except OSError as e:
-            logger.error(f"Error scanning logs: {e}")
-            return None
-            
-        return most_recent_file
-
-    def get_character_from_log(self, filepath: str) -> Optional[str]:
-        """
-        Parse character name from log header.
-        Reads first ~15 lines looking for "Listener: <CharacterName>".
-        """
-        header = self._header_cache.read(filepath)
-        return (header.listener_name or None) if header is not None else None

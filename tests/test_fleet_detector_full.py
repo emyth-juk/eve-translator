@@ -4,18 +4,18 @@ import shutil
 import time
 import unittest
 from unittest.mock import patch
-from pathlib import Path
 from datetime import datetime, timezone
 
 from src.services.fleet_detector import FleetDetector
 from src.core.fleet_info import FleetInfo
+from src.services.log_discovery import UTF16HeaderCache, parse_eve_log_filename
 
 
-class TestFleetDetectorParsing(unittest.TestCase):
-    """Tests for FleetDetector parsing methods."""
+class TestSharedLogDiscoveryParsing(unittest.TestCase):
+    """Tests for the shared header and filename parsers used by Fleet."""
 
     def setUp(self):
-        self.detector = FleetDetector()
+        self.header_cache = UTF16HeaderCache()
         self.test_dir = tempfile.mkdtemp()
 
     def tearDown(self):
@@ -40,64 +40,75 @@ class TestFleetDetectorParsing(unittest.TestCase):
             f.write(content)
         return path
 
-    # --- parse_listener_from_log ---
+    # --- UTF16HeaderCache ---
 
-    def test_parse_listener_from_log_valid(self):
+    def test_header_cache_parses_listener(self):
         path = self._create_fleet_log("Fleet_20251216_082457.txt", "Emyth Juk")
-        result = self.detector.parse_listener_from_log(path)
-        self.assertEqual(result, "Emyth Juk")
+        header = self.header_cache.read(path)
+        self.assertIsNotNone(header)
+        self.assertEqual(header.listener_name, "Emyth Juk")
 
-    def test_parse_listener_from_log_no_listener(self):
+    def test_header_cache_preserves_empty_listener(self):
         path = os.path.join(self.test_dir, "Fleet_test.txt")
         with open(path, 'w', encoding='utf-16-le') as f:
             f.write("Channel ID: (None)\r\nChannel Name: Fleet\r\n")
-        result = self.detector.parse_listener_from_log(path)
-        self.assertIsNone(result)
+        header = self.header_cache.read(path)
+        self.assertIsNotNone(header)
+        self.assertEqual(header.listener_name, "")
 
-    def test_parse_listener_from_log_nonexistent(self):
-        result = self.detector.parse_listener_from_log("/nonexistent/path.txt")
-        self.assertIsNone(result)
+    def test_header_cache_returns_none_for_nonexistent_file(self):
+        self.assertIsNone(self.header_cache.read("/nonexistent/path.txt"))
 
-    def test_parse_listener_from_log_uses_metadata_cache(self):
+    def test_header_cache_uses_metadata_version(self):
         path = self._create_fleet_log("Fleet_20251216_082457.txt", "CachedPilot")
 
         with patch("builtins.open", wraps=open) as mock_open:
-            self.assertEqual(self.detector.parse_listener_from_log(path), "CachedPilot")
-            self.assertEqual(self.detector.parse_listener_from_log(path), "CachedPilot")
+            first = self.header_cache.read(path)
+            second = self.header_cache.read(path)
 
+        self.assertEqual(first.listener_name, "CachedPilot")
+        self.assertEqual(second.listener_name, "CachedPilot")
         self.assertEqual(mock_open.call_count, 1)
 
-    def test_parse_listener_from_log_invalidates_cache_on_change(self):
+    def test_header_cache_invalidates_on_change(self):
         path = self._create_fleet_log("Fleet_20251216_082457.txt", "OldPilot")
 
         with patch("builtins.open", wraps=open) as mock_open:
-            self.assertEqual(self.detector.parse_listener_from_log(path), "OldPilot")
+            old_header = self.header_cache.read(path)
             with open(path, 'w', encoding='utf-16-le') as f:
                 f.write("Listener:        NewPilotLonger\r\n")
-            self.assertEqual(self.detector.parse_listener_from_log(path), "NewPilotLonger")
+            new_header = self.header_cache.read(path)
 
+        self.assertEqual(old_header.listener_name, "OldPilot")
+        self.assertEqual(new_header.listener_name, "NewPilotLonger")
         self.assertEqual(mock_open.call_count, 3)
 
-    # --- parse_timestamp_from_filename ---
+    # --- parse_eve_log_filename ---
 
-    def test_parse_timestamp_standard_filename(self):
-        ts = self.detector.parse_timestamp_from_filename("Fleet_20251216_082457.txt")
-        self.assertIsNotNone(ts)
-        dt = datetime.fromtimestamp(ts, timezone.utc)
+    def test_filename_parser_reads_fleet_timestamp(self):
+        parsed = parse_eve_log_filename("Fleet_20251216_082457.txt")
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.channel_name, "Fleet")
+        dt = datetime.fromtimestamp(parsed.started_time, timezone.utc)
         self.assertEqual(dt.year, 2025)
         self.assertEqual(dt.month, 12)
         self.assertEqual(dt.day, 16)
         self.assertEqual(dt.hour, 8)
         self.assertEqual(dt.minute, 24)
 
-    def test_parse_timestamp_with_char_id(self):
-        ts = self.detector.parse_timestamp_from_filename("Fleet_20251216_082457_1117005149.txt")
-        self.assertIsNotNone(ts)
+    def test_filename_parser_reads_character_id(self):
+        parsed = parse_eve_log_filename(
+            "Fleet_20251216_082457_1117005149.txt"
+        )
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.character_id, "1117005149")
 
-    def test_parse_timestamp_invalid_filename(self):
-        self.assertIsNone(self.detector.parse_timestamp_from_filename("Local_20251216.txt"))
-        self.assertIsNone(self.detector.parse_timestamp_from_filename("Fleet_invalid.txt"))
-        self.assertIsNone(self.detector.parse_timestamp_from_filename("random.txt"))
+    def test_filename_parser_is_channel_agnostic_and_rejects_invalid_names(self):
+        local = parse_eve_log_filename("Local_20251216_082457.txt")
+        self.assertIsNotNone(local)
+        self.assertEqual(local.channel_name, "Local")
+        self.assertIsNone(parse_eve_log_filename("Fleet_invalid.txt"))
+        self.assertIsNone(parse_eve_log_filename("random.txt"))
 
 
 class TestFleetDetectorScanning(unittest.TestCase):
@@ -161,8 +172,8 @@ class TestFleetDetectorScanning(unittest.TestCase):
         self.assertEqual(len(result), 0)
 
     def test_scan_nonexistent_directory(self):
-        result = self.detector.scan_active_fleets("/nonexistent/path")
-        self.assertEqual(len(result), 0)
+        with self.assertRaises(FileNotFoundError):
+            self.detector.scan_active_fleets("/nonexistent/path")
 
     def test_scan_ignores_non_fleet_files(self):
         # Create a Local_ file (should be ignored)
@@ -241,18 +252,18 @@ class TestFleetDetectorScanning(unittest.TestCase):
             "fleet2": FleetInfo("fleet2", "NewPilot", "/path2", 2000, 200.0, True),
             "fleet3": FleetInfo("fleet3", "MidPilot", "/path3", 1500, 150.0, True),
         }
-        result = self.detector.get_most_recent_fleet(fleets)
+        result = FleetDetector.get_most_recent_fleet(fleets)
         self.assertEqual(result.listener_name, "NewPilot")
 
     def test_get_most_recent_fleet_empty(self):
-        result = self.detector.get_most_recent_fleet({})
+        result = FleetDetector.get_most_recent_fleet({})
         self.assertIsNone(result)
 
     def test_get_most_recent_fleet_single(self):
         fleets = {
             "fleet1": FleetInfo("fleet1", "SoloPilot", "/path1", 1000, 100.0, True),
         }
-        result = self.detector.get_most_recent_fleet(fleets)
+        result = FleetDetector.get_most_recent_fleet(fleets)
         self.assertEqual(result.listener_name, "SoloPilot")
 
 

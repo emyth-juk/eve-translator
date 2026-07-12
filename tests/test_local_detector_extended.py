@@ -5,7 +5,6 @@ import shutil
 import time
 import unittest
 from unittest.mock import patch
-from pathlib import Path
 
 from src.services.local_detector import LocalChatDetector
 
@@ -61,112 +60,6 @@ class TestLocalChatDetectorExtended(unittest.TestCase):
     def test_window_check_non_windows(self):
         """On non-Windows platforms, should return False."""
         self.assertFalse(self.detector.is_character_window_open("AnyName"))
-
-    # --- find_local_logs ---
-
-    def test_find_local_logs_returns_files(self):
-        self._create_local_log("111", "Pilot1")
-        self._create_local_log("222", "Pilot2")
-
-        result = self.detector.find_local_logs(self.test_dir)
-        self.assertEqual(len(result), 2)
-        for path, mtime in result:
-            self.assertTrue(path.endswith(".txt"))
-            self.assertGreater(mtime, 0)
-
-    def test_find_local_logs_empty_dir(self):
-        result = self.detector.find_local_logs(self.test_dir)
-        self.assertEqual(len(result), 0)
-
-    def test_find_local_logs_ignores_fleet(self):
-        """Should only find Local_ files, not Fleet_ files."""
-        self._create_local_log("111", "Pilot1")
-        # Create a fleet file
-        fleet_path = os.path.join(self.test_dir, "Fleet_20251216_082457.txt")
-        with open(fleet_path, 'w') as f:
-            f.write("fleet data")
-
-        result = self.detector.find_local_logs(self.test_dir)
-        self.assertEqual(len(result), 1)
-
-    def test_find_local_logs_nonexistent_dir(self):
-        result = self.detector.find_local_logs("/nonexistent/path")
-        self.assertEqual(len(result), 0)
-
-    # --- get_most_recent_local ---
-
-    def test_get_most_recent_local(self):
-        """Should return the most recently modified Local log."""
-        old_time = time.time() - 600
-        self._create_local_log("111", "OldPilot", touch_time=old_time)
-        recent_path = self._create_local_log("222", "NewPilot")
-
-        result = self.detector.get_most_recent_local(self.test_dir)
-        self.assertEqual(result, recent_path)
-
-    def test_get_most_recent_local_empty(self):
-        result = self.detector.get_most_recent_local(self.test_dir)
-        self.assertIsNone(result)
-
-    def test_get_most_recent_local_nonexistent_dir(self):
-        result = self.detector.get_most_recent_local("/nonexistent/path")
-        self.assertIsNone(result)
-
-    # --- get_latest_log_for_character ---
-
-    def test_get_latest_log_for_specific_character(self):
-        self._create_local_log("111", "Pilot1")
-        expected = self._create_local_log("222", "Pilot2")
-
-        result = self.detector.get_latest_log_for_character(self.test_dir, "222")
-        self.assertEqual(result, expected)
-
-    def test_get_latest_log_character_not_found(self):
-        self._create_local_log("111", "Pilot1")
-        result = self.detector.get_latest_log_for_character(self.test_dir, "999")
-        self.assertIsNone(result)
-
-    def test_get_latest_log_multiple_logs_same_character(self):
-        """When a character has multiple logs, return the newest."""
-        old_time = time.time() - 600
-        # Older log
-        old_path = os.path.join(self.test_dir, "Local_20251201_080000_111.txt")
-        with open(old_path, 'w', encoding='utf-16-le') as f:
-            f.write("old log")
-        os.utime(old_path, (old_time, old_time))
-
-        # Newer log (same character)
-        new_path = self._create_local_log("111", "Pilot1")
-
-        result = self.detector.get_latest_log_for_character(self.test_dir, "111")
-        self.assertEqual(result, new_path)
-
-    # --- get_character_from_log ---
-
-    def test_get_character_from_log(self):
-        path = self._create_local_log("111", "Emyth Juk")
-        result = self.detector.get_character_from_log(path)
-        self.assertEqual(result, "Emyth Juk")
-
-    def test_get_character_from_log_no_listener(self):
-        path = os.path.join(self.test_dir, "test.txt")
-        with open(path, 'w', encoding='utf-16-le') as f:
-            f.write("No listener line here\r\n")
-        result = self.detector.get_character_from_log(path)
-        self.assertIsNone(result)
-
-    def test_get_character_from_log_nonexistent(self):
-        result = self.detector.get_character_from_log("/nonexistent/path.txt")
-        self.assertIsNone(result)
-
-    def test_get_character_from_log_uses_metadata_cache(self):
-        path = self._create_local_log("111", "CachedPilot")
-
-        with patch("builtins.open", wraps=open) as mock_open:
-            self.assertEqual(self.detector.get_character_from_log(path), "CachedPilot")
-            self.assertEqual(self.detector.get_character_from_log(path), "CachedPilot")
-
-        self.assertEqual(mock_open.call_count, 1)
 
     # --- extract_system_name ---
 
@@ -229,8 +122,8 @@ class TestLocalChatDetectorExtended(unittest.TestCase):
         self.assertEqual(len(result), 0)
 
     def test_scan_active_characters_nonexistent_dir(self):
-        result = self.detector.scan_active_characters("/nonexistent/path")
-        self.assertEqual(len(result), 0)
+        with self.assertRaises(FileNotFoundError):
+            self.detector.scan_active_characters("/nonexistent/path")
 
     def test_scan_fallback_character_name(self):
         """If listener can't be parsed, should fallback to Character_<id>."""

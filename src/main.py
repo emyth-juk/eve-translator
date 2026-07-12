@@ -1789,8 +1789,9 @@ class TranslatorManager(QObject):
         # No selected fleet or it's not active - find most recent
         if self.fleet_registry:
             from src.services.fleet_detector import FleetDetector
-            detector = FleetDetector()
-            most_recent = detector.get_most_recent_fleet(self.fleet_registry)
+            most_recent = FleetDetector.get_most_recent_fleet(
+                self.fleet_registry
+            )
             if most_recent:
                 logger.info(f"[FLEET] Auto-selecting most recent fleet: {most_recent.listener_name}")
                 self.selected_fleet_id = most_recent.fleet_id
@@ -1990,7 +1991,6 @@ class TranslatorManager(QObject):
         - Does NOT auto-switch when newer fleets appear
         """
         from src.services.fleet_detector import FleetDetector
-        detector = FleetDetector()
         if new_registry is None:
             log_dir = self._get_configured_log_dir()
             if not log_dir or not os.path.exists(log_dir):
@@ -2001,7 +2001,7 @@ class TranslatorManager(QObject):
                 'fleet_inactive_threshold',
                 1800,
             )
-            new_registry = detector.scan_active_fleets(
+            new_registry = FleetDetector().scan_active_fleets(
                 log_dir,
                 active_threshold_seconds=threshold,
             )
@@ -2033,7 +2033,9 @@ class TranslatorManager(QObject):
                 # BACK-TO-BACK FLEET CHECK:
                 # If the same character starts a NEW fleet, switch to it even if the old log is technically still "active" (within 30m).
                 if auto_switch_enabled:
-                    most_recent = detector.get_most_recent_fleet(new_registry)
+                    most_recent = FleetDetector.get_most_recent_fleet(
+                        new_registry
+                    )
                     if most_recent and most_recent.fleet_id != self.selected_fleet_id:
                         # Check if it's the SAME character but a NEWER file
                         if most_recent.listener_name == fleet_info.listener_name and most_recent.created_time > fleet_info.created_time:
@@ -2046,7 +2048,9 @@ class TranslatorManager(QObject):
 
                 if auto_switch_enabled and new_registry:
                     # Auto-switch to most recent active fleet
-                    most_recent = detector.get_most_recent_fleet(new_registry)
+                    most_recent = FleetDetector.get_most_recent_fleet(
+                        new_registry
+                    )
                     if most_recent and most_recent.fleet_id != self.selected_fleet_id:
                         logger.info(f"[FLEET] Auto-switching to most recent active fleet: {most_recent.listener_name}")
                         fleet_to_switch = most_recent.fleet_id
@@ -2067,7 +2071,9 @@ class TranslatorManager(QObject):
                 # Check if fleet session is enabled and running
                 if self.config['sessions']['fleet'].get('enabled') and 'fleet' in self.sessions and self.sessions['fleet']:
                     # Session is running but no fleet selected - select most recent
-                    most_recent = detector.get_most_recent_fleet(new_registry)
+                    most_recent = FleetDetector.get_most_recent_fleet(
+                        new_registry
+                    )
                     if most_recent:
                         logger.info(f"[FLEET] Initial auto-selection: {most_recent.listener_name}")
                         fleet_to_switch = most_recent.fleet_id

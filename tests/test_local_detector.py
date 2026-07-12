@@ -1,6 +1,5 @@
 import unittest
-from unittest.mock import MagicMock, patch
-import os
+from unittest.mock import patch
 import time
 from src.services.local_detector import LocalChatDetector
 from src.services.log_discovery import (
@@ -90,6 +89,7 @@ class TestLocalChatDetector(unittest.TestCase):
             
             # Verify name resolved from older log
             self.assertEqual(char_info.character_name, "CharC")
+            self.assertEqual(char_info.latest_log_path, entry1.path)
             
             # Verify active because window found for "CharC"
             self.assertTrue(char_info.is_active)
@@ -138,25 +138,6 @@ class TestLocalChatDetector(unittest.TestCase):
 
         self.assertTrue(result["1"].is_active)
         self.assertFalse(result["2"].is_active)
-
-    @patch('src.services.local_detector.os.scandir')
-    def test_get_latest_log_for_character(self, mock_scandir):
-        entry1 = MagicMock()
-        entry1.is_file.return_value = True
-        entry1.name = "Local_20250101_100000_123.txt"
-        entry1.path = "/logs/old.txt"
-        entry1.stat.return_value.st_mtime = 1000
-
-        entry2 = MagicMock()
-        entry2.is_file.return_value = True
-        entry2.name = "Local_20250101_110000_123.txt"
-        entry2.path = "/logs/new.txt"
-        entry2.stat.return_value.st_mtime = 2000
-
-        mock_scandir.return_value.__enter__.return_value = [entry1, entry2]
-        
-        path = self.detector.get_latest_log_for_character("/logs", "123")
-        self.assertEqual(path, "/logs/new.txt")
 
 if __name__ == '__main__':
     unittest.main()
