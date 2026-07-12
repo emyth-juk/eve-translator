@@ -37,5 +37,23 @@ Development is supported and CI-tested on 64-bit Windows with Python 3.10,
 5. Run the tests: `.venv\Scripts\python -m pytest`.
 6. Run the linter: `.venv\Scripts\python -m ruff check src tests scripts packaging`.
 
+## Maintainer Release Setup
+
+Tagged releases require a protected VirusTotal credential and stop before publication if the scan cannot complete.
+
+1. In the GitHub repository, create an environment named `virustotal-release`.
+2. Add an environment secret named `VIRUSTOTAL_API_KEY`. Never add the key to a repository file, command-line argument, cache, artifact, workflow output, or log.
+3. Restrict that environment to release tags matching `v*`. For stronger protection, require a reviewer before the scan job can receive the secret.
+4. Add a tag ruleset for `v*` that restricts tag creation, updates, and deletion to release maintainers. The workflow also rejects a release tag whose commit is not reachable from `main`.
+5. Confirm that using VirusTotal's public API is compatible with the project's current non-commercial use and that the release executable is ready to be shared publicly.
+
+The release workflow keeps its trust boundaries separate:
+
+- **Build** has read-only repository access and no VirusTotal secret.
+- **Scan** has read-only access and receives `VIRUSTOTAL_API_KEY` only as a process environment variable. It submits only the packaged EXE, verifies its hash against `BUNDLED_COMPONENTS.json`, waits for completed aggregate findings, and writes fixed-format notes.
+- **Publish** has release-write access but no VirusTotal secret. A result with zero malicious and zero suspicious classifications publishes normally; any such classification creates a draft release for review. Missing credentials, API failures, malformed results, hash mismatches, and timeouts prevent release creation.
+
+Standard VirusTotal uploads and reports are shared with its security community and partners. Never adapt this job to upload configuration, logs, user data, API keys, private prereleases, or source bundles. See VirusTotal's [submission model](https://docs.virustotal.com/docs/how-it-works), [public API restrictions](https://docs.virustotal.com/reference/public-vs-premium-api), and [report-link format](https://docs.virustotal.com/docs/most-recent-report).
+
 ## License
 By contributing, you agree that your contributions will be licensed under its MIT License.

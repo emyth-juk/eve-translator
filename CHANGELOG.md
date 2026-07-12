@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [1.4] - 2026-07-12
 
 ### Added
+- Tagged Windows releases now submit the exact packaged executable to VirusTotal and include its SHA-256, completed aggregate findings, and live report link in the GitHub release notes.
 - Combat, Bilingual, and Mirror overlay modes with a compact status header.
 - Explicit FC, Scout, and Starred speaker roles plus deterministic source-text command cards.
 - True Windows click-through interaction lock with a system-tray action and global `Ctrl+Shift+L` shortcut.
@@ -27,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A third Any Chat overlay for one selected Corp, Alliance, intel, or custom channel, with stable per-character selection and relog recovery.
 
 ### Changed
+- Release automation now isolates build, VirusTotal scan, and publication permissions; scan failures stop publication, while malicious or suspicious classifications create a draft release for maintainer review.
+- VirusTotal receives only the public release executable through its standard public submission service; API credentials, logs, configuration, source bundles, and the release ZIP are never submitted.
 - Original chat lines now reach the HUD before provider work and remain visible after translation.
 - Analysis and provider calls run on separate workers so a stalled provider cannot hide later originals.
 - SDE conversion is delegated to `noirsoldats/eve-sde-converter`; this repository contains only a validated SQLite-to-runtime-index extractor.
@@ -80,6 +83,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Shutdown now cancels waits for in-flight provider calls and suppresses late results instead of waiting for the full provider deadline.
 
 ### Known limitations
+- VirusTotal findings are a point-in-time aggregation of independent engines, not a safety guarantee; the linked live report can change after publication.
 - Any Chat follows one selected logged source and cannot detect which EVE chat tab is currently visible.
 - Windows may reject a global shortcut already owned by another application; the equivalent system-tray action remains available.
 - Windows release executables are currently unsigned, so Microsoft Defender SmartScreen may show an unrecognized-app warning.

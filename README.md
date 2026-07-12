@@ -40,6 +40,7 @@ Real-time overlay translator for EVE Online Fleet, Local, and other logged chat 
 1. Download: grab the latest `EVETranslator_vX.Y_windows_x64.zip` from the GitHub [Releases Page](https://github.com/emyth-juk/eve-translator/releases).
 2. Extract the ZIP, then run `EVETranslator_vX.Y.exe` from the extracted folder. Keep the accompanying notices and license files with it.
    The current Windows builds are unsigned, so Microsoft Defender SmartScreen may show an unrecognized-app warning.
+   Tagged release notes include the executable's SHA-256 and an automated VirusTotal report. Treat the findings as a point-in-time multi-engine summary, not a guarantee of safety, and use `SHA256SUMS.txt` in the ZIP to verify the downloaded executable.
 3. Choose translation: open **Settings → Provider**, select Google or DeepL, and review the cloud-use notice.
 4. For DeepL, enter your API key and use **Test Provider** before saving.
 5. Point to your chat logs if needed: Settings → Log Directory (default is usually auto-detected).
