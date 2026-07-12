@@ -3,9 +3,12 @@ import yaml
 import os
 import logging
 import unicodedata
+from collections.abc import Iterable
 from functools import lru_cache
 from langdetect import DetectorFactory, detect, LangDetectException
-from typing import Optional, List, Dict
+
+from src.core.combat import classify_commands
+from src.core.languages import normalize_language_code
 try:
     from src.utils.paths import get_resource_path
 except ImportError:
@@ -27,16 +30,6 @@ SHORT_ASCII_ALNUM_LIMIT = 3
 # frequently short, so the same text must not change decisions between runs.
 DetectorFactory.seed = 0
 
-LANGUAGE_ALIASES = {
-    # Legacy ISO codes occasionally returned by libraries or stored in config.
-    'iw': 'he',
-    'in': 'id',
-    'ji': 'yi',
-    # langdetect reports Norwegian as "no", while providers/config may use NB/NN.
-    'nb': 'no',
-    'nn': 'no',
-}
-
 EVE_MARKET_PREFIX_PATTERN = re.compile(
     r'^(?:hypernet|wts|wtb|wtt|zkillboard)\b',
     re.IGNORECASE,
@@ -46,17 +39,6 @@ EVE_ITEM_SUFFIX_PATTERN = re.compile(
     r'(?:\s+x?\s*\d+\w*)?$',
     re.IGNORECASE,
 )
-ENGLISH_FLEET_COMMAND_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE)
-    for pattern in (
-        r'align(?:\s+to\s+[a-z0-9][a-z0-9 .\'/-]*)?[!.]*',
-        r'jump(?:\s+jump)*[!.]*',
-        r'(?:do\s+not|don\'t)\s+jump[!.]*',
-        r'hold(?:\s+(?:cloak|gate|position))?[!.]*',
-        r'primary\s+(?:is\s+)?[a-z0-9][a-z0-9 .\'/-]*[!.]*',
-    )
-)
-
 class LanguageDetector:
     """
     Detects the language of a message.
@@ -144,17 +126,7 @@ class LanguageDetector:
     @staticmethod
     def normalize_language_code(language: str | None) -> str:
         """Normalize locale/provider variants to a comparable language code."""
-        if not language:
-            return 'unknown'
-
-        normalized = str(language).strip().lower().replace('_', '-')
-        if not normalized:
-            return 'unknown'
-        if normalized in {'auto', 'unknown'}:
-            return normalized
-
-        base_language = normalized.split('-', 1)[0]
-        return LANGUAGE_ALIASES.get(base_language, base_language)
+        return normalize_language_code(language)
 
     def _detect_script_language(self, text: str) -> str | None:
         """Return a language when East Asian script makes the decision reliable."""
@@ -206,12 +178,86 @@ class LanguageDetector:
         return is_title_cased and bool(EVE_ITEM_SUFFIX_PATTERN.search(text))
 
     @staticmethod
-    def _is_english_fleet_command(text: str) -> bool:
-        """Recognize a small set of unambiguous English FC commands."""
-        if not text.isascii():
-            return False
-        normalized = ' '.join(text.split())
-        return any(pattern.fullmatch(normalized) for pattern in ENGLISH_FLEET_COMMAND_PATTERNS)
+    def _commands_cover_text(text: str, command_matches: Iterable[object]) -> bool:
+        """Return whether command matches account for every alphanumeric token."""
+
+        remaining = unicodedata.normalize("NFKC", text or "")
+        remaining = " ".join(remaining.split())
+        for match in command_matches:
+            clause = getattr(match, "source_clause", "")
+            if not isinstance(clause, str) or not clause.strip():
+                return False
+            start = remaining.casefold().find(clause.casefold())
+            if start < 0:
+                return False
+            end = start + len(clause)
+            remaining = remaining[:start] + (" " * (end - start)) + remaining[end:]
+        return not any(character.isalnum() for character in remaining)
+
+    def command_language_hint(
+        self,
+        text: str,
+        command_matches: Iterable[object] | None = None,
+        source_language: str | None = None,
+    ) -> str | None:
+        """Return a reliable source hint for a fully classified command line.
+
+        ``combat.classify_commands`` is the single built-in command grammar.
+        Callers that add doctrine-only phrases can also supply an explicit
+        ``source_language``; without that metadata, statistical detection is
+        retained for ASCII doctrine phrases instead of guessing English.
+        """
+
+        matches = tuple(
+            classify_commands(text) if command_matches is None else command_matches
+        )
+        if not matches or not self._commands_cover_text(text, matches):
+            return None
+
+        explicit_hint = normalize_language_code(source_language, "")
+        if explicit_hint and explicit_hint not in {"auto", "unknown"}:
+            return explicit_hint
+
+        script_language = self._detect_script_language(text)
+        if script_language:
+            return script_language
+
+        # ASCII commands are English only when every upstream match is also
+        # produced by the built-in combat grammar. Doctrine-only phrases need
+        # an explicit source-language hint to avoid a new false assumption.
+        if text.isascii():
+            builtins = classify_commands(text)
+            builtin_keys = {
+                (match.code, match.source_clause.casefold()) for match in builtins
+            }
+            match_keys = {
+                (
+                    str(getattr(match, "code", "")),
+                    str(getattr(match, "source_clause", "")).casefold(),
+                )
+                for match in matches
+            }
+            if match_keys and match_keys.issubset(builtin_keys):
+                # ALIGN/WARP deliberately accept arbitrary destinations. A
+                # multi-word lowercase tail without an English connector can
+                # therefore be foreign prose ("align con la puerta"), not an
+                # English source-language guarantee.
+                for match in matches:
+                    code = str(getattr(match, "code", "")).upper()
+                    argument = str(getattr(match, "argument", "")).strip()
+                    clause = str(getattr(match, "source_clause", ""))
+                    if code not in {"ALIGN", "WARP"} or " " not in argument:
+                        continue
+                    prefix = clause[: clause.casefold().rfind(argument.casefold())]
+                    if prefix.strip().casefold() not in {
+                        "align to",
+                        "align on",
+                        "warp to",
+                        "warp on",
+                    }:
+                        return None
+                return "en"
+        return None
 
     def detect_language(self, text: str) -> str:
         return self._detect_language_cached(text)
@@ -246,7 +292,15 @@ class LanguageDetector:
 
         return self.normalize_language_code(detected)
             
-    def should_translate(self, text: str, target_lang: str = 'en', ignored_langs=None) -> (bool, str):
+    def should_translate(
+        self,
+        text: str,
+        target_lang: str = 'en',
+        ignored_langs=None,
+        *,
+        command_matches: Iterable[object] | None = None,
+        command_source_language: str | None = None,
+    ) -> tuple[bool, str]:
         if ignored_langs is None:
             ignored_langs = {'en'} # Default ignore English only
         elif isinstance(ignored_langs, str):
@@ -259,9 +313,25 @@ class LanguageDetector:
             if language
         }
         ignored_tuple = tuple(sorted(normalized_ignored))
-        return self._should_translate_cached(text, normalized_target, ignored_tuple)
+        command_hint = self.command_language_hint(
+            text,
+            command_matches,
+            command_source_language,
+        )
+        return self._should_translate_cached(
+            text,
+            normalized_target,
+            ignored_tuple,
+            command_hint or "",
+        )
 
-    def _should_translate_uncached(self, text: str, target_lang: str, ignored_tuple: tuple) -> (bool, str):
+    def _should_translate_uncached(
+        self,
+        text: str,
+        target_lang: str,
+        ignored_tuple: tuple,
+        command_hint: str,
+    ) -> tuple[bool, str]:
         """
         Decides if text should be translated.
         Returns: (should_translate: bool, detected_lang: str)
@@ -290,11 +360,11 @@ class LanguageDetector:
             if detected_lang != 'unknown':
                 return True, detected_lang
 
-        # These short FC calls are routinely misidentified by langdetect
-        # (for example, "jump" as Latvian). They are confidently English, but
-        # still need translation when the pilot's target language is not English.
-        if self._is_english_fleet_command(s_text):
-            return target_lang != 'en', 'en'
+        # Command classification is derived from combat.py's complete grammar,
+        # not a second detector-specific list. Known commands still translate
+        # when the target is different even if their source is generally ignored.
+        if command_hint:
+            return target_lang != command_hint, command_hint
 
         # 2. Ignore only a complete phrase match. The previous substring search
         # caused words such as "shield" or "armor" to suppress an entire mixed

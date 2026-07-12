@@ -55,6 +55,7 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 - Colors and UI: set default/translated/highlight colors in Settings; changes are live.  
 - Translation Intelligence: manage SDE name protection, burst optimization, context consent, exact local corrections, and one active doctrine pack.
 - Glossaries are selected from the detected source and target language pair. User overrides go in `%USERPROFILE%\.eve_translator\glossaries\`.
+- Ignored-language entries are matched by base language: `zh` ignores Chinese, `ja` ignores Japanese, and `ko` ignores Korean independently; regional forms such as `pt-BR` match `pt`.
 - Corrections are exact, language-pair scoped, and stored locally in `%USERPROFILE%\.eve_translator\translation_memory.sqlite3`.
 - Doctrine packs are data-only ZIPs validated before installation under `%USERPROFILE%\.eve_translator\doctrines\`; they cannot grant FC/scout trust. See `data/doctrines/README.md` for the pack schema.
 - Logs: app logs live in `%USERPROFILE%\.eve_translator\logs\`.

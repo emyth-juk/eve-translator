@@ -127,6 +127,48 @@ ENGLISH_FLEET_COMMANDS = (
 )
 
 
+@pytest.mark.parametrize("message", ["regroup", "star burst", "bubble up"])
+def test_all_builtin_ascii_commands_use_combat_classifier_hint(message):
+    with patch("src.core.detector.detect") as mock_detect:
+        detector = LanguageDetector()
+
+        assert detector.should_translate(
+            message,
+            target_lang="en",
+            ignored_langs={"en"},
+        ) == (False, "en")
+        mock_detect.assert_not_called()
+
+
+def test_upstream_doctrine_command_can_supply_an_explicit_source_hint():
+    class Match:
+        code = "CUSTOM"
+        source_clause = "rojo ahora"
+
+    with patch("src.core.detector.detect") as mock_detect:
+        detector = LanguageDetector()
+
+        assert detector.should_translate(
+            "rojo ahora",
+            target_lang="en",
+            ignored_langs={"en"},
+            command_matches=(Match(),),
+            command_source_language="es-MX",
+        ) == (True, "es")
+        mock_detect.assert_not_called()
+
+
+def test_partial_command_classification_does_not_override_mixed_line_detection():
+    with patch("src.core.detector.detect", return_value="fr"):
+        detector = LanguageDetector()
+
+        assert detector.should_translate(
+            "jump; bonjour tout le monde",
+            target_lang="en",
+            ignored_langs={"en"},
+        ) == (True, "fr")
+
+
 @pytest.mark.parametrize("message", ENGLISH_FLEET_COMMANDS)
 def test_english_fleet_commands_do_not_make_remote_calls_for_english_target(message):
     detector = LanguageDetector()

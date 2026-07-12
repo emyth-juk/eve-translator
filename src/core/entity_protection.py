@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from src.core.languages import normalize_language_code
 from src.utils.paths import get_resource_path
 
 logger = logging.getLogger(__name__)
@@ -186,10 +187,7 @@ class ProtectedEntityIndex:
 
     @staticmethod
     def _normalize_locale(language: str | None) -> str:
-        if not isinstance(language, str):
-            return ""
-        normalized = language.strip().lower().replace("_", "-")
-        return normalized.split("-", 1)[0]
+        return normalize_language_code(language, "")
 
     @staticmethod
     def _strict_case(name: str) -> bool:

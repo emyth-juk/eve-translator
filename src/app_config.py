@@ -6,8 +6,11 @@ import os
 from pathlib import Path
 from typing import Any, Mapping
 
+from src.core.languages import normalize_locale
+
 logger = logging.getLogger(__name__)
 
+CONFIG_SCHEMA_VERSION = 1
 CONFIG_DIR_NAME = ".eve_translator"
 CONFIG_FILE_NAME = "translator_config.json"
 LEGACY_OVERLAY_CONFIG_FILE_NAME = "overlay_config.json"
@@ -102,8 +105,94 @@ def _config_text(value, default=''):
     return value if isinstance(value, str) else default
 
 
+def _document_schema_version(config: Mapping[str, Any]) -> int:
+    version = config.get('schema_version', 0)
+    if type(version) is not int or version < 0:
+        return 0
+    return version
+
+
+def _migrate_provider_fields(
+    shared: dict,
+    *,
+    legacy_schema: bool,
+) -> tuple[str | None, bool | None]:
+    """Materialize legacy provider state once and return its provenance.
+
+    An empty legacy DeepL key represented implicit Google in pre-1.4 builds.
+    It deliberately does *not* materialize a provider field: doing so would let
+    an incidental empty key in a later candidate erase an earlier explicit
+    choice. A standalone no-key legacy config still inherits the safe Disabled
+    default and remains unconfirmed.
+    """
+
+    if TRANSLATION_PROVIDER_KEY in shared:
+        configured = shared.get(TRANSLATION_PROVIDER_KEY)
+        valid = (
+            isinstance(configured, str)
+            and configured.strip().lower() in TRANSLATION_PROVIDER_MODES
+        )
+        if valid:
+            shared[TRANSLATION_PROVIDER_KEY] = configured.strip().lower()
+            confirmation = (
+                _config_bool(shared.get('provider_choice_confirmed'), False)
+                if 'provider_choice_confirmed' in shared
+                else True
+            )
+            return 'explicit', confirmation
+        shared[TRANSLATION_PROVIDER_KEY] = TRANSLATION_PROVIDER_DISABLED
+        shared['provider_choice_confirmed'] = False
+        return 'invalid', False
+
+    if not legacy_schema or 'deepl_api_key' not in shared:
+        return None, None
+
+    api_key = shared.get('deepl_api_key')
+    if isinstance(api_key, str) and api_key.strip():
+        shared[TRANSLATION_PROVIDER_KEY] = TRANSLATION_PROVIDER_DEEPL
+        confirmation = (
+            _config_bool(shared.get('provider_choice_confirmed'), False)
+            if 'provider_choice_confirmed' in shared
+            else True
+        )
+        return 'legacy_deepl', confirmation
+
+    # Pre-1.4 selected Google implicitly for this shape. It now fails closed,
+    # but must not override a provider explicitly chosen in another source.
+    return 'legacy_google', False
+
+
+def _migrate_config_document(
+    loaded: Mapping[str, Any],
+) -> tuple[dict, str | None, bool | None, bool]:
+    """Upgrade one structured config document to the current schema in memory."""
+
+    version = _document_schema_version(loaded)
+    if version > CONFIG_SCHEMA_VERSION:
+        logger.error(
+            "Ignoring config with unsupported schema version %s (maximum %s)",
+            version,
+            CONFIG_SCHEMA_VERSION,
+        )
+        return {}, None, None, False
+
+    migrated = copy.deepcopy(dict(loaded))
+    shared = migrated.get('shared')
+    if not isinstance(shared, dict):
+        shared = {}
+        migrated['shared'] = shared
+    origin, confirmation = _migrate_provider_fields(
+        shared,
+        legacy_schema=version < CONFIG_SCHEMA_VERSION,
+    )
+    changed = version < CONFIG_SCHEMA_VERSION
+    migrated['schema_version'] = CONFIG_SCHEMA_VERSION
+    return migrated, origin, confirmation, changed
+
+
 def normalize_config(config: dict) -> dict:
     """Normalize user-editable values to safe runtime types and UI ranges."""
+    config['schema_version'] = CONFIG_SCHEMA_VERSION
     shared = config.setdefault('shared', {})
     if not isinstance(shared, dict):
         shared = {}
@@ -121,13 +210,14 @@ def normalize_config(config: dict) -> dict:
     if not isinstance(ignored, (list, tuple, set)):
         ignored = ['en']
     shared['ignored_languages'] = [
-        language.strip().lower().replace('_', '-')
+        normalize_locale(language)
         for language in ignored
         if isinstance(language, str) and language.strip()
     ]
 
-    target_language = _config_text(shared.get('target_language'), 'en').strip()
-    shared['target_language'] = target_language.lower().replace('_', '-') or 'en'
+    shared['target_language'] = normalize_locale(
+        shared.get('target_language'), 'en'
+    )
     normalize_translation_provider_config(shared)
     shared['provider_choice_confirmed'] = _config_bool(
         shared.get('provider_choice_confirmed'), False
@@ -268,6 +358,7 @@ def get_default_config(legacy_overlay: Mapping[str, Any] | None = None) -> dict:
     legacy_overlay = legacy_overlay or {}
     legacy_provider = resolve_translation_provider(legacy_overlay)
     config = {
+        'schema_version': CONFIG_SCHEMA_VERSION,
         'shared': {
             'opacity': legacy_overlay.get('opacity', 0.8),
             'font_size': legacy_overlay.get('font_size', 10),
@@ -378,59 +469,49 @@ class ConfigStore:
         return Path.home() / CONFIG_DIR_NAME / CONFIG_FILE_NAME
 
     def load(self) -> dict:
-        legacy_overlay = self._read_json(self.legacy_dir / LEGACY_OVERLAY_CONFIG_FILE_NAME)
-        config = get_default_config(legacy_overlay)
-        if 'provider_choice_confirmed' in legacy_overlay:
-            provider_choice_confirmed = _config_bool(
-                legacy_overlay.get('provider_choice_confirmed'), False
-            )
-        else:
-            provider_choice_confirmed = None
-        if TRANSLATION_PROVIDER_KEY in legacy_overlay:
-            legacy_provider = legacy_overlay.get(TRANSLATION_PROVIDER_KEY)
-            provider_origin = (
-                'explicit'
-                if isinstance(legacy_provider, str)
-                and legacy_provider.strip().lower() in TRANSLATION_PROVIDER_MODES
-                else 'invalid'
-            )
-        elif 'deepl_api_key' in legacy_overlay:
-            legacy_key = legacy_overlay.get('deepl_api_key')
-            provider_origin = (
-                'legacy_deepl'
-                if isinstance(legacy_key, str) and legacy_key.strip()
-                else 'legacy_google'
-            )
-        else:
-            provider_origin = 'default'
+        legacy_overlay = self._read_json(
+            self.legacy_dir / LEGACY_OVERLAY_CONFIG_FILE_NAME
+        )
+        migrated_overlay = copy.deepcopy(legacy_overlay)
+        overlay_origin, overlay_confirmation = _migrate_provider_fields(
+            migrated_overlay,
+            legacy_schema=True,
+        )
+        config = get_default_config(migrated_overlay)
+        provider_origin = overlay_origin or 'default'
+        provider_choice_confirmed = overlay_confirmation
+        migrated_any = bool(legacy_overlay)
+        primary_is_current = False
 
         for candidate in self._load_candidates():
             loaded = self._read_json(candidate)
-            if loaded:
-                shared = loaded.get('shared')
-                if isinstance(shared, dict):
-                    if 'provider_choice_confirmed' in shared:
-                        provider_choice_confirmed = _config_bool(
-                            shared.get('provider_choice_confirmed'), False
-                        )
-                    configured_provider = shared.get(TRANSLATION_PROVIDER_KEY)
-                    if configured_provider is not None:
-                        if (
-                            isinstance(configured_provider, str)
-                            and configured_provider.strip().lower()
-                            in TRANSLATION_PROVIDER_MODES
-                        ):
-                            provider_origin = 'explicit'
-                        else:
-                            provider_origin = 'invalid'
-                    elif 'deepl_api_key' in shared:
-                        api_key = shared.get('deepl_api_key')
-                        provider_origin = (
-                            'legacy_deepl'
-                            if isinstance(api_key, str) and api_key.strip()
-                            else 'legacy_google'
-                        )
-                self._merge_config(config, loaded)
+            if not loaded:
+                continue
+            if (
+                candidate.resolve(strict=False) == self.path.resolve(strict=False)
+                and _document_schema_version(loaded) == CONFIG_SCHEMA_VERSION
+            ):
+                primary_is_current = True
+
+            migrated, origin, confirmation, changed = _migrate_config_document(loaded)
+            if not migrated:
+                continue
+            # Candidate order is precedence order, except an empty legacy key
+            # cannot erase an explicit choice from an earlier source.
+            accept_state = origin is not None and not (
+                origin == 'legacy_google'
+                and provider_origin in {'explicit', 'legacy_deepl', 'invalid'}
+            )
+            if origin == 'legacy_google' and not accept_state:
+                migrated_shared = migrated.get('shared', {})
+                migrated_shared.pop('deepl_api_key', None)
+                migrated_shared.pop('provider_choice_confirmed', None)
+
+            self._merge_config(config, migrated)
+            migrated_any = migrated_any or changed
+            if accept_state:
+                provider_origin = origin
+                provider_choice_confirmed = confirmation
 
         normalize_config(config)
         if provider_origin == 'invalid':
@@ -441,6 +522,12 @@ class ConfigStore:
 
         self.migrated_from_implicit_google = provider_origin == 'legacy_google'
         self.provider_selection_required = not provider_choice_confirmed
+
+        # Persist the consolidated schema once. If a current primary already
+        # exists, legacy source files are only lower-precedence fallbacks and do
+        # not trigger a redundant rewrite on every launch.
+        if migrated_any and not primary_is_current and not self.save(config):
+            logger.warning("Could not persist migrated config schema to %s", self.path)
 
         return config
 
@@ -499,18 +586,6 @@ class ConfigStore:
         shared = loaded.get('shared')
         if isinstance(shared, dict):
             config['shared'].update(shared)
-            # Migrate legacy provider selection only when this candidate carries
-            # provider-related state. This preserves normal candidate precedence.
-            if TRANSLATION_PROVIDER_KEY in shared or 'deepl_api_key' in shared:
-                if TRANSLATION_PROVIDER_KEY in shared:
-                    config['shared'][TRANSLATION_PROVIDER_KEY] = resolve_translation_provider(shared)
-                else:
-                    legacy_provider_source = {
-                        'deepl_api_key': shared.get('deepl_api_key', ''),
-                    }
-                    config['shared'][TRANSLATION_PROVIDER_KEY] = resolve_translation_provider(
-                        legacy_provider_source
-                    )
 
         sessions = loaded.get('sessions')
         if isinstance(sessions, dict):

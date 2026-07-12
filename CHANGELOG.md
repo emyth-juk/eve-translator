@@ -28,6 +28,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Bundled YAML now owns only aliases, abbreviations, commands, doctrine vocabulary, and slang; exact vanilla SDE mappings are generated instead.
 - Cloud translation is disabled by default and is never enabled without an explicit provider choice.
 - Existing configurations with a saved DeepL key continue using DeepL; no-key configurations migrate to Disabled instead of silently using Google.
+- Ignored languages now apply to the exact detected base language: ignoring `zh` suppresses Chinese only, while Japanese and Korean remain independent choices.
 - Settings can now be opened directly from the system tray.
 - First-run provider guidance remains active until the player saves an explicit choice.
 - Provider calls and connection tests have responsiveness deadlines, and Settings validates DeepL keys and target-language codes before saving.
@@ -40,6 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Common English fleet commands such as `align`, `jump`, `do not jump`, `hold cloak`, and `primary` are detected consistently.
 - Mixed-language messages are no longer suppressed by embedded EVE terms such as `shield` or `armor`.
 - Failed provider calls are no longer rendered as successful translations.
+- Versioned config migration preserves an explicit provider choice when older fallback files contain an empty DeepL key.
 - Saving a provider change now defers unstarted chat lines until the new choice is active, preventing an old provider from receiving the rest of a queued batch.
 - Active overlays return to Waiting when their tracked log goes inactive and recover to Active when it resumes.
 - Malformed numeric and text settings are normalized at the config boundary instead of breaking startup or Settings.

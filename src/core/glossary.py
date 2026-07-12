@@ -3,6 +3,9 @@ import yaml
 import logging
 from pathlib import Path
 from typing import Dict
+
+from src.core.languages import normalize_locale
+from src.core.lexicon import LexiconTerm, LongestLexiconMatcher
 try:
     from src.utils.paths import get_resource_path
 except ImportError:
@@ -31,13 +34,14 @@ class EVEGlossary:
         
         # Sort terms by length (descending) to ensure longest matches are replaced first.
         self.sorted_terms = sorted(self.terms.items(), key=lambda x: len(x[0]), reverse=True)
+        self._matcher = LongestLexiconMatcher(
+            LexiconTerm(source=source, target=target)
+            for source, target in self.terms.items()
+        )
         
     @staticmethod
     def _normalize_language(value, default: str) -> str:
-        if not isinstance(value, str):
-            return default
-        normalized = value.strip().lower().replace('_', '-')
-        return normalized or default
+        return normalize_locale(value, default)
 
     def _pair_filenames(self) -> list[str]:
         """Return base-to-exact locale pairs in override order."""
@@ -133,39 +137,9 @@ class EVEGlossary:
         return flattened
 
     def replace_terms(self, text: str) -> str:
-        """
-        Replaces known terms in the text with their English equivalents.
-        """
-        if not text:
-            return text
-            
-        processed = text
-        # Use simple iteration but with regex for safety on alphanumeric terms
-        import re
+        """Replace terms through the same longest-span engine as translation."""
 
-        for term, replacement in self.sorted_terms:
-            if not term.strip():
-                continue
-            
-            # Use regex for alphanumeric terms (prevents '00' matching inside '1600')
-            # Check if term is basically "word characters"
-            if re.match(r'^[a-zA-Z0-9]+$', term):
-                # \b matches word boundary. 
-                # Note: We replaced `term` with `replacement` surrounded by spaces.
-                # However, if we blindly replace, we might re-replace things we just replaced?
-                # sorted_terms is by length descending, so 1600 replaced before 00.
-                # But '00' finds parts of '1600mm'.
-                # Boundary check solves this: \b00\b won't match inside 1600mm.
-                pattern = r'\b' + re.escape(term) + r'\b'
-                # Check if it matches before compiling replacement? regex sub handles it.
-                processed = re.sub(pattern, f" {replacement} ", processed)
-            else:
-                # Fallback to literal replacement for CJK or symbols (like +1) where \b isn't applicable
-                if term in processed:
-                    processed = processed.replace(term, f" {replacement} ")
-                
-        # Clean up double spaces introduced
-        return " ".join(processed.split())
+        return self._matcher.replace(text)
 
     def _get_hardcoded_fallback(self) -> Dict[str, str]:
         """Original hardcoded dictionary for safety."""

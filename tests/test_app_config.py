@@ -4,7 +4,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from src.app_config import ConfigStore, get_default_config, sanitize_config_for_log
+from src.app_config import (
+    CONFIG_SCHEMA_VERSION,
+    ConfigStore,
+    get_default_config,
+    sanitize_config_for_log,
+)
 
 
 class TestConfigStore(unittest.TestCase):
@@ -35,6 +40,7 @@ class TestConfigStore(unittest.TestCase):
     def test_new_config_disables_cloud_translation(self):
         config = get_default_config()
 
+        self.assertEqual(config['schema_version'], CONFIG_SCHEMA_VERSION)
         self.assertEqual(config['shared']['translation_provider'], 'disabled')
         self.assertFalse(config['shared']['provider_choice_confirmed'])
         self.assertEqual(config['shared']['deepl_api_key'], '')
@@ -87,6 +93,52 @@ class TestConfigStore(unittest.TestCase):
         self.assertEqual(config['shared']['translation_provider'], 'google')
         self.assertEqual(config['shared']['deepl_api_key'], 'preserved-secret')
         self.assertFalse(self.store.provider_selection_required)
+
+    def test_empty_legacy_key_cannot_erase_explicit_overlay_provider(self):
+        with open(self.root / "overlay_config.json", 'w', encoding='utf-8') as config_file:
+            json.dump({'translation_provider': 'google'}, config_file)
+        with open(self.root / "translator_config.json", 'w', encoding='utf-8') as config_file:
+            json.dump({'shared': {'deepl_api_key': ''}}, config_file)
+
+        config = self.store.load()
+
+        self.assertEqual(config['shared']['translation_provider'], 'google')
+        self.assertTrue(config['shared']['provider_choice_confirmed'])
+        self.assertFalse(self.store.provider_selection_required)
+        with open(self.primary, 'r', encoding='utf-8') as config_file:
+            persisted = json.load(config_file)
+        self.assertEqual(persisted['schema_version'], CONFIG_SCHEMA_VERSION)
+        self.assertEqual(persisted['shared']['translation_provider'], 'google')
+
+    def test_empty_legacy_key_cannot_erase_explicit_deepl_credentials(self):
+        with open(self.root / "overlay_config.json", 'w', encoding='utf-8') as config_file:
+            json.dump({
+                'translation_provider': 'deepl',
+                'deepl_api_key': 'explicit-secret',
+            }, config_file)
+        with open(self.root / "translator_config.json", 'w', encoding='utf-8') as config_file:
+            json.dump({'shared': {'deepl_api_key': ''}}, config_file)
+
+        config = self.store.load()
+
+        self.assertEqual(config['shared']['translation_provider'], 'deepl')
+        self.assertEqual(config['shared']['deepl_api_key'], 'explicit-secret')
+        self.assertTrue(config['shared']['provider_choice_confirmed'])
+
+    def test_migrated_schema_is_not_rewritten_on_the_next_load(self):
+        with open(self.root / "translator_config.json", 'w', encoding='utf-8') as config_file:
+            json.dump({'shared': {'deepl_api_key': 'legacy-secret'}}, config_file)
+
+        first = self.store.load()
+        self.assertEqual(first['shared']['translation_provider'], 'deepl')
+
+        reloaded = ConfigStore(path=self.primary, legacy_dir=self.root)
+        with patch.object(reloaded, 'save', wraps=reloaded.save) as save:
+            second = reloaded.load()
+
+        self.assertEqual(second['schema_version'], CONFIG_SCHEMA_VERSION)
+        self.assertEqual(second['shared']['translation_provider'], 'deepl')
+        save.assert_not_called()
 
     def test_invalid_explicit_provider_fails_closed(self):
         with open(self.root / "translator_config.json", 'w', encoding='utf-8') as config_file:
@@ -196,6 +248,7 @@ class TestConfigStore(unittest.TestCase):
 
         self.assertEqual(saved['sessions']['fleet']['x'], 100)
         self.assertNotIn('opacity', saved['sessions']['fleet'])
+        self.assertEqual(saved['schema_version'], CONFIG_SCHEMA_VERSION)
 
     def test_failed_atomic_save_keeps_previous_config_and_returns_false(self):
         self.primary.parent.mkdir(parents=True, exist_ok=True)
