@@ -39,13 +39,6 @@ COMMAND_CATEGORY = {
     "BUBBLE_UP": "SUPPORT",
 }
 
-EXECUTION_COMMANDS = frozenset({
-    "JUMP", "ALIGN", "WARP", "ANCHOR", "FREE_BURN", "PRIMARY",
-    "SWITCH_PRIMARY", "LOCK", "CEASE_FIRE", "PROP_ON", "PROP_OFF",
-    "OVERHEAT", "BUBBLE_UP", "BUBBLE_DOWN", "REGROUP", "STAR_BURST",
-})
-
-
 @dataclass(frozen=True)
 class CommandMatch:
     """One complete, grammar-matched fleet command clause."""
@@ -55,6 +48,7 @@ class CommandMatch:
     argument: str = ""
     source_clause: str = ""
     display_label: str = ""
+    source_language: str = ""
 
 
 def normalize_speaker_name(name: str) -> str:
@@ -93,19 +87,15 @@ def command_is_trusted(
     command_code: str,
     command_category: str = "",
 ) -> bool:
-    """FC calls are trusted; scouts may only create non-execution intel cards."""
+    """Only a locally assigned FC role can verify any command card.
 
+    Imported doctrine data controls display classification only. Neither a
+    Scout/Starred role nor a custom ``INTEL`` category can grant authority.
+    """
+
+    del command_code, command_category
     normalized_role = (role or "").strip().lower()
-    if normalized_role == ROLE_FC:
-        return True
-    if normalized_role == ROLE_SCOUT:
-        code = (command_code or "").strip().upper()
-        if code in COMMAND_CATEGORY:
-            return code not in EXECUTION_COMMANDS
-        # A custom code has no built-in safety classification. Only the
-        # doctrine schema's constrained INTEL category is non-execution.
-        return (command_category or "").strip().upper() == "INTEL"
-    return False
+    return normalized_role == ROLE_FC
 
 
 _ARGUMENT = r"(?P<argument>[\w][\w .'+/\-]{0,80}?)"
@@ -218,11 +208,20 @@ def classify_commands(
                 display_label = (
                     label_for(code) if callable(label_for) else str(code)
                 )
+                language_for = getattr(
+                    doctrine_pack,
+                    'command_source_language',
+                    None,
+                )
+                source_language = (
+                    language_for(code) if callable(language_for) else ""
+                )
                 matches.append(CommandMatch(
                     code=code,
                     category=category,
                     source_clause=clause,
                     display_label=display_label,
+                    source_language=source_language,
                 ))
         if len(matches) >= max_commands:
             break

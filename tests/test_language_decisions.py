@@ -158,6 +158,24 @@ def test_upstream_doctrine_command_can_supply_an_explicit_source_hint():
         mock_detect.assert_not_called()
 
 
+def test_doctrine_match_metadata_routes_a_short_command_without_detection():
+    class Match:
+        code = "CEASE_FIRE"
+        source_clause = "red cycle"
+        source_language = "en-US"
+
+    with patch("src.core.detector.detect") as mock_detect:
+        detector = LanguageDetector()
+
+        assert detector.should_translate(
+            "red cycle",
+            target_lang="de",
+            ignored_langs={"en"},
+            command_matches=(Match(),),
+        ) == (True, "en")
+        mock_detect.assert_not_called()
+
+
 def test_partial_command_classification_does_not_override_mixed_line_detection():
     with patch("src.core.detector.detect", return_value="fr"):
         detector = LanguageDetector()

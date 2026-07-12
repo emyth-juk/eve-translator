@@ -27,14 +27,23 @@ def make_overlay(**config):
     return overlay
 
 
-def message(identifier, text, *, relevant=False, role='', commands=(), state=None):
+def message(
+    identifier,
+    text,
+    *,
+    relevant=False,
+    role='',
+    commands=(),
+    state=None,
+    sender='Pilot',
+):
     return ProcessedMessage(
         message_id=identifier,
         session_id='fleet',
         source_id='source',
         text=text,
         original_text='原文' if state == TranslationState.TRANSLATED else '',
-        sender='Pilot',
+        sender=sender,
         timestamp='12:00:00',
         state=state or TranslationState.ORIGINAL,
         translation_relevant=relevant,
@@ -44,11 +53,13 @@ def message(identifier, text, *, relevant=False, role='', commands=(), state=Non
 
 
 def test_mode_filtering_keeps_full_history_and_never_reprocesses():
-    overlay = make_overlay()
+    overlay = make_overlay(speaker_roles={'fleet boss': 'fc'})
     try:
         overlay.upsert_processed_message(message('ordinary', 'ordinary'))
         overlay.upsert_processed_message(message('translated', 'translated', relevant=True))
-        overlay.upsert_processed_message(message('fc', 'fc chatter', role='fc'))
+        overlay.upsert_processed_message(
+            message('fc', 'fc chatter', role='fc', sender='Fleet Boss')
+        )
 
         overlay.set_display_mode('bilingual', save=False)
         plain = overlay.text_browser.toPlainText()
@@ -113,8 +124,30 @@ def test_custom_command_card_uses_safe_label_and_scout_trust_category():
         )
 
         assert 'Check directional scan' in intel_rendered
-        assert 'SCOUT VERIFIED' in intel_rendered
+        assert 'UNVERIFIED' in intel_rendered
         assert 'UNVERIFIED' in move_rendered
+    finally:
+        overlay.close()
+
+
+def test_removing_role_revokes_existing_command_card_verification():
+    command = CommandMatch('JUMP', 'MOVE', source_clause='jump')
+    overlay = make_overlay(
+        display_mode='combat',
+        speaker_roles={'pilot': 'fc'},
+    )
+    try:
+        stored = overlay_message_dict(
+            overlay,
+            message('revoked', 'jump', role='fc', commands=(command,)),
+        )
+        assert 'FC VERIFIED' in overlay._format_message_html(stored)
+
+        overlay.config['speaker_roles'] = {}
+
+        assert overlay._role_for(stored) == ''
+        assert 'UNVERIFIED' in overlay._format_message_html(stored)
+        assert overlay._message_visible(stored) is False
     finally:
         overlay.close()
 

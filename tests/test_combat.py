@@ -48,6 +48,8 @@ def test_speaker_roles_are_explicit_normalized_and_system_is_rejected():
 def test_only_fc_execution_commands_are_trusted():
     assert command_is_trusted("fc", "JUMP") is True
     assert command_is_trusted("scout", "JUMP") is False
+    assert command_is_trusted("scout", "HOLD", "HOLD") is False
+    assert command_is_trusted("scout", "DO_NOT_JUMP", "HOLD") is False
     assert command_is_trusted("starred", "JUMP") is False
 
 
@@ -56,9 +58,15 @@ def test_doctrine_can_add_only_an_exact_existing_command_code():
         def command_for_phrase(self, phrase):
             return "CEASE_FIRE" if phrase.casefold() == "red cycle" else None
 
-    assert [item.code for item in classify_commands(
-        "red cycle", doctrine_pack=Pack()
-    )] == ["CEASE_FIRE"]
+        @staticmethod
+        def command_source_language(code):
+            return "en" if code == "CEASE_FIRE" else ""
+
+    matches = classify_commands("red cycle", doctrine_pack=Pack())
+
+    assert [(item.code, item.source_language) for item in matches] == [
+        ("CEASE_FIRE", "en"),
+    ]
     assert classify_commands("red cycles", doctrine_pack=Pack()) == ()
 
 
@@ -80,5 +88,5 @@ def test_doctrine_custom_command_uses_validated_category_and_label():
     assert (match.code, match.category, match.display_label) == (
         "CHECK_DSCAN", "INTEL", "Check directional scan"
     )
-    assert command_is_trusted("scout", match.code, match.category) is True
+    assert command_is_trusted("scout", match.code, match.category) is False
     assert command_is_trusted("scout", "CUSTOM_MOVE", "MOVE") is False

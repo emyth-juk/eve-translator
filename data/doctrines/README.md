@@ -56,6 +56,19 @@ commands:
     - red cycle
 ```
 
+Schema v2 can attach a source-language hint to a built-in command phrase set.
+This is useful for short, doctrine-only calls that statistical language
+detection cannot identify reliably. The list form above remains valid in both
+schema versions.
+
+```yaml
+commands:
+  CEASE_FIRE:
+    source_language: en
+    phrases:
+      - red cycle
+```
+
 Supported built-in codes are `HOLD`, `DO_NOT_JUMP`, `JUMP`, `ALIGN`, `WARP`,
 `ANCHOR`, `FREE_BURN`, `PRIMARY`, `SWITCH_PRIMARY`, `LOCK`, `CEASE_FIRE`,
 `PROP_ON`, `PROP_OFF`, `OVERHEAT`, `BUBBLE_UP`, `BUBBLE_DOWN`, `REGROUP`, and
@@ -71,12 +84,15 @@ custom_commands:
   BASTION_UP:
     category: SUPPORT
     label: Bastion up
+    source_language: en
     phrases:
       - green bastion
 ```
 
-The label is display text only. A custom definition cannot add trusted speakers
-or change who is allowed to issue a verified command.
+`source_language` is optional, accepts a normalized language or locale code,
+and influences translation routing only when command matches cover the entire
+message. The label is display text only. A custom definition cannot add trusted
+speakers or change who is allowed to issue a verified command.
 
 ## Exact corrections
 

@@ -788,12 +788,16 @@ class OverlayWindow(QMainWindow):
 
     def _role_for(self, msg_data: dict) -> str:
         roles = self.config.get('speaker_roles', {})
-        configured = (
-            roles.get(normalize_speaker_name(msg_data.get('sender', '')), '')
-            if isinstance(roles, dict)
-            else ''
-        )
-        return str(configured or msg_data.get('speaker_role') or '').lower()
+        if isinstance(roles, dict):
+            # Current local configuration is authoritative. Falling back to
+            # the role captured when the line arrived would make revocation
+            # ineffective for existing cards/history.
+            configured = roles.get(
+                normalize_speaker_name(msg_data.get('sender', '')),
+                '',
+            )
+            return str(configured or '').lower()
+        return str(msg_data.get('speaker_role') or '').lower()
 
     @staticmethod
     def _command_code(command) -> str:

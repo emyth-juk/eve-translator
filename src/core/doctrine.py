@@ -463,6 +463,7 @@ class DoctrineCommandDefinition:
     category: str
     display_label: str
     phrases: tuple[str, ...]
+    source_language: str = ""
 
 
 def _parse_commands(
@@ -471,6 +472,7 @@ def _parse_commands(
 ) -> tuple[
     Mapping[str, tuple[str, ...]],
     Mapping[str, DoctrineCommandDefinition],
+    Mapping[str, str],
 ]:
     document = _require_mapping(value, "commands.yml")
     _require_exact_keys(
@@ -482,6 +484,7 @@ def _parse_commands(
     raw_commands = _require_mapping(document["commands"], "commands.yml commands")
     commands: dict[str, tuple[str, ...]] = {}
     definitions: dict[str, DoctrineCommandDefinition] = {}
+    source_languages: dict[str, str] = {}
     seen_codes: set[str] = set()
     seen_phrases: dict[str, str] = {}
     count = 0
@@ -508,6 +511,35 @@ def _parse_commands(
                 )
         return tuple(phrases)
 
+    def parse_source_language(code: str, value: object) -> str:
+        language = normalize_language_code(
+            _bounded_string(value, f"{code} command source language", 32)
+        )
+        if not language or language in {"auto", "unknown"}:
+            raise DoctrinePackError(
+                f"command {code} contains an invalid source language"
+            )
+        return language
+
+    def parse_builtin_entry(code: str, value: object) -> tuple[tuple[str, ...], str]:
+        if isinstance(value, list):
+            return parse_phrases(code, value), ""
+        if schema_version < 2:
+            raise DoctrinePackError(f"command {code} phrases must be a list")
+        definition = _require_mapping(value, f"command {code}")
+        _require_exact_keys(
+            definition,
+            f"command {code}",
+            required={"phrases"},
+            optional={"source_language"},
+        )
+        language = (
+            parse_source_language(code, definition["source_language"])
+            if "source_language" in definition
+            else ""
+        )
+        return parse_phrases(code, definition["phrases"]), language
+
     for raw_code, raw_phrases in raw_commands.items():
         if not isinstance(raw_code, str):
             raise DoctrinePackError("command codes must be strings")
@@ -517,7 +549,10 @@ def _parse_commands(
         if code in seen_codes:
             raise DoctrinePackError(f"duplicate normalized command code: {code}")
         seen_codes.add(code)
-        commands[code] = parse_phrases(code, raw_phrases)
+        phrases, source_language = parse_builtin_entry(code, raw_phrases)
+        commands[code] = phrases
+        if source_language:
+            source_languages[code] = source_language
 
     raw_custom_commands = document.get("custom_commands", {})
     custom_commands = _require_mapping(
@@ -549,6 +584,7 @@ def _parse_commands(
             definition,
             f"custom command {code}",
             required={"category", "label", "phrases"},
+            optional={"source_language"},
         )
         category = _bounded_string(
             definition["category"],
@@ -566,14 +602,26 @@ def _parse_commands(
             80,
         )
         phrases = parse_phrases(code, definition["phrases"])
+        source_language = (
+            parse_source_language(code, definition["source_language"])
+            if "source_language" in definition
+            else ""
+        )
         commands[code] = phrases
+        if source_language:
+            source_languages[code] = source_language
         definitions[code] = DoctrineCommandDefinition(
             code=code,
             category=category,
             display_label=label,
             phrases=phrases,
+            source_language=source_language,
         )
-    return MappingProxyType(commands), MappingProxyType(definitions)
+    return (
+        MappingProxyType(commands),
+        MappingProxyType(definitions),
+        MappingProxyType(source_languages),
+    )
 
 
 @dataclass(frozen=True)
@@ -661,6 +709,7 @@ class DoctrinePack:
     protected_entities: tuple[str, ...]
     command_phrases: Mapping[str, tuple[str, ...]]
     command_definitions: Mapping[str, DoctrineCommandDefinition]
+    command_source_languages: Mapping[str, str]
     corrections: tuple[DoctrineCorrection, ...]
     source_path: Path = field(compare=False, repr=False)
     _command_lookup: Mapping[str, str] = field(compare=False, repr=False)
@@ -720,6 +769,12 @@ class DoctrinePack:
         code = (command_code or "").strip().upper()
         definition = self.command_definitions.get(code)
         return definition.display_label if definition is not None else code.replace("_", " ")
+
+    def command_source_language(self, command_code: str) -> str:
+        """Return an explicit pack-authored language hint, when present."""
+
+        code = (command_code or "").strip().upper()
+        return self.command_source_languages.get(code, "")
 
     def command_for_phrase(self, phrase: str) -> str | None:
         """Match one complete literal phrase; regex-looking text stays literal."""
@@ -782,7 +837,7 @@ def _build_pack(files: Mapping[str, bytes], source_path: Path) -> DoctrinePack:
     protected_entities = _parse_protected_entities(
         _load_yaml(files["protected_entities.yml"], "protected_entities.yml")
     )
-    commands, command_definitions = _parse_commands(
+    commands, command_definitions, command_source_languages = _parse_commands(
         _load_yaml(files["commands.yml"], "commands.yml"),
         schema_version,
     )
@@ -816,6 +871,7 @@ def _build_pack(files: Mapping[str, bytes], source_path: Path) -> DoctrinePack:
         protected_entities=protected_entities,
         command_phrases=commands,
         command_definitions=command_definitions,
+        command_source_languages=command_source_languages,
         corrections=corrections,
         source_path=source_path,
         _command_lookup=command_lookup,

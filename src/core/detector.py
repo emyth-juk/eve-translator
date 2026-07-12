@@ -218,6 +218,20 @@ class LanguageDetector:
         if explicit_hint and explicit_hint not in {"auto", "unknown"}:
             return explicit_hint
 
+        match_hints = tuple(
+            normalize_language_code(
+                getattr(match, "source_language", ""),
+                "",
+            )
+            for match in matches
+        )
+        unique_hints = set(match_hints)
+        if (
+            len(unique_hints) == 1
+            and match_hints[0] not in {"", "auto", "unknown"}
+        ):
+            return match_hints[0]
+
         script_language = self._detect_script_language(text)
         if script_language:
             return script_language

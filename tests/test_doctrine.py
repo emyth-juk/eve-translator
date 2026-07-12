@@ -4,6 +4,8 @@ from pathlib import Path
 
 import pytest
 
+from src.core.combat import classify_commands
+from src.core.detector import LanguageDetector
 from src.core.doctrine import (
     MAX_FILE_BYTES,
     DoctrinePackError,
@@ -155,11 +157,14 @@ def test_schema_v2_adds_safe_custom_command_definitions(tmp_path):
     commands = b"""\
 commands:
   ALIGN:
-    - form on the outgate
+    source_language: en-US
+    phrases:
+      - form on the outgate
 custom_commands:
   BASTION_UP:
     category: SUPPORT
     label: Bastion up
+    source_language: en
     phrases:
       - green bastion
 """
@@ -174,8 +179,55 @@ custom_commands:
     assert pack.command_for_phrase("GREEN BASTION") == "BASTION_UP"
     assert pack.command_category("BASTION_UP") == "SUPPORT"
     assert pack.command_label("BASTION_UP") == "Bastion up"
+    assert pack.command_source_language("ALIGN") == "en-us"
+    assert pack.command_source_language("BASTION_UP") == "en"
+    assert pack.command_definitions["BASTION_UP"].source_language == "en"
     assert pack.command_category("ALIGN") == "MOVE"
     assert pack.metadata["schema_version"] == 2
+
+
+def test_command_source_language_rejects_unknown_or_automatic_values(tmp_path):
+    manifest = VALID_FILES["manifest.yml"].replace(
+        b"schema_version: 1",
+        b"schema_version: 2",
+    )
+    commands = b"""\
+commands:
+  CEASE_FIRE:
+    source_language: auto
+    phrases: [red cycle]
+"""
+
+    with pytest.raises(DoctrinePackError, match="invalid source language"):
+        load_doctrine_pack(_write_pack(
+            tmp_path / "pack",
+            {"manifest.yml": manifest, "commands.yml": commands},
+        ))
+
+
+def test_doctrine_only_command_language_metadata_drives_translation_routing(tmp_path):
+    manifest = VALID_FILES["manifest.yml"].replace(
+        b"schema_version: 1",
+        b"schema_version: 2",
+    )
+    commands = b"""\
+commands:
+  CEASE_FIRE:
+    source_language: en
+    phrases: [red cycle]
+"""
+    pack = load_doctrine_pack(_write_pack(
+        tmp_path / "pack",
+        {"manifest.yml": manifest, "commands.yml": commands},
+    ))
+    matches = classify_commands("red cycle", doctrine_pack=pack)
+
+    assert LanguageDetector().should_translate(
+        "red cycle",
+        target_lang="en",
+        ignored_langs={"en"},
+        command_matches=matches,
+    ) == (False, "en")
 
 
 @pytest.mark.parametrize(
