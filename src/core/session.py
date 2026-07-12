@@ -6,7 +6,6 @@ from PySide6.QtCore import QObject, QCoreApplication, QFileSystemWatcher, Qt, QT
 
 logger = logging.getLogger(__name__)
 LOG_WATCH_DEBOUNCE_MS = 100
-WATCHED_LOG_FALLBACK_SECONDS = 5.0
 
 class ChatSession(QObject):
     """
@@ -217,10 +216,11 @@ class ChatSession(QObject):
         return max(100, int(interval * 1000))
 
     def _poll_interval_ms(self):
-        configured_ms = self._configured_poll_interval_ms()
-        if self._file_watch_active:
-            return max(configured_ms, int(WATCHED_LOG_FALLBACK_SECONDS * 1000))
-        return configured_ms
+        # QFileSystemWatcher accelerates delivery when Windows reports an
+        # append, but EVE's UTF-16 log writes do not reliably produce one event
+        # per chat line. Keep the configured poll as the hard latency fallback
+        # even while the watcher is registered.
+        return self._configured_poll_interval_ms()
 
     def _start_log_watcher(self):
         self._file_watch_active = False

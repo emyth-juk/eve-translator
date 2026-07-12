@@ -290,13 +290,16 @@ class TestSessionConfigUpdate(unittest.TestCase):
 
     @patch(PATCH_OVERLAY)
     @patch(PATCH_TAILER)
-    def test_watched_log_uses_relaxed_fallback_interval(self, MockTailer, MockOW):
-        """Active file watch should relax fallback polling but respect larger user intervals."""
+    def test_watched_log_keeps_configured_latency_fallback(self, MockTailer, MockOW):
+        """File watching must not silently turn a 1s preference into 5s latency."""
         from src.core.session import ChatSession
 
         session = ChatSession('fleet', self.log_path, _make_config(polling_interval=1.0))
         session._file_watch_active = True
-        self.assertEqual(session._poll_interval_ms(), 5000)
+        self.assertEqual(session._poll_interval_ms(), 1000)
+
+        session.config['polling_interval'] = 0.2
+        self.assertEqual(session._poll_interval_ms(), 200)
 
         session.config['polling_interval'] = 10.0
         self.assertEqual(session._poll_interval_ms(), 10000)
