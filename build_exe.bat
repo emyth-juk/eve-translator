@@ -15,6 +15,7 @@ python -m pip install -r requirements-build.txt || exit /b 1
 python -m PyInstaller --clean --noconfirm --onefile --windowed ^
   --name "EVETranslator_v%VERSION%" ^
   --icon "src\assets\icon.ico" ^
+  --version-file "packaging\windows_version_info.txt" ^
   --add-data "src\assets\icon.png;src\assets" ^
   --add-data "data;data" ^
   --collect-data "langdetect" ^

@@ -6,11 +6,6 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
   <img src="src/assets/eve_translator_banner.png" width="900" alt="EVE Translator">
 </p>
 
-## Screenshots
-![Fleet Overlay](docs/screenshots/eve_translator_overlay.png)   
-![Context Menu](docs/screenshots/eve_translator_fleet_context_menu_1.png)
-![Context Menu](docs/screenshots/eve_translator_local_chat_context_menu_1.png)
-
 ## What It Does
 - Two overlays: one for Fleet, one for Local (toggle either on/off).
 - Combat, Bilingual, and Mirror HUD modes with a compact readiness/provider header.
@@ -55,7 +50,7 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 - First-run provider guidance returns on later launches until you open Settings and save an explicit choice, including Disabled.
 - Provider test: sends only a built-in connection-test phrase, never fleet chat.
 - Context assist is off by default. When enabled with a provider that supports native context, recent lines from only the same channel/log source are also sent to that provider.
-- Provider fallback is off by default. Enabling it explicitly consents to sending a failed messageâ€”and enabled context-assist linesâ€”to the other cloud provider only after the primary provider fails.
+- Provider fallback is off by default. Enabling it explicitly consents to sending a failed message—and enabled context-assist lines—to the other cloud provider only after the primary provider fails.
 - **Refresh Usage** reads exact DeepL character usage. Google does not expose an account quota through this integration, so its figure is clearly labelled as a local runtime estimate.
 - Colors and UI: set default/translated/highlight colors in Settings; changes are live.  
 - Translation Intelligence: manage SDE name protection, burst optimization, context consent, exact local corrections, and one active doctrine pack.

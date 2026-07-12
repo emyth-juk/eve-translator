@@ -1,5 +1,6 @@
-PySide6
-langdetect
-deepl
-PyYAML>=6.0.1
-deep-translator
+PySide6==6.10.1
+langdetect==1.0.9
+deepl==1.27.0
+PyYAML==6.0.3
+deep-translator==1.11.4
+requests==2.32.5

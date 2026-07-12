@@ -1,0 +1,29 @@
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(1, 4, 0, 0),
+    prodvers=(1, 4, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0),
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '040904B0',
+        [
+          StringStruct('CompanyName', 'EVE Translator Contributors'),
+          StringStruct('FileDescription', 'EVE fleet chat translation HUD'),
+          StringStruct('FileVersion', '1.4'),
+          StringStruct('InternalName', 'EVETranslator'),
+          StringStruct('OriginalFilename', 'EVETranslator_v1.4.exe'),
+          StringStruct('ProductName', 'EVE Translator'),
+          StringStruct('ProductVersion', '1.4'),
+        ],
+      ),
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])]),
+  ],
+)
