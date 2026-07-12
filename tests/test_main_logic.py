@@ -77,6 +77,7 @@ class TestConfigLoadSave(unittest.TestCase):
         self.assertTrue(config['shared']['auto_scroll'])
         self.assertTrue(config['sessions']['fleet']['enabled'])
         self.assertFalse(config['sessions']['local']['enabled'])
+        self.assertFalse(config['sessions']['any']['enabled'])
 
     def test_load_config_merges_existing(self):
         """Existing config file should be merged with defaults."""
@@ -214,7 +215,12 @@ class TestScannerWatcherConfig(unittest.TestCase):
 class TestSessionRuntimeState(unittest.TestCase):
     """Tests for waiting-session recovery and truthful tray state."""
 
-    def _make_manager(self, fleet_enabled=False, local_enabled=False):
+    def _make_manager(
+        self,
+        fleet_enabled=False,
+        local_enabled=False,
+        any_enabled=False,
+    ):
         with patch('src.main.TranslatorManager.__init__', lambda self: None):
             from src.main import SessionRuntimeState, TranslatorManager
 
@@ -226,9 +232,10 @@ class TestSessionRuntimeState(unittest.TestCase):
             'sessions': {
                 'fleet': {'enabled': fleet_enabled},
                 'local': {'enabled': local_enabled},
+                'any': {'enabled': any_enabled},
             },
         }
-        mgr.sessions = {'fleet': None, 'local': None}
+        mgr.sessions = {'fleet': None, 'local': None, 'any': None}
         mgr._session_runtime_states = {
             'fleet': (
                 SessionRuntimeState.WAITING
@@ -240,6 +247,11 @@ class TestSessionRuntimeState(unittest.TestCase):
                 if local_enabled
                 else SessionRuntimeState.DISABLED
             ),
+            'any': (
+                SessionRuntimeState.WAITING
+                if any_enabled
+                else SessionRuntimeState.DISABLED
+            ),
         }
         mgr._session_runtime_errors = {}
         mgr._sessions_initialized = True
@@ -247,10 +259,12 @@ class TestSessionRuntimeState(unittest.TestCase):
         mgr.worker.request_config_update.return_value = 1
         mgr.fleet_action = MagicMock()
         mgr.local_action = MagicMock()
+        mgr.any_action = MagicMock()
         mgr.tray_icon = MagicMock()
         mgr._save_config = MagicMock()
         mgr._broadcast_session_states = MagicMock()
         mgr._broadcast_character_list = MagicMock()
+        mgr._broadcast_channel_list = MagicMock()
         return mgr
 
     def test_enabling_without_log_enters_waiting_state(self):
@@ -293,6 +307,7 @@ class TestSessionRuntimeState(unittest.TestCase):
         mgr = self._make_manager()
         mgr._get_log_path = MagicMock(side_effect=[None, 'C:/logs/Fleet_test.txt'])
         mgr._scan_characters = MagicMock()
+        mgr._scan_channels = MagicMock()
         mgr._scan_fleets = MagicMock()
 
         self.assertFalse(mgr.start_session('fleet'))
@@ -307,6 +322,7 @@ class TestSessionRuntimeState(unittest.TestCase):
             mgr._periodic_scan()
 
         mgr._scan_characters.assert_called_once_with()
+        mgr._scan_channels.assert_called_once_with()
         mgr._scan_fleets.assert_called_once_with()
         session_cls.assert_called_once_with(
             'fleet',
@@ -322,15 +338,19 @@ class TestSessionRuntimeState(unittest.TestCase):
         )
         self.assertIn('Active', mgr.fleet_action.setText.call_args.args[0])
 
-    def test_recovery_checks_fleet_and_local_waiting_sessions(self):
-        mgr = self._make_manager(fleet_enabled=True, local_enabled=True)
+    def test_recovery_checks_all_waiting_sessions(self):
+        mgr = self._make_manager(
+            fleet_enabled=True,
+            local_enabled=True,
+            any_enabled=True,
+        )
         mgr.start_session = MagicMock()
 
         mgr._recover_waiting_sessions()
 
         self.assertEqual(
             mgr.start_session.call_args_list,
-            [call('fleet'), call('local')],
+            [call('fleet'), call('local'), call('any')],
         )
 
     def test_recovery_preserves_waiting_state_for_open_stale_overlay(self):
@@ -375,6 +395,7 @@ class TestSessionRuntimeState(unittest.TestCase):
         mgr.app = MagicMock()
         fleet_action = MagicMock()
         local_action = MagicMock()
+        any_action = MagicMock()
         lock_action = MagicMock()
         compose_action = MagicMock()
         settings_action = MagicMock()
@@ -388,6 +409,7 @@ class TestSessionRuntimeState(unittest.TestCase):
             action_cls.side_effect = [
                 fleet_action,
                 local_action,
+                any_action,
                 lock_action,
                 compose_action,
                 settings_action,
@@ -397,6 +419,7 @@ class TestSessionRuntimeState(unittest.TestCase):
             mgr._setup_system_tray()
 
         self.assertIs(mgr.settings_action, settings_action)
+        self.assertIs(mgr.any_action, any_action)
         self.assertIs(mgr.compose_action, compose_action)
         compose_action.triggered.connect.assert_called_once_with(
             mgr.open_compose_dialog
@@ -415,13 +438,15 @@ class TestSessionRuntimeState(unittest.TestCase):
         mgr.lock_overlays_action = MagicMock()
         fleet = MagicMock()
         local = MagicMock()
-        mgr.sessions = {'fleet': fleet, 'local': local}
+        any_chat = MagicMock()
+        mgr.sessions = {'fleet': fleet, 'local': local, 'any': any_chat}
         mgr._update_overlay_status = MagicMock()
 
         mgr.set_overlay_locked(True)
 
         fleet.overlay.set_interaction_locked.assert_called_once_with(True)
         local.overlay.set_interaction_locked.assert_called_once_with(True)
+        any_chat.overlay.set_interaction_locked.assert_called_once_with(True)
         self.assertTrue(mgr.overlay_locked)
         mgr.lock_overlays_action.setChecked.assert_any_call(True)
 

@@ -81,6 +81,7 @@ from src.services.hotkeys import (
     WindowsGlobalHotkey,
 )
 from src.services.local_detector import LocalChatDetector
+from src.services.channel_detector import AnyChatDetector
 from src.gui.settings import SettingsDialog
 from src.gui.compose import ComposeDialog
 from src.version import __version__
@@ -88,6 +89,12 @@ from src.version import __version__
 DIR_SCAN_DEBOUNCE_MS = 500
 WATCHED_DIR_FALLBACK_SECONDS = 60
 WORKER_SHUTDOWN_TIMEOUT_MS = 15_000
+SESSION_IDS = ('fleet', 'local', 'any')
+SESSION_LABELS = {
+    'fleet': 'Fleet Chat',
+    'local': 'Local Chat',
+    'any': 'Any Chat',
+}
 
 
 class SessionRuntimeState(str, Enum):
@@ -145,6 +152,22 @@ class TranslatorManager(QObject):
     @selected_fleet_id.setter
     def selected_fleet_id(self, value):
         self._get_scan_state().selected_fleet_id = value
+
+    @property
+    def channel_registry(self):
+        return self._get_scan_state().channel_registry
+
+    @channel_registry.setter
+    def channel_registry(self, value):
+        self._get_scan_state().channel_registry = value
+
+    @property
+    def selected_channel_id(self):
+        return self._get_scan_state().selected_channel_id
+
+    @selected_channel_id.setter
+    def selected_channel_id(self, value):
+        self._get_scan_state().selected_channel_id = value
 
     def __init__(self):
         super().__init__()
@@ -479,6 +502,14 @@ class TranslatorManager(QObject):
         self.local_action.triggered.connect(lambda: self.toggle_session('local'))
         self.tray_menu.addAction(self.local_action)
 
+        self.any_action = QAction("Any Chat", self.tray_menu, checkable=True)
+        self.any_action.setChecked(self.config['sessions']['any']['enabled'])
+        self.any_action.triggered.connect(lambda: self.toggle_session('any'))
+        self.tray_menu.addAction(self.any_action)
+
+        self.any_source_menu = self.tray_menu.addMenu("Any Chat Source")
+        self.any_source_menu.aboutToShow.connect(self._populate_any_source_menu)
+
         self.tray_menu.addSeparator()
 
         chord = self.config.get('shared', {}).get('global_hotkey', 'Ctrl+Shift+L')
@@ -545,6 +576,64 @@ class TranslatorManager(QObject):
                 12000,
             )
 
+    def _populate_any_source_menu(self) -> None:
+        """Rebuild the arbitrary-chat picker from the latest log scan."""
+        menu = getattr(self, 'any_source_menu', None)
+        if menu is None:
+            return
+        menu.clear()
+
+        selected = getattr(self, 'selected_channel_id', None)
+        channels = self._any_channel_choices()
+        if not channels:
+            action = QAction("No chat logs detected", menu)
+            action.setEnabled(False)
+            menu.addAction(action)
+            return
+
+        channels.sort(key=lambda item: (
+            not bool(item.is_active),
+            item.channel_name.casefold(),
+            item.listener_name.casefold(),
+            -float(item.started_time),
+        ))
+        for channel in channels:
+            label = f"{channel.channel_name} - {channel.listener_name}"
+            if not channel.is_active:
+                label += " [Offline]"
+            action = QAction(label, menu, checkable=True)
+            action.setChecked(channel.selection_id == selected)
+            action.triggered.connect(
+                lambda _checked=False, selection=channel.selection_id: (
+                    self.switch_channel(selection)
+                )
+            )
+            menu.addAction(action)
+
+    def _any_channel_choices(self):
+        """Keep pickers useful without flooding them with every old rotation."""
+        registry = getattr(self, 'channel_registry', {})
+        channels = list(registry.values())
+        if not channels:
+            return []
+
+        selected = getattr(self, 'selected_channel_id', None)
+        active = [channel for channel in channels if channel.is_active]
+        if active:
+            choices = active
+        else:
+            newest_start = max(channel.started_time for channel in channels)
+            choices = [
+                channel
+                for channel in channels
+                if abs(channel.started_time - newest_start) < 1.0
+            ]
+
+        selected_channel = registry.get(selected) if selected else None
+        if selected_channel is not None and selected_channel not in choices:
+            choices.append(selected_channel)
+        return choices
+
     def _show_provider_setup_notice(self):
         config_store = getattr(self, 'config_store', None)
         newer_schema = getattr(config_store, 'unsupported_schema_version', None)
@@ -578,10 +667,9 @@ class TranslatorManager(QObject):
 
     def _initialize_sessions(self):
         # Start enabled sessions
-        if self.config['sessions']['fleet']['enabled']:
-            self.start_session('fleet')
-        if self.config['sessions']['local']['enabled']:
-            self.start_session('local')
+        for session_id in SESSION_IDS:
+            if self.config['sessions'][session_id]['enabled']:
+                self.start_session(session_id)
         
         # Initial broadcast of state to any active sessions (including those just started)
         self._broadcast_session_states()
@@ -718,12 +806,16 @@ class TranslatorManager(QObject):
             # Connect fleet selection signal (for fleet sessions)
             if hasattr(session.overlay, 'fleet_selected'):
                 session.overlay.fleet_selected.connect(self.switch_fleet)
+            if hasattr(session.overlay, 'channel_selected'):
+                session.overlay.channel_selected.connect(self.switch_channel)
 
             self.sessions[session_id] = session
             session.overlay.set_interaction_locked(
                 bool(getattr(self, 'overlay_locked', False))
             )
             session.start()
+            if session_id == 'any':
+                self._update_any_overlay_title()
         except Exception as exc:
             logger.exception("[%s] Error starting chat session", session_id)
             if session is not None:
@@ -744,6 +836,7 @@ class TranslatorManager(QObject):
         self._set_session_runtime_state(session_id, SessionRuntimeState.ACTIVE)
         self._broadcast_session_states()
         self._broadcast_character_list()
+        self._broadcast_channel_list()
         return True
 
     def open_settings_dialog(self):
@@ -915,6 +1008,11 @@ class TranslatorManager(QObject):
         if hasattr(session.overlay, 'fleet_selected'):
             try:
                 session.overlay.fleet_selected.disconnect(self.switch_fleet)
+            except RuntimeError:
+                pass
+        if hasattr(session.overlay, 'channel_selected'):
+            try:
+                session.overlay.channel_selected.disconnect(self.switch_channel)
             except RuntimeError:
                 pass
 
@@ -1130,12 +1228,16 @@ class TranslatorManager(QObject):
             character = session_config.get('character_name', '')
             system = session_config.get('system_name', '')
             context = ' · '.join(value for value in (character, system) if value)
-        else:
+        elif session_id == 'fleet':
             context = ''
             selected = getattr(self, 'selected_fleet_id', None)
             fleet = getattr(self, 'fleet_registry', {}).get(selected) if selected else None
             if fleet is not None:
                 context = getattr(fleet, 'listener_name', '')
+        else:
+            channel = session_config.get('channel_name', '')
+            listener = session_config.get('listener_name', '')
+            context = ' · '.join(value for value in (channel, listener) if value)
 
         service = getattr(self, 'translation_service', None)
         provider_status = (
@@ -1173,7 +1275,11 @@ class TranslatorManager(QObject):
             f"Translation provider: {provider_status.get('name', 'Disabled')}"
         )
         session.overlay.update_status(OverlayStatus(
-            channel=session_id.capitalize(),
+            channel={
+                'fleet': 'Fleet',
+                'local': 'Local',
+                'any': 'Any Chat',
+            }.get(session_id, session_id),
             state=state_labels[state],
             context=context,
             provider=str(provider_status.get('name') or 'Disabled'),
@@ -1193,6 +1299,7 @@ class TranslatorManager(QObject):
         action_specs = (
             ('fleet', 'Fleet Chat', 'fleet_action'),
             ('local', 'Local Chat', 'local_action'),
+            ('any', 'Any Chat', 'any_action'),
         )
         provider_mode = (
             self.config.get('shared', {})
@@ -1287,7 +1394,7 @@ class TranslatorManager(QObject):
 
     def _recover_waiting_sessions(self):
         """Start enabled sessions once their EVE chat log becomes available."""
-        for session_id in ('fleet', 'local'):
+        for session_id in SESSION_IDS:
             session_config = self.config['sessions'].get(session_id, {})
             if not session_config.get('enabled', False):
                 if (
@@ -1311,6 +1418,8 @@ class TranslatorManager(QObject):
             return self._find_latest_fleet_log()
         elif session_id == 'local':
             return self._find_latest_local_log()
+        elif session_id == 'any':
+            return self._find_latest_any_log()
         return None
 
     def _find_latest_fleet_log(self):
@@ -1410,12 +1519,113 @@ class TranslatorManager(QObject):
         self._get_scan_state().select_character(char_info.character_id, self.config)
         return char_info.latest_log_path
 
+    def _find_latest_any_log(self):
+        """Return the active arbitrary-channel log selected by the pilot."""
+        selected = getattr(self, 'selected_channel_id', None)
+        if selected:
+            channel = getattr(self, 'channel_registry', {}).get(selected)
+            if channel is None or not channel.is_active:
+                return None
+            self._get_scan_state().select_channel(selected, self.config)
+            return channel.log_path
+
+        active_channels = [
+            channel
+            for channel in getattr(self, 'channel_registry', {}).values()
+            if channel.is_active
+        ]
+        if not active_channels:
+            return None
+
+        channel = max(active_channels, key=lambda item: (
+            item.started_time,
+            item.log_mtime,
+            item.log_path.casefold(),
+        ))
+        self._get_scan_state().select_channel(channel.selection_id, self.config)
+        logger.info(
+            "[ANY] Auto-selected chat: %s - %s",
+            channel.channel_name,
+            channel.listener_name,
+        )
+        return channel.log_path
+
+    def _scan_channels(self):
+        """Discover arbitrary EVE chats and follow only the selected source."""
+        log_dir = self._get_configured_log_dir()
+        if not log_dir or not os.path.exists(log_dir):
+            return
+
+        detector = getattr(self, 'any_chat_detector', None)
+        if detector is None:
+            detector = AnyChatDetector()
+            self.any_chat_detector = detector
+        active_characters = {}
+        for character_id, character in getattr(
+            self, 'character_registry', {}
+        ).items():
+            if not getattr(character, 'is_active', False):
+                continue
+            parsed_local = detector.parse_filename(
+                Path(character.latest_log_path).name
+            )
+            active_characters[character_id] = (
+                parsed_local[2] if parsed_local is not None else None
+            )
+        new_registry = detector.scan_channels(
+            log_dir,
+            active_characters=active_characters,
+        )
+        self.channel_registry = new_registry
+
+        selected = getattr(self, 'selected_channel_id', None)
+        if (
+            not selected
+            and self.config['sessions']['any'].get('enabled', False)
+        ):
+            active_channels = [
+                channel for channel in new_registry.values() if channel.is_active
+            ]
+            if active_channels:
+                channel = max(active_channels, key=lambda item: (
+                    item.started_time,
+                    item.log_mtime,
+                    item.log_path.casefold(),
+                ))
+                self._get_scan_state().select_channel(
+                    channel.selection_id,
+                    self.config,
+                )
+                selected = channel.selection_id
+
+        channel = new_registry.get(selected) if selected else None
+        session = getattr(self, 'sessions', {}).get('any')
+        if channel is not None and channel.is_active:
+            self._get_scan_state().select_channel(channel.selection_id, self.config)
+            current_path = getattr(session, 'log_path', '') if session else ''
+            path_changed = bool(session) and (
+                os.path.normcase(os.path.abspath(str(current_path)))
+                != os.path.normcase(os.path.abspath(channel.log_path))
+            )
+            if session and path_changed:
+                session.switch_log(channel.log_path)
+                self._update_any_overlay_title()
+            if session:
+                self._set_session_runtime_state(
+                    'any', SessionRuntimeState.ACTIVE
+                )
+        elif session:
+            self._set_session_runtime_state('any', SessionRuntimeState.WAITING)
+
+        self._broadcast_channel_list()
+
     def _periodic_scan(self):
         """
         Periodic scanner that runs every 30 seconds.
-        Scans for both active characters (Local) and active fleets (Fleet).
+        Scans active characters, arbitrary channels, and fleets.
         """
         self._scan_characters()
+        self._scan_channels()
         self._scan_fleets()
         if getattr(self, '_sessions_initialized', True):
             self._recover_waiting_sessions()
@@ -1685,6 +1895,59 @@ class TranslatorManager(QObject):
         self.sessions['fleet'].overlay.setWindowTitle(title)
         self._update_overlay_status('fleet')
 
+    def switch_channel(self, selection_id: str):
+        """Select one arbitrary EVE chat without aggregating duplicate logs."""
+        channel = getattr(self, 'channel_registry', {}).get(selection_id)
+        if channel is None:
+            logger.warning("[ANY] Chat source not found: %s", selection_id)
+            return
+
+        logger.info(
+            "[ANY] Selecting chat: %s - %s",
+            channel.channel_name,
+            channel.listener_name,
+        )
+        self._get_scan_state().select_channel(selection_id, self.config)
+
+        enabled = self.config['sessions']['any'].get('enabled', False)
+        session = getattr(self, 'sessions', {}).get('any')
+        if enabled and channel.is_active:
+            if session:
+                current = os.path.normcase(
+                    os.path.abspath(str(session.log_path))
+                )
+                selected = os.path.normcase(os.path.abspath(channel.log_path))
+                if current != selected:
+                    session.switch_log(channel.log_path)
+            else:
+                self.start_session('any')
+            self._set_session_runtime_state('any', SessionRuntimeState.ACTIVE)
+        elif enabled:
+            if session:
+                self._disconnect_session_signals(session)
+                session.stop()
+                self.sessions['any'] = None
+            self._set_session_runtime_state('any', SessionRuntimeState.WAITING)
+
+        self._update_any_overlay_title()
+        self._broadcast_channel_list()
+        self._save_config()
+
+    def _update_any_overlay_title(self):
+        """Show the selected arbitrary channel and listening character."""
+        session = getattr(self, 'sessions', {}).get('any')
+        if not session:
+            return
+
+        session_config = self.config['sessions']['any']
+        channel_name = session_config.get('channel_name') or 'Any Chat'
+        listener = session_config.get('listener_name', '')
+        title = f"Any Chat - {channel_name}"
+        if listener:
+            title += f" - {listener}"
+        session.overlay.setWindowTitle(title)
+        self._update_overlay_status('any')
+
     def _broadcast_character_list(self):
         """Send available characters to overlays for context menu."""
         for session in self.sessions.values():
@@ -1699,6 +1962,16 @@ class TranslatorManager(QObject):
                     self.fleet_registry,
                     self.selected_fleet_id
                 )
+
+    def _broadcast_channel_list(self):
+        """Send arbitrary chat choices to the Any Chat overlay."""
+        session = getattr(self, 'sessions', {}).get('any')
+        if session and hasattr(session.overlay, 'update_channel_list'):
+            choices = self._any_channel_choices()
+            session.overlay.update_channel_list(
+                {channel.selection_id: channel for channel in choices},
+                self.selected_channel_id,
+            )
 
     def _build_session_config(self, session_id):
         shared = self.config['shared'].copy()

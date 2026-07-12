@@ -54,6 +54,23 @@
             "display_mode": "mirror",
             "compact_header": true,
             "command_cards": true
+        },
+        "any": {
+            "x": 720,
+            "y": 100,
+            "w": 300,
+            "h": 400,
+            "background_color": "#21173d",
+            "title_prefix": "[ANY]",
+            "enabled": false,
+            "display_mode": "mirror",
+            "compact_header": true,
+            "command_cards": true,
+            "channel_selection": "",
+            "channel_id": "",
+            "channel_name": "",
+            "character_id": "",
+            "listener_name": ""
         }
     }
 }

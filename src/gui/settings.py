@@ -74,7 +74,12 @@ class SettingsDialog(QDialog):
         self._init_session_tab(self.tab_local, 'local')
         self.tabs.addTab(self.tab_local, "Local Overlay")
 
-        # 4. EVE-aware translation controls stay out of the dense General tab.
+        # 4. One selected Corp/Alliance/custom chat at a time.
+        self.tab_any = QWidget()
+        self._init_session_tab(self.tab_any, 'any')
+        self.tabs.addTab(self.tab_any, "Any Chat Overlay")
+
+        # 5. EVE-aware translation controls stay out of the dense General tab.
         self.tab_intelligence = QWidget()
         self._init_intelligence_tab()
         self.tabs.addTab(self.tab_intelligence, "Translation Intelligence")
@@ -361,6 +366,26 @@ class SettingsDialog(QDialog):
             form_fleet.addRow("History Lines:", self.spin_fleet_history)
 
             layout.addWidget(grp_fleet)
+        elif session_id == 'any':
+            grp_any = QGroupBox("Chat Source")
+            form_any = QFormLayout(grp_any)
+            selected_channel = session_cfg.get('channel_name') or 'Auto-select on first enable'
+            selected_listener = session_cfg.get('listener_name', '')
+            if selected_listener:
+                selected_channel += f" - {selected_listener}"
+            current_source = QLabel(selected_channel)
+            current_source.setWordWrap(True)
+            form_any.addRow("Selected:", current_source)
+            source_hint = QLabel(
+                "Enable Any Chat from the tray, then choose Corp, Alliance, "
+                "intel, or another logged channel from Any Chat Source in the "
+                "tray or Switch Chat in the overlay. Fleet and Local remain "
+                "separate to avoid duplicate translations."
+            )
+            source_hint.setWordWrap(True)
+            source_hint.setStyleSheet("color: gray; font-style: italic;")
+            form_any.addRow("", source_hint)
+            layout.addWidget(grp_any)
         
         grp_layout = QGroupBox("Layout")
         form = QFormLayout(grp_layout)
@@ -406,7 +431,7 @@ class SettingsDialog(QDialog):
         form_runtime.addRow(self.chk_context_assist)
 
         context_note = QLabel(
-            "Context is off by default, never crosses Fleet/Local or log sources, "
+            "Context is off by default and never crosses sessions or log sources, "
             "and is used only through a provider-native context API."
         )
         context_note.setWordWrap(True)

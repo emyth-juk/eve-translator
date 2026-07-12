@@ -18,6 +18,17 @@ from src.services.translator import ProviderTestResult
 app = QApplication.instance() or QApplication(sys.argv)
 
 
+def test_settings_expose_any_chat_overlay_tab():
+    dialog = SettingsDialog(get_default_config())
+
+    labels = [dialog.tabs.tabText(index) for index in range(dialog.tabs.count())]
+
+    assert "Any Chat Overlay" in labels
+    assert "any" in dialog._session_hud_controls
+    assert dialog.get_settings()["sessions"]["any"]["enabled"] is False
+    dialog.close()
+
+
 def wait_for_provider_test(dialog, timeout_seconds=1.0):
     deadline = time.monotonic() + timeout_seconds
     while dialog._provider_test_running and time.monotonic() < deadline:

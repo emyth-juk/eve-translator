@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
 
 from src.core.character_info import CharacterInfo
+from src.core.channel_info import ChatChannelInfo
 from src.core.fleet_info import FleetInfo
 from src.core.message import ProcessedMessage, TranslationState
 
@@ -332,6 +333,37 @@ class TestOverlayNonUILogic(unittest.TestCase):
         overlay.update_fleet_list(fleets, 'f1')
         self.assertEqual(len(overlay.available_fleets), 2)
         self.assertEqual(overlay.selected_fleet_id, 'f1')
+
+    def test_update_any_chat_list_tracks_stable_selection(self):
+        overlay = self._make_overlay('any')
+        channel = ChatChannelInfo(
+            selection_id='player_intel::123',
+            channel_id='player_intel',
+            channel_name='Intel',
+            character_id='123',
+            listener_name='TestPilot',
+            log_path='/path/intel.txt',
+            log_mtime=1000,
+            started_time=900,
+            is_active=True,
+        )
+
+        overlay.update_channel_list(
+            {channel.selection_id: channel},
+            channel.selection_id,
+        )
+
+        self.assertEqual(overlay.available_channels[channel.selection_id], channel)
+        self.assertEqual(overlay.selected_channel_id, channel.selection_id)
+        self.assertEqual(
+            overlay.config['channel_selection'],
+            channel.selection_id,
+        )
+
+    def test_any_chat_overlay_uses_explicit_window_label(self):
+        overlay = self._make_overlay('any')
+
+        self.assertIn('Any Chat', overlay.windowTitle())
 
     # --- _format_message_html ---
 

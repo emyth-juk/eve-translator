@@ -50,7 +50,9 @@ class OverlayWindow(QMainWindow):
     # Signal to request character switch (char_id)
     character_selected = Signal(str)
     # Signal to request fleet switch (fleet_id)
-    fleet_selected = Signal(str) 
+    fleet_selected = Signal(str)
+    # Signal to select one arbitrary EVE chat source.
+    channel_selected = Signal(str)
     # Signal to request application shutdown
     exit_requested = Signal()
     # Explicit role management; values are original display name and role.
@@ -69,7 +71,12 @@ class OverlayWindow(QMainWindow):
             Qt.WindowType.Tool  # Tool window doesn't appear in taskbar usually
         )
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
-        self.setWindowTitle(f"EVE Translator v{__version__} - {session_id.capitalize()}")
+        session_label = {
+            'fleet': 'Fleet',
+            'local': 'Local',
+            'any': 'Any Chat',
+        }.get(session_id, session_id.capitalize())
+        self.setWindowTitle(f"EVE Translator v{__version__} - {session_label}")
         
         # Opacity
         self.setWindowOpacity(0.8)
@@ -131,7 +138,11 @@ class OverlayWindow(QMainWindow):
             'auto_scroll': True,
             'ignored_languages': ['en', 'de'],
             'target_language': 'en',
-            'background_color': '#33001a' if session_id == 'fleet' else '#001a33',
+            'background_color': {
+                'fleet': '#33001a',
+                'local': '#001a33',
+                'any': '#21173d',
+            }.get(session_id, '#101820'),
             'display_mode': DISPLAY_MODE_MIRROR,
             'compact_header': True,
             'command_cards': True,
@@ -154,10 +165,17 @@ class OverlayWindow(QMainWindow):
         self.available_characters = {}
         # Track available fleets for Fleet selection
         self.available_fleets = {}
-        self.selected_fleet_id = None 
+        self.selected_fleet_id = None
+        # Track arbitrary EVE chat sources for Any Chat selection.
+        self.available_channels = {}
+        self.selected_channel_id = self.config.get('channel_selection') or None
         self.interaction_locked = False
         self.overlay_status = OverlayStatus(
-            channel=session_id.capitalize(),
+            channel={
+                'fleet': 'Fleet',
+                'local': 'Local',
+                'any': 'Any',
+            }.get(session_id, session_id.capitalize()),
             display_mode=self.config.get('display_mode', DISPLAY_MODE_MIRROR),
         )
         
@@ -171,6 +189,11 @@ class OverlayWindow(QMainWindow):
             char_name = self.config.get('character_name', 'Unknown Character')
             system_name = self.config.get('system_name', 'Unknown System')
             welcome_text = f"Listening to Local Chat for <b>{char_name}</b> in <b>{system_name}</b>."
+        elif session_id == 'any':
+            channel_name = self.config.get('channel_name') or 'an arbitrary chat'
+            listener = self.config.get('listener_name', '')
+            suffix = f" for <b>{listener}</b>" if listener else ''
+            welcome_text = f"Listening to <b>{channel_name}</b>{suffix}."
         else:
             welcome_text = f"Listening to {session_id.capitalize()} Chat."
 
@@ -192,7 +215,10 @@ class OverlayWindow(QMainWindow):
         
         if x == -1 or y == -1:
             # Stagger default positions if multiple?
-            offset = 0 if self.session_id == 'fleet' else 50
+            offset = {'fleet': 0, 'local': 50, 'any': 100}.get(
+                self.session_id,
+                150,
+            )
             x = screen_geo.width() - w - 50 - offset
             y = screen_geo.height() - h - 100 - offset
             
@@ -456,6 +482,13 @@ class OverlayWindow(QMainWindow):
         act_local.setChecked(is_local_active)
         act_local.triggered.connect(lambda: self.session_toggled.emit('local'))
         menu_session.addAction(act_local)
+
+        # Any logged EVE chat other than the dedicated Fleet/Local sources.
+        is_any_active = self.all_session_states.get('any', False)
+        act_any = QAction("Any Chat", self, checkable=True)
+        act_any.setChecked(is_any_active)
+        act_any.triggered.connect(lambda: self.session_toggled.emit('any'))
+        menu_session.addAction(act_any)
         
         # Character Selection Submenu (Local Only)
         if self.session_id == 'local':
@@ -521,6 +554,48 @@ class OverlayWindow(QMainWindow):
                 act = QAction("No active fleets detected", self)
                 act.setEnabled(False)
                 menu_fleets.addAction(act)
+
+        if self.session_id == 'any':
+            menu.addSeparator()
+            menu_channels = menu.addMenu("Switch Chat")
+            current_channel_id = getattr(self, 'selected_channel_id', None)
+
+            selectable_channels = list(self.available_channels.values())
+            if selectable_channels:
+                sorted_channels = sorted(
+                    selectable_channels,
+                    key=lambda item: (
+                        not bool(item.is_active),
+                        item.channel_name.casefold(),
+                        item.listener_name.casefold(),
+                        -float(item.started_time),
+                    ),
+                )
+                for channel in sorted_channels:
+                    started = datetime.datetime.fromtimestamp(
+                        channel.started_time,
+                        datetime.timezone.utc,
+                    ).strftime("%m-%d %H:%M")
+                    label = (
+                        f"{channel.channel_name} - {channel.listener_name} "
+                        f"[{started} EVE]"
+                    )
+                    if not channel.is_active:
+                        label += " [Offline]"
+                    action = QAction(label, self, checkable=True)
+                    action.setChecked(
+                        channel.selection_id == current_channel_id
+                    )
+                    action.triggered.connect(
+                        lambda _checked=False, selection=channel.selection_id: (
+                            self.channel_selected.emit(selection)
+                        )
+                    )
+                    menu_channels.addAction(action)
+            else:
+                action = QAction("No chat logs detected", self)
+                action.setEnabled(False)
+                menu_channels.addAction(action)
 
         menu.addSeparator()
 
@@ -1107,6 +1182,17 @@ class OverlayWindow(QMainWindow):
         """Update list of available fleets for context menu."""
         self.available_fleets = fleet_registry
         self.selected_fleet_id = selected_fleet_id
+
+    def update_channel_list(
+        self,
+        channel_registry: dict,
+        selected_channel_id: str | None,
+    ):
+        """Update arbitrary chat sources for the Any Chat picker."""
+        self.available_channels = channel_registry
+        self.selected_channel_id = selected_channel_id
+        if selected_channel_id:
+            self.config['channel_selection'] = selected_channel_id
 
     def clear_messages(self):
         """Clear all messages from the overlay."""

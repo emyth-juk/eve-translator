@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - DeepL quota refresh, Google local character estimates, and warnings when DeepL usage reaches 80%.
 - Opt-in provider fallback that contacts the second cloud provider only after primary failure and explicit consent.
 - Schema-v2 doctrine correction packs and constrained custom command types with safe categories and display labels.
+- A third Any Chat overlay for one selected Corp, Alliance, intel, or custom channel, with stable per-character selection and relog recovery.
 
 ### Changed
 - Original chat lines now reach the HUD before provider work and remain visible after translation.
@@ -55,6 +56,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Google network calls now have real connect/read timeouts, DeepL's outer deadline matches its bounded SDK retries, and provider status snapshots are atomic.
 - Internal translation `TypeError` failures no longer trigger duplicate calls or escape the scheduler.
 - All built-in combat phrases share one classifier, preventing short calls such as `regroup`, `star burst`, and `bubble up` from being misdetected and sent unnecessarily.
+- Generated English HyperNet offers, including punctuation-prefixed and link-artifact variants, no longer consume translation quota.
 
 ## [1.3] - 2026-06-29
 

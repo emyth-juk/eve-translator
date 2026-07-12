@@ -1,13 +1,14 @@
 # EVE Translator
 
-Real-time overlay translator for EVE Online fleet and local chat. Built for everyday EVE pilots with guided log and translation-provider setup.
+Real-time overlay translator for EVE Online Fleet, Local, and other logged chat channels. Built for everyday EVE pilots with guided log and translation-provider setup.
 
 <p align="center">
   <img src="src/assets/eve_translator_banner.png" width="900" alt="EVE Translator">
 </p>
 
 ## What It Does
-- Two overlays: one for Fleet, one for Local (toggle either on/off).
+- Three overlays: Fleet, Local, and Any Chat (toggle each independently).
+- Any Chat follows one selected Corp, Alliance, intel, or custom channel; it never merges duplicate logs from multiple characters.
 - Combat, Bilingual, and Mirror HUD modes with a compact readiness/provider header.
 - Exact command cards generated from the original line, with explicit FC/scout/starred roles.
 - Immediate originals while translation runs; translated lines always keep the original visible.
@@ -18,13 +19,13 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 - Explicit DeepL Free/Pro or Google provider selection; cloud translation is off until you choose one.
 - Auto-detects your active character log and updates Local automatically.
 - Always-on-top windows you can drag, resize, and right-click for quick actions.
-- Readiness states show whether Fleet and Local are off, waiting for a log, active, or in error.
+- Readiness states show whether Fleet, Local, and Any Chat are off, waiting for a log, active, or in error.
 
 ## Requirements
 - Windows PC running EVE Online.
 - Choose a provider in Settings. DeepL requires a Free or Pro API key; Google does not require a key.
 - Selecting Google or DeepL sends message text to that cloud provider. Translation remains disabled until you explicitly select one.
-- EVE client chat logging enabled (for Fleet/Local). In EVE: **Settings → Chat → Log Chat to File**.
+- EVE client chat logging enabled. In EVE: **Settings → Chat → Log Chat to File**.
 
 ### How to get a Free DeepL API Key
 1. Go to [https://www.deepl.com/pro-api](https://www.deepl.com/pro-api).
@@ -40,8 +41,8 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 3. Choose translation: open **Settings → Provider**, select Google or DeepL, and review the cloud-use notice.
 4. For DeepL, enter your API key and use **Test Provider** before saving.
 5. Point to your chat logs if needed: Settings → Log Directory (default is usually auto-detected).
-6. Use it in game: position the overlays, adjust opacity/font size, and right-click for options (Settings, Export Logs, Toggle Sessions).
-7. When positioned, use **Lock overlays** in the tray or **Ctrl+Shift+L** while EVE has focus to pass mouse input through both overlays.
+6. Use it in game: position the overlays, adjust opacity/font size, and right-click for options (Settings, Export Logs, Toggle Sessions, Switch Chat).
+7. When positioned, use **Lock overlays** in the tray or **Ctrl+Shift+L** while EVE has focus to pass mouse input through all overlays.
 8. Use **Compose translation** in the tray or **Ctrl+Shift+T** to translate an outgoing call, review it, and copy it manually into EVE.
 
 ## First-Time Setup Details
@@ -73,9 +74,9 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 ### Context Menu
 - **Right-Click** (release without dragging) to open the menu:
     - **Settings**: Configure API keys, colors, fonts, and opacity.
-    - **Toggle Chat**: Switch between Fleet and Local overlays.
+    - **Toggle Chat**: Enable or disable Fleet, Local, and Any Chat overlays.
     - **Export Recent History**: Save the overlay's latest 100 message states to a file.
-    - **Switch Character/Fleet**: Manually override auto-detection if needed.
+    - **Switch Character/Fleet/Chat**: Manually choose the Local character, Fleet, or arbitrary chat source.
     - **Display Mode**: Switch Combat, Bilingual, and Mirror instantly without retranslating history.
     - **Speaker Role**: Mark the latest speaker as FC, Scout, Starred, or remove the role.
     - **Improve Last Translation**: Save an exact local correction for the latest translated line.
@@ -87,13 +88,21 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 
 Speaker roles are exact, local mappings. The app never infers authority from a name containing “FC”, and doctrine imports cannot silently trust identities. Command cards are classified from the source text before cloud translation; unstarred commands are labelled **Unverified**.
 
+### Any Chat
+
+- Enable **Any Chat** from the tray. On first enable it chooses the newest currently open non-Fleet/non-Local log.
+- Choose a specific source from **Any Chat Source** in the tray or **Switch Chat** in the Any Chat overlay. Choices are shown as `Channel - Character`.
+- The selection survives relogs and follows only a newer log for that same channel and character. It does not jump to whichever channel receives the newest message.
+- EVE chat logs do not report which chat tab is currently visible, so switching the in-game tab does not automatically retarget the overlay.
+- Fleet and Local are excluded from Any Chat to prevent duplicate display and duplicate provider usage.
+
 ### System Tray Readiness
 - **Off**: the session is disabled.
-- **Waiting**: enabled and watching for EVE to create an active Fleet or Local log.
+- **Waiting**: enabled and watching for the selected EVE chat log to become active.
 - **Active**: the overlay is following a live chat log.
 - **Error**: the log or session could not be opened; hover the tray action for details.
 - Waiting sessions start automatically when their log appears. Settings is always available from the tray.
-- **Lock overlays** enables true click-through for both overlays. The global shortcut uses Windows `RegisterHotKey`, not a keyboard hook; the tray remains the recovery path if the shortcut is unavailable.
+- **Lock overlays** enables true click-through for all overlays. The global shortcut uses Windows `RegisterHotKey`, not a keyboard hook; the tray remains the recovery path if the shortcut is unavailable.
 - **Compose translation** opens a separate review-and-copy window. Its global shortcut also uses `RegisterHotKey`; no keystrokes or clipboard contents are injected into EVE.
 
 ### Features
