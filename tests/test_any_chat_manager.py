@@ -176,6 +176,122 @@ def test_manual_switch_updates_metadata_and_invalidates_old_source_path():
     manager._save_config.assert_called_once_with()
 
 
+def test_save_config_preserves_manager_source_identity_and_overlay_geometry():
+    manager = _manager()
+    manager._save_config = TranslatorManager._save_config.__get__(manager)
+    manager.config_store = MagicMock()
+    manager.config_store.save.return_value = True
+
+    authoritative = {
+        "fleet": {"fleet_id": "new-fleet"},
+        "local": {
+            "character_id": "new-character",
+            "character_name": "New Pilot",
+            "system_name": "Jita",
+        },
+        "any": {
+            "channel_selection": "new-channel",
+            "channel_id": "player_new",
+            "channel_name": "New Intel",
+            "character_id": "new-character",
+            "listener_name": "New Pilot",
+        },
+    }
+    stale = {
+        "fleet": {"fleet_id": "old-fleet"},
+        "local": {
+            "character_id": "old-character",
+            "character_name": "Old Pilot",
+            "system_name": "Amarr",
+        },
+        "any": {
+            "channel_selection": "old-channel",
+            "channel_id": "player_old",
+            "channel_name": "Old Intel",
+            "character_id": "old-character",
+            "listener_name": "Old Pilot",
+        },
+    }
+
+    for index, session_id in enumerate(("fleet", "local", "any"), start=1):
+        manager.config["sessions"][session_id].update(authoritative[session_id])
+        session = MagicMock()
+        session.get_config.return_value = {
+            **stale[session_id],
+            "x": 100 * index,
+            "y": 200 * index,
+            "display_mode": "bilingual",
+        }
+        manager.sessions[session_id] = session
+
+    assert manager._save_config() is True
+
+    for index, session_id in enumerate(("fleet", "local", "any"), start=1):
+        saved_session = manager.config["sessions"][session_id]
+        for key, value in authoritative[session_id].items():
+            assert saved_session[key] == value
+        assert saved_session["x"] == 100 * index
+        assert saved_session["y"] == 200 * index
+        assert saved_session["display_mode"] == "bilingual"
+
+    manager.config_store.save.assert_called_once_with(manager.config)
+
+
+def test_failed_any_start_preserves_error_state_and_detail():
+    manager = _manager()
+    channel = _channel("corp", path="C:/logs/corp.txt", name="Corp")
+    manager.channel_registry = {channel.selection_id: channel}
+
+    def fail_start(_session_id):
+        manager._set_session_runtime_state(
+            "any",
+            SessionRuntimeState.ERROR,
+            error="overlay construction failed",
+        )
+        return False
+
+    manager.start_session = MagicMock(side_effect=fail_start)
+
+    manager.switch_channel(channel.selection_id)
+
+    assert manager.sessions["any"] is None
+    assert manager._get_session_runtime_state("any") == SessionRuntimeState.ERROR
+    assert manager._session_runtime_errors["any"] == "overlay construction failed"
+    manager.start_session.assert_called_once_with("any")
+
+
+def test_unavailable_any_start_preserves_waiting_state():
+    manager = _manager()
+    channel = _channel("corp", path="C:/logs/corp.txt", name="Corp")
+    manager.channel_registry = {channel.selection_id: channel}
+    manager.start_session = MagicMock(return_value=False)
+
+    manager.switch_channel(channel.selection_id)
+
+    assert manager.sessions["any"] is None
+    assert manager._get_session_runtime_state("any") == SessionRuntimeState.WAITING
+    manager.start_session.assert_called_once_with("any")
+
+
+def test_successful_any_start_keeps_active_state():
+    manager = _manager()
+    channel = _channel("corp", path="C:/logs/corp.txt", name="Corp")
+    manager.channel_registry = {channel.selection_id: channel}
+
+    def successful_start(_session_id):
+        manager.sessions["any"] = MagicMock()
+        manager._set_session_runtime_state("any", SessionRuntimeState.ACTIVE)
+        return True
+
+    manager.start_session = MagicMock(side_effect=successful_start)
+
+    manager.switch_channel(channel.selection_id)
+
+    assert manager.sessions["any"] is not None
+    assert manager._get_session_runtime_state("any") == SessionRuntimeState.ACTIVE
+    manager.start_session.assert_called_once_with("any")
+
+
 def test_selecting_source_while_any_chat_is_off_only_persists_choice():
     manager = _manager(any_enabled=False)
     channel = _channel("alliance", path="C:/logs/alliance.txt")

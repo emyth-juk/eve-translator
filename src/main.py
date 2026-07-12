@@ -95,6 +95,17 @@ SESSION_LABELS = {
     'local': 'Local Chat',
     'any': 'Any Chat',
 }
+SESSION_SOURCE_IDENTITY_KEYS = {
+    'fleet': frozenset({'fleet_id'}),
+    'local': frozenset({'character_id', 'character_name', 'system_name'}),
+    'any': frozenset({
+        'channel_selection',
+        'channel_id',
+        'channel_name',
+        'character_id',
+        'listener_name',
+    }),
+}
 
 
 class SessionRuntimeState(str, Enum):
@@ -432,6 +443,15 @@ class TranslatorManager(QObject):
                 # Remove Shared Keys (handled by Shared config)
                 # 'enabled' MUST be allowed so it persists to JSON.
                 filtered_config = filter_session_config(current_overlay_config)
+                # Log-source identity is selected by the manager/scanners. An
+                # overlay holds a point-in-time copy, so merging those fields
+                # back after a character/fleet/channel switch can roll the
+                # authoritative selection back to stale metadata.
+                for key in SESSION_SOURCE_IDENTITY_KEYS.get(
+                    session_id,
+                    frozenset(),
+                ):
+                    filtered_config.pop(key, None)
                 
                 # Update with filtered config
                 self.config.setdefault('sessions', {}).setdefault(session_id, {})
@@ -1919,9 +1939,14 @@ class TranslatorManager(QObject):
                 selected = os.path.normcase(os.path.abspath(channel.log_path))
                 if current != selected:
                     session.switch_log(channel.log_path)
+                self._set_session_runtime_state(
+                    'any', SessionRuntimeState.ACTIVE
+                )
             else:
+                # start_session owns the resulting ACTIVE/WAITING/ERROR state.
+                # In particular, do not mask a constructor/log lookup failure
+                # as Active when no ChatSession was created.
                 self.start_session('any')
-            self._set_session_runtime_state('any', SessionRuntimeState.ACTIVE)
         elif enabled:
             if session:
                 self._disconnect_session_signals(session)
