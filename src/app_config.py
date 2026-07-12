@@ -318,6 +318,15 @@ def normalize_config(config: dict) -> dict:
             'background_color': '#001a33',
             'title_prefix': '[LOCAL]',
         },
+        'any': {
+            'enabled': False,
+            'x': 720,
+            'y': 100,
+            'w': 300,
+            'h': 200,
+            'background_color': '#21173d',
+            'title_prefix': '[ANY]',
+        },
     }
     for session_id, defaults in session_defaults.items():
         session = sessions.setdefault(session_id, {})
@@ -361,6 +370,15 @@ def normalize_config(config: dict) -> dict:
         session['command_cards'] = _config_bool(
             session.get('command_cards'), True
         )
+        if session_id == 'any':
+            for key in (
+                'channel_selection',
+                'channel_id',
+                'channel_name',
+                'character_id',
+                'listener_name',
+            ):
+                session[key] = _config_text(session.get(key), '').strip()
 
     return config
 
@@ -424,6 +442,23 @@ def get_default_config(legacy_overlay: Mapping[str, Any] | None = None) -> dict:
                 'display_mode': DISPLAY_MODE_MIRROR,
                 'compact_header': True,
                 'command_cards': True,
+            },
+            'any': {
+                'enabled': False,
+                'x': 720,
+                'y': 100,
+                'w': 300,
+                'h': 200,
+                'background_color': '#21173d',
+                'title_prefix': '[ANY]',
+                'display_mode': DISPLAY_MODE_MIRROR,
+                'compact_header': True,
+                'command_cards': True,
+                'channel_selection': '',
+                'channel_id': '',
+                'channel_name': '',
+                'character_id': '',
+                'listener_name': '',
             },
         },
     }

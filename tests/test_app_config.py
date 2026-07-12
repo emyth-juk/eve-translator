@@ -36,6 +36,7 @@ class TestConfigStore(unittest.TestCase):
         self.assertTrue(config['sessions']['local']['enabled'])
         self.assertEqual(config['shared']['translation_provider'], 'disabled')
         self.assertTrue(self.store.provider_selection_required)
+        self.assertFalse(config['sessions']['any']['enabled'])
 
     def test_new_config_disables_cloud_translation(self):
         config = get_default_config()
@@ -48,6 +49,9 @@ class TestConfigStore(unittest.TestCase):
         self.assertNotIn('interaction_locked', config['shared'])
         self.assertEqual(config['shared']['global_hotkey'], 'Ctrl+Shift+L')
         self.assertEqual(config['shared']['compose_hotkey'], 'Ctrl+Shift+T')
+        self.assertFalse(config['sessions']['any']['enabled'])
+        self.assertEqual(config['sessions']['any']['channel_selection'], '')
+        self.assertEqual(config['sessions']['any']['title_prefix'], '[ANY]')
 
     def test_disabled_provider_clears_fallback_consent(self):
         config = get_default_config()
@@ -267,6 +271,12 @@ class TestConfigStore(unittest.TestCase):
                 },
                 'sessions': {
                     'fleet': {'w': 'bad', 'h': 20, 'enabled': 'true'},
+                    'any': {
+                        'enabled': 'false',
+                        'channel_selection': 123,
+                        'channel_name': ['bad'],
+                        'listener_name': None,
+                    },
                 },
             }, config_file)
 
@@ -281,6 +291,10 @@ class TestConfigStore(unittest.TestCase):
         self.assertEqual(config['sessions']['fleet']['w'], 300)
         self.assertEqual(config['sessions']['fleet']['h'], 120)
         self.assertTrue(config['sessions']['fleet']['enabled'])
+        self.assertFalse(config['sessions']['any']['enabled'])
+        self.assertEqual(config['sessions']['any']['channel_selection'], '')
+        self.assertEqual(config['sessions']['any']['channel_name'], '')
+        self.assertEqual(config['sessions']['any']['listener_name'], '')
 
     def test_save_writes_primary_path_and_filters_shared_session_keys(self):
         saved_ok = self.store.save({

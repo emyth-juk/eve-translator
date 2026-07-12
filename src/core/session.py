@@ -9,7 +9,7 @@ LOG_WATCH_DEBOUNCE_MS = 100
 
 class ChatSession(QObject):
     """
-    Encapsulates a single chat session (Fleet or Local).
+    Encapsulates one Fleet, Local, or arbitrary EVE chat session.
     Manages tailer, overlay, and polling lifecycle.
     """
 
@@ -35,7 +35,7 @@ class ChatSession(QObject):
         Initialize chat session.
 
         Args:
-            session_id: Unique ID ('fleet' or 'local')
+            session_id: Unique ID ('fleet', 'local', or 'any')
             log_path: Path to log file to tail
             overlay_config: Session-specific overlay configuration
             parent: Parent QObject
@@ -148,19 +148,16 @@ class ChatSession(QObject):
         logger.info(f"[{self.session_id}] Session stopped")
 
     def switch_fleet_log(self, new_log_path: str, listener_name: str):
-        """
-        Switch to a different fleet log file.
-        Used when user selects a different active fleet.
+        """Compatibility wrapper for existing Fleet callers."""
+        self.switch_log(new_log_path)
 
-        Args:
-            new_log_path: Path to the new fleet log file
-            listener_name: Character name for the new fleet
-        """
+    def switch_log(self, new_log_path: str):
+        """Switch this session to another concrete EVE chat log source."""
         if not self.is_running:
             logger.warning(f"[{self.session_id}] Cannot switch log - session not running")
             return
 
-        logger.info(f"[{self.session_id}] Switching to new fleet log: {new_log_path}")
+        logger.info(f"[{self.session_id}] Switching to new chat log: {new_log_path}")
         # Invalidate any provider result still in flight for the previous log.
         self.source_id = uuid.uuid4().hex
 
@@ -209,7 +206,7 @@ class ChatSession(QObject):
         self._start_log_watcher()
         self.poll_timer.start(self._poll_interval_ms())
 
-        logger.info(f"[{self.session_id}] Fleet log switch complete")
+        logger.info(f"[{self.session_id}] Chat log switch complete")
 
     def _configured_poll_interval_ms(self):
         interval = self.config.get('polling_interval', 1.0)
