@@ -65,6 +65,10 @@ class ProviderCallTimeout(TimeoutError):
     """Raised when a provider call exceeds the app's responsiveness budget."""
 
 
+class ProviderCallCancelled(ProviderCallTimeout):
+    """Raised when shutdown stops waiting for an in-flight provider call."""
+
+
 @dataclass
 class _OrphanedCall:
     thread: threading.Thread
@@ -98,6 +102,11 @@ class _BoundedCallRunner:
         self._state_lock = threading.Lock()
         self._active_thread = None
         self._timed_out = False
+        self._cancel_requested = threading.Event()
+
+    def request_cancel(self) -> None:
+        """Stop the owner thread waiting while its daemon request winds down."""
+        self._cancel_requested.set()
 
     @classmethod
     def _scope_orphan_state(
@@ -198,6 +207,9 @@ class _BoundedCallRunner:
         errors = []
         finished = threading.Event()
 
+        if self._cancel_requested.is_set():
+            raise ProviderCallCancelled("Provider shutdown was requested")
+
         def invoke():
             try:
                 result.append(callback())
@@ -225,9 +237,18 @@ class _BoundedCallRunner:
             )
             self._active_thread.start()
 
-        if not finished.wait(self.timeout_seconds):
-            self._mark_timed_out()
-            raise ProviderCallTimeout("The provider request exceeded its deadline")
+        deadline = time.monotonic() + max(0.0, float(self.timeout_seconds))
+        while not finished.is_set():
+            if self._cancel_requested.is_set():
+                self._mark_timed_out()
+                raise ProviderCallCancelled("Provider shutdown was requested")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self._mark_timed_out()
+                raise ProviderCallTimeout(
+                    "The provider request exceeded its deadline"
+                )
+            finished.wait(min(0.05, remaining))
         if errors:
             raise errors[0]
         return result[0] if result else None
@@ -261,6 +282,10 @@ class TranslationProvider(ABC):
         """Return a safe provider-specific usage snapshot without message data."""
 
         return {'available': False}
+
+    def request_cancel(self) -> None:
+        """Thread-safe shutdown hook for providers with bounded call runners."""
+        return
 
     @abstractmethod
     def translate(
@@ -384,6 +409,9 @@ class GoogleTransProvider(TranslationProvider):
         # batch and therefore must not be advertised as one.
         return False
 
+    def request_cancel(self) -> None:
+        self._call_runner.request_cancel()
+
     def translate(
         self,
         text: str,
@@ -477,6 +505,10 @@ class DeepLProvider(TranslationProvider):
     @property
     def supports_context(self) -> bool:
         return True
+
+    def request_cancel(self) -> None:
+        self._call_runner.request_cancel()
+        self._usage_call_runner.request_cancel()
 
     @classmethod
     def _translation_args(
@@ -780,6 +812,19 @@ class TranslationService:
     def set_entity_index(self, entity_index: Any) -> None:
         self.entity_index = entity_index
         self._clear_translation_cache()
+
+    def request_cancel_pending(self) -> None:
+        """Thread-safely stop waiting for primary and fallback requests."""
+        with self._provider_lock:
+            providers = (self.provider, self._fallback_provider)
+        seen: set[int] = set()
+        for provider in providers:
+            if provider is None or id(provider) in seen:
+                continue
+            seen.add(id(provider))
+            request_cancel = getattr(provider, 'request_cancel', None)
+            if callable(request_cancel):
+                request_cancel()
 
     def set_doctrine_manager(self, doctrine_manager: Any) -> None:
         self.doctrine_manager = doctrine_manager

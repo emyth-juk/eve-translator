@@ -313,6 +313,41 @@ def test_unavailable_any_start_preserves_waiting_state():
     manager.start_session.assert_called_once_with("any")
 
 
+def test_selecting_inactive_source_captures_live_any_geometry():
+    manager = _manager()
+    channel = _channel(
+        "corp",
+        path="C:/logs/corp.txt",
+        name="Corp",
+        active=False,
+    )
+    manager.channel_registry = {channel.selection_id: channel}
+    session = MagicMock()
+    session.get_config.return_value = {
+        "x": 432,
+        "y": 234,
+        "w": 640,
+        "h": 180,
+        "channel_selection": "stale-source",
+    }
+    manager.sessions["any"] = session
+    manager._disconnect_session_signals = MagicMock()
+
+    manager.switch_channel(channel.selection_id)
+
+    saved = manager.config["sessions"]["any"]
+    assert {key: saved[key] for key in ("x", "y", "w", "h")} == {
+        "x": 432,
+        "y": 234,
+        "w": 640,
+        "h": 180,
+    }
+    assert saved["channel_selection"] == channel.selection_id
+    assert manager.sessions["any"] is None
+    session.stop.assert_called_once_with()
+    manager._disconnect_session_signals.assert_called_once_with(session)
+
+
 def test_successful_any_start_keeps_active_state():
     manager = _manager()
     channel = _channel("corp", path="C:/logs/corp.txt", name="Corp")

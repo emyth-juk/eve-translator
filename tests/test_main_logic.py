@@ -301,6 +301,35 @@ class TestSessionRuntimeState(unittest.TestCase):
         mgr._save_config.assert_called_once_with()
         self.assertIn('Off', mgr.fleet_action.setText.call_args.args[0])
 
+    def test_toggling_live_session_captures_geometry_before_clearing_it(self):
+        mgr = self._make_manager(fleet_enabled=True)
+        mgr.config['sessions']['fleet']['fleet_id'] = 'current-fleet'
+        session = MagicMock()
+        session.get_config.return_value = {
+            'enabled': True,
+            'x': 321,
+            'y': 654,
+            'w': 777,
+            'h': 222,
+            'opacity': 0.25,
+            'fleet_id': 'stale-fleet',
+        }
+        mgr.sessions['fleet'] = session
+        mgr._disconnect_session_signals = MagicMock()
+
+        mgr.toggle_session('fleet')
+
+        saved = mgr.config['sessions']['fleet']
+        self.assertEqual(
+            {key: saved[key] for key in ('x', 'y', 'w', 'h')},
+            {'x': 321, 'y': 654, 'w': 777, 'h': 222},
+        )
+        self.assertEqual(saved['fleet_id'], 'current-fleet')
+        self.assertNotIn('opacity', saved)
+        self.assertFalse(saved['enabled'])
+        mgr._disconnect_session_signals.assert_called_once_with(session)
+        session.stop.assert_called_once_with()
+
     def test_periodic_scan_recovers_waiting_session_when_log_appears(self):
         from src.main import SessionRuntimeState
 
@@ -519,12 +548,22 @@ class TestSessionRuntimeState(unittest.TestCase):
         mgr.discovery_thread.wait.return_value = True
         mgr.thread = MagicMock()
         mgr.thread.wait.return_value = True
-        mgr.translation_scheduler = None
+        mgr.translation_scheduler = MagicMock()
         mgr.translation_thread = MagicMock()
         mgr.translation_thread.isRunning.return_value = False
         mgr.translation_thread.wait.return_value = True
         mgr.translation_memory = MagicMock()
         mgr.app = MagicMock()
+        session = MagicMock()
+        session.get_config.return_value = {
+            'enabled': True,
+            'x': 111,
+            'y': 222,
+            'w': 444,
+            'h': 333,
+        }
+        mgr.sessions['fleet'] = session
+        mgr._disconnect_session_signals = MagicMock()
 
         mgr.shutdown()
 
@@ -541,6 +580,10 @@ class TestSessionRuntimeState(unittest.TestCase):
         )
         mgr.thread.quit.assert_called_once_with()
         mgr.translation_thread.quit.assert_called_once_with()
+        mgr.translation_scheduler.request_stop.assert_called_once_with()
+        session.stop.assert_called_once_with()
+        self.assertEqual(mgr.config['sessions']['fleet']['w'], 444)
+        self.assertEqual(mgr.config['sessions']['fleet']['h'], 333)
         mgr.app.quit.assert_called_once_with()
 
     def test_shutdown_forces_discovery_after_its_short_deadline(self):

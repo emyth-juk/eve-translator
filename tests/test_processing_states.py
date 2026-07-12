@@ -578,6 +578,17 @@ def test_scheduler_publishes_provider_status_only_after_latest_config_applies():
     assert emitted == [service.get_provider_status.return_value]
 
 
+def test_scheduler_request_stop_cancels_provider_waits_thread_safely():
+    service = MagicMock()
+    service.entity_index = None
+    scheduler = TranslationScheduler(service)
+
+    scheduler.request_stop()
+
+    assert scheduler._stopping is True
+    service.request_cancel_pending.assert_called_once_with()
+
+
 def test_scheduler_detects_auto_source_for_outbound_eve_aware_translation():
     service = MagicMock()
     service.entity_index = None

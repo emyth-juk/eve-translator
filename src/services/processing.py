@@ -584,6 +584,8 @@ class TranslationScheduler(QObject):
     ) -> None:
         """Translate manual outbound text without automating EVE input."""
 
+        if self._stopping:
+            return
         if self._config_update_pending():
             self.compose_translation_failed.emit(
                 request_id,
@@ -627,6 +629,8 @@ class TranslationScheduler(QObject):
         except Exception as exc:
             logger.error("Unexpected outbound translation failure: %s", type(exc).__name__)
             translated, success, provider = message, False, "Translation provider"
+        if self._stopping:
+            return
         if self._config_update_pending():
             self.compose_translation_failed.emit(
                 request_id,
@@ -729,7 +733,7 @@ class TranslationScheduler(QObject):
 
     @Slot(object)
     def queue_job(self, job) -> None:
-        if not isinstance(job, TranslationJob):
+        if self._stopping or not isinstance(job, TranslationJob):
             return
         generation_state = self._config_gate.snapshot()
         if generation_state.pending or job.config_generation > generation_state.applied:
@@ -813,7 +817,7 @@ class TranslationScheduler(QObject):
             history.popleft()
 
     def _translate_jobs(self, jobs: list[TranslationJob]) -> None:
-        if not jobs:
+        if self._stopping or not jobs:
             return
         if self._config_update_pending():
             self._deferred_jobs.extend(jobs)
@@ -845,6 +849,9 @@ class TranslationScheduler(QObject):
             logger.error("Unexpected scheduled translation failure: %s", type(exc).__name__)
             provider = getattr(self.translator_service, 'provider_name', '')
             results = [(job.source_text, False, provider) for job in jobs]
+
+        if self._stopping:
+            return
 
         if not isinstance(results, (list, tuple)) or len(results) != len(jobs):
             logger.error("Provider batch returned an invalid result count")
@@ -891,9 +898,20 @@ class TranslationScheduler(QObject):
 
     @Slot()
     def stop(self) -> None:
-        with self._usage_refresh_lock:
-            self._stopping = True
+        self.request_stop()
         self._flush_timer.stop()
         self._jobs.clear()
         self._deferred_jobs.clear()
         self._context.clear()
+
+    def request_stop(self) -> None:
+        """Thread-safely stop waiting for in-flight provider work."""
+        with self._usage_refresh_lock:
+            self._stopping = True
+        request_cancel = getattr(
+            self.translator_service,
+            'request_cancel_pending',
+            None,
+        )
+        if callable(request_cancel):
+            request_cancel()

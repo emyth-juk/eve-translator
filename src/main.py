@@ -205,6 +205,16 @@ class TranslatorManager(QObject):
         # Configuration
         self.config_store = ConfigStore()
         self.config = self._load_config()
+        # Log-folder setup is modal and may be cancelled. Complete it before
+        # constructing any QThread-backed workers so a first-run exit cannot
+        # leave live threads behind during interpreter teardown.
+        self.sessions = {}
+        self.startup_cancelled = False
+        self._shutting_down = False
+        if not self._ensure_log_directory():
+            self.startup_cancelled = True
+            self._shutting_down = True
+            return
         # Interaction lock is deliberately runtime-only so a stale config can
         # never relaunch an unrecoverable click-through overlay.
         self.overlay_locked = False
@@ -213,7 +223,6 @@ class TranslatorManager(QObject):
         self.compose_dialog = None
         self.settings_dialog = None
         self._provider_status_snapshot = {}
-        self._shutting_down = False
         self.app.aboutToQuit.connect(self.shutdown)
 
         # Shared Processing Components
@@ -293,7 +302,6 @@ class TranslatorManager(QObject):
         self.translation_thread.start()
 
         # Sessions
-        self.sessions = {}
         self._session_runtime_states = {
             session_id: (
                 SessionRuntimeState.WAITING
@@ -330,8 +338,6 @@ class TranslatorManager(QObject):
         # System Tray
         self._setup_system_tray()
 
-        # Validate Log Directory FIRST (before initializing sessions)
-        self._ensure_log_directory()
         self._configure_log_directory_watcher()
         # Queue discovery only after first-run folder selection finalizes the
         # path. Enabled sessions begin truthfully in Waiting and recover as soon
@@ -677,18 +683,18 @@ class TranslatorManager(QObject):
         shared = config.get('shared', {})
         return tuple(shared.get(key) for key in sorted(SCANNER_CONFIG_KEYS))
 
-    def _ensure_log_directory(self):
-        """Check if log dir is valid, if not, ask user."""
+    def _ensure_log_directory(self) -> bool:
+        """Return whether a valid log directory was selected."""
         current_path = self.config['shared'].get('log_dir', '')
         
         # Try default if empty
         if not current_path:
             default_path = os.path.expanduser("~/Documents/EVE/logs/Chatlogs")
-            if os.path.exists(default_path):
+            if os.path.isdir(default_path):
                 current_path = default_path
         
         # Validate existence
-        if not current_path or not os.path.exists(current_path):
+        if not current_path or not os.path.isdir(current_path):
             from PySide6.QtWidgets import QFileDialog, QMessageBox
             
             # Show message
@@ -708,7 +714,7 @@ class TranslatorManager(QObject):
                     # Cancelled?
                     ret = QMessageBox.question(None, "Exit?", "Log folder is required. Exit application?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
                     if ret == QMessageBox.StandardButton.Yes:
-                        sys.exit(0)
+                        return False
                         
         # Save validated path
         self.config['shared']['log_dir'] = current_path
@@ -716,6 +722,7 @@ class TranslatorManager(QObject):
         if hasattr(self, 'log_dir_watcher'):
             self._configure_log_directory_watcher()
         logger.info(f"Using Log Directory: {current_path}")
+        return True
 
     def _load_config(self) -> dict:
         config_store = getattr(self, 'config_store', ConfigStore())
@@ -724,26 +731,7 @@ class TranslatorManager(QObject):
     def _save_config(self):
         # Update session configs
         for session_id, session in self.sessions.items():
-            if session:
-                current_overlay_config = session.get_config()
-                # Only update session-specific properties.
-                # Remove Shared Keys (handled by Shared config)
-                # 'enabled' MUST be allowed so it persists to JSON.
-                filtered_config = filter_session_config(current_overlay_config)
-                # Log-source identity is selected by the manager/scanners. An
-                # overlay holds a point-in-time copy, so merging those fields
-                # back after a character/fleet/channel switch can roll the
-                # authoritative selection back to stale metadata.
-                spec = SESSION_SPECS_BY_ID.get(session_id)
-                identity_keys = (
-                    spec.source_identity_keys if spec is not None else ()
-                )
-                for key in identity_keys:
-                    filtered_config.pop(key, None)
-
-                # Update with filtered config
-                self.config.setdefault('sessions', {}).setdefault(session_id, {})
-                self.config['sessions'][session_id].update(filtered_config)
+            self._capture_session_config(session_id, session)
 
         remove_shared_keys_from_sessions(self.config)
         config_store = getattr(self, 'config_store', ConfigStore())
@@ -779,6 +767,19 @@ class TranslatorManager(QObject):
                 )
             return False
         return True
+
+    def _capture_session_config(self, session_id: str, session) -> None:
+        """Copy live overlay geometry without restoring stale source identity."""
+        if not session:
+            return
+        current_overlay_config = session.get_config()
+        filtered_config = filter_session_config(current_overlay_config)
+        spec = SESSION_SPECS_BY_ID.get(session_id)
+        identity_keys = spec.source_identity_keys if spec is not None else ()
+        for key in identity_keys:
+            filtered_config.pop(key, None)
+        self.config.setdefault('sessions', {}).setdefault(session_id, {})
+        self.config['sessions'][session_id].update(filtered_config)
 
     def _setup_system_tray(self):
         self.tray_icon = QSystemTrayIcon(self.app)
@@ -1368,6 +1369,9 @@ class TranslatorManager(QObject):
     def stop_session(self, session_id):
         session = self.sessions.get(session_id)
         if session:
+            # Capture geometry before disconnecting close/save signals and
+            # clearing the manager's last reference to this session.
+            self._capture_session_config(session_id, session)
             self._disconnect_session_signals(session)
             session.stop()
 
@@ -2299,6 +2303,7 @@ class TranslatorManager(QObject):
                 self.start_session('any')
         elif enabled:
             if session:
+                self._capture_session_config('any', session)
                 self._disconnect_session_signals(session)
                 session.stop()
                 self.sessions['any'] = None
@@ -2395,6 +2400,7 @@ class TranslatorManager(QObject):
         for sid in list(self.sessions.keys()):
             session = self.sessions.get(sid)
             if session:
+                self._capture_session_config(sid, session)
                 # Disconnect all signals to prevent memory leaks
                 self._disconnect_session_signals(session)
 
@@ -2433,6 +2439,11 @@ class TranslatorManager(QObject):
         scheduler = getattr(self, 'translation_scheduler', None)
         translation_thread = getattr(self, 'translation_thread', None)
         if translation_thread is not None:
+            if scheduler is not None:
+                # This method only flips thread-safe events/locks. Call it
+                # directly so an executing provider slot stops waiting before
+                # the queued Qt stop slot can run.
+                scheduler.request_stop()
             if scheduler is not None and translation_thread.isRunning():
                 QMetaObject.invokeMethod(
                     scheduler,
@@ -2479,6 +2490,8 @@ def run_application(
     manager = None
     try:
         manager = manager_factory()
+        if getattr(manager, 'startup_cancelled', False) is True:
+            return 0
         return int(manager.app.exec())
     finally:
         if manager is not None and not getattr(

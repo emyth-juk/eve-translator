@@ -11,7 +11,9 @@ from src.services.translator import (
     GOOGLE_READ_TIMEOUT_SECONDS,
     DeepLProvider,
     GoogleTransProvider,
+    ProviderCallCancelled,
     ProviderCallTimeout,
+    TranslationService,
     _BoundedCallRunner,
 )
 
@@ -235,6 +237,53 @@ class TestTranslatorErrors(unittest.TestCase):
         finally:
             first_release.set()
             second_release.set()
+
+    def test_shutdown_cancel_stops_waiting_for_inflight_provider(self):
+        request_started = threading.Event()
+        release_request = threading.Event()
+        runner = _BoundedCallRunner(
+            f"provider-cancel-{id(release_request)}",
+            timeout_seconds=90,
+        )
+        observed = []
+
+        def blocked_request():
+            request_started.set()
+            release_request.wait()
+            return "late"
+
+        def invoke_runner():
+            try:
+                runner.run(blocked_request)
+            except Exception as exc:
+                observed.append(exc)
+
+        owner = threading.Thread(target=invoke_runner)
+        owner.start()
+        self.assertTrue(request_started.wait(0.5))
+
+        started = time.monotonic()
+        runner.request_cancel()
+        owner.join(0.5)
+
+        self.assertFalse(owner.is_alive())
+        self.assertLess(time.monotonic() - started, 0.5)
+        self.assertEqual(len(observed), 1)
+        self.assertIsInstance(observed[0], ProviderCallCancelled)
+        release_request.set()
+
+    def test_translation_service_cancels_primary_and_fallback_once(self):
+        primary = MagicMock()
+        primary.name = "Primary"
+        fallback = MagicMock()
+        fallback.name = "Fallback"
+        service = TranslationService(provider=primary)
+        service._fallback_provider = fallback
+
+        service.request_cancel_pending()
+
+        primary.request_cancel.assert_called_once_with()
+        fallback.request_cancel.assert_called_once_with()
 
 if __name__ == '__main__':
     unittest.main()
