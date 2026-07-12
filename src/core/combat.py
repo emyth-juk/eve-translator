@@ -54,6 +54,7 @@ class CommandMatch:
     category: str
     argument: str = ""
     source_clause: str = ""
+    display_label: str = ""
 
 
 def normalize_speaker_name(name: str) -> str:
@@ -87,14 +88,23 @@ def speaker_role(name: str, roles: object) -> str:
     return normalize_speaker_roles(roles).get(normalize_speaker_name(name), "")
 
 
-def command_is_trusted(role: str, command_code: str) -> bool:
+def command_is_trusted(
+    role: str,
+    command_code: str,
+    command_category: str = "",
+) -> bool:
     """FC calls are trusted; scouts may only create non-execution intel cards."""
 
     normalized_role = (role or "").strip().lower()
     if normalized_role == ROLE_FC:
         return True
     if normalized_role == ROLE_SCOUT:
-        return command_code not in EXECUTION_COMMANDS
+        code = (command_code or "").strip().upper()
+        if code in COMMAND_CATEGORY:
+            return code not in EXECUTION_COMMANDS
+        # A custom code has no built-in safety classification. Only the
+        # doctrine schema's constrained INTEL category is non-execution.
+        return (command_category or "").strip().upper() == "INTEL"
     return False
 
 
@@ -197,11 +207,22 @@ def classify_commands(
         if not matched and doctrine_pack is not None:
             lookup = getattr(doctrine_pack, 'command_for_phrase', None)
             code = lookup(clause) if callable(lookup) else None
-            if code in COMMAND_CATEGORY:
+            category_for = getattr(doctrine_pack, 'command_category', None)
+            category = (
+                category_for(code)
+                if code and callable(category_for)
+                else COMMAND_CATEGORY.get(code)
+            )
+            if code and category:
+                label_for = getattr(doctrine_pack, 'command_label', None)
+                display_label = (
+                    label_for(code) if callable(label_for) else str(code)
+                )
                 matches.append(CommandMatch(
                     code=code,
-                    category=COMMAND_CATEGORY[code],
+                    category=category,
                     source_clause=clause,
+                    display_label=display_label,
                 ))
         if len(matches) >= max_commands:
             break

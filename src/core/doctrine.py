@@ -1,19 +1,20 @@
 """Safe import and loading for local doctrine translation packs.
 
 Doctrine packs are deliberately data-only.  A pack is a flat directory or ZIP
-containing exactly these files::
+containing these four base files::
 
     manifest.yml
     terms.yml
     protected_entities.yml
     commands.yml
 
-``manifest.yml`` identifies schema version 1, ``terms.yml`` maps normalized
+``manifest.yml`` identifies schema version 1 or 2, ``terms.yml`` maps normalized
 ``source_target`` language pairs to exact term translations,
 ``protected_entities.yml`` lists names that must survive translation, and
-``commands.yml`` maps existing combat command codes to literal phrases.  Packs
-cannot nominate trusted speakers and command phrases are never interpreted as
-regular expressions.
+``commands.yml`` maps combat command codes to literal phrases. Schema v2 may
+also contain ``corrections.yml`` and constrained custom command definitions.
+Packs cannot nominate trusted speakers and command phrases are never
+interpreted as regular expressions.
 """
 
 from __future__ import annotations
@@ -35,16 +36,23 @@ from typing import Any
 import yaml
 
 from src.core.combat import COMMAND_CATEGORY
+from src.core.languages import normalize_locale
+from src.core.translation_memory import (
+    CorrectionEntry,
+    normalize_correction_text,
+)
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+SUPPORTED_SCHEMA_VERSIONS = frozenset({1, SCHEMA_VERSION})
 REQUIRED_FILES = frozenset({
     "manifest.yml",
     "terms.yml",
     "protected_entities.yml",
     "commands.yml",
 })
-ALLOWED_FILES = REQUIRED_FILES
+OPTIONAL_FILES = frozenset({"corrections.yml"})
+ALLOWED_FILES = REQUIRED_FILES | OPTIONAL_FILES
 
 MAX_FILES = 8
 MAX_FILE_BYTES = 1024 * 1024
@@ -52,14 +60,27 @@ MAX_TOTAL_BYTES = 3 * 1024 * 1024
 MAX_TERMS = 5_000
 MAX_PROTECTED_ENTITIES = 10_000
 MAX_COMMAND_PHRASES = 500
+MAX_CORRECTIONS = 5_000
+MAX_CUSTOM_COMMANDS = 100
+
+CUSTOM_COMMAND_CATEGORIES = frozenset({
+    "HOLD",
+    "MOVE",
+    "TARGET",
+    "TACKLE",
+    "SUPPORT",
+    "INTEL",
+})
+CORRECTION_SCOPES = frozenset({"global", "pack"})
 
 _PACK_ID = re.compile(r"^[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?$")
 _VERSION = re.compile(r"^[0-9A-Za-z](?:[0-9A-Za-z._+-]{0,62}[0-9A-Za-z])?$")
 _LANGUAGE = re.compile(r"^[a-z]{2,8}(?:-[a-z0-9]{1,8})*$")
+_CUSTOM_COMMAND_CODE = re.compile(r"^[A-Z][A-Z0-9_]{1,39}$")
 
 
 class DoctrinePackError(ValueError):
-    """Raised when a doctrine pack is unsafe or does not match schema v1."""
+    """Raised when a doctrine pack is unsafe or uses an unsupported schema."""
 
 
 class _StrictSafeLoader(yaml.SafeLoader):
@@ -114,10 +135,7 @@ _StrictSafeLoader.add_constructor(
 def normalize_language_code(language: str) -> str:
     """Normalize a BCP-47-like language code without applying fallbacks."""
 
-    if not isinstance(language, str):
-        return ""
-    normalized = unicodedata.normalize("NFKC", language).strip().casefold()
-    normalized = normalized.replace("_", "-")
+    normalized = normalize_locale(language)
     return normalized if _LANGUAGE.fullmatch(normalized) else ""
 
 
@@ -356,7 +374,7 @@ def _content_digest(files: Mapping[str, bytes]) -> str:
     return digest.hexdigest()
 
 
-def _parse_manifest(value: object) -> tuple[str, str, str, str]:
+def _parse_manifest(value: object) -> tuple[int, str, str, str, str]:
     manifest = _require_mapping(value, "manifest.yml")
     _require_exact_keys(
         manifest,
@@ -364,8 +382,13 @@ def _parse_manifest(value: object) -> tuple[str, str, str, str]:
         required={"schema_version", "id", "name", "version"},
         optional={"description"},
     )
-    if type(manifest["schema_version"]) is not int or manifest["schema_version"] != SCHEMA_VERSION:
-        raise DoctrinePackError(f"unsupported doctrine schema; expected {SCHEMA_VERSION}")
+    schema_version = manifest["schema_version"]
+    if (
+        type(schema_version) is not int
+        or schema_version not in SUPPORTED_SCHEMA_VERSIONS
+    ):
+        supported = ", ".join(str(item) for item in sorted(SUPPORTED_SCHEMA_VERSIONS))
+        raise DoctrinePackError(f"unsupported doctrine schema; expected one of {supported}")
     pack_id = _bounded_string(manifest["id"], "manifest id", 64)
     if not _PACK_ID.fullmatch(pack_id):
         raise DoctrinePackError("manifest id must be a lowercase filesystem-safe slug")
@@ -379,7 +402,7 @@ def _parse_manifest(value: object) -> tuple[str, str, str, str]:
         500,
         allow_empty=True,
     )
-    return pack_id, name, version, description
+    return schema_version, pack_id, name, version, description
 
 
 def _parse_terms(value: object) -> Mapping[str, Mapping[str, str]]:
@@ -432,27 +455,43 @@ def _parse_protected_entities(value: object) -> tuple[str, ...]:
     return tuple(entities)
 
 
-def _parse_commands(value: object) -> Mapping[str, tuple[str, ...]]:
+@dataclass(frozen=True)
+class DoctrineCommandDefinition:
+    """A pack-defined command type constrained to a safe display taxonomy."""
+
+    code: str
+    category: str
+    display_label: str
+    phrases: tuple[str, ...]
+
+
+def _parse_commands(
+    value: object,
+    schema_version: int,
+) -> tuple[
+    Mapping[str, tuple[str, ...]],
+    Mapping[str, DoctrineCommandDefinition],
+]:
     document = _require_mapping(value, "commands.yml")
-    _require_exact_keys(document, "commands.yml", required={"commands"})
+    _require_exact_keys(
+        document,
+        "commands.yml",
+        required={"commands"},
+        optional={"custom_commands"} if schema_version >= 2 else frozenset(),
+    )
     raw_commands = _require_mapping(document["commands"], "commands.yml commands")
     commands: dict[str, tuple[str, ...]] = {}
+    definitions: dict[str, DoctrineCommandDefinition] = {}
     seen_codes: set[str] = set()
     seen_phrases: dict[str, str] = {}
     count = 0
-    for raw_code, raw_phrases in raw_commands.items():
-        if not isinstance(raw_code, str):
-            raise DoctrinePackError("command codes must be strings")
-        code = raw_code.strip().upper()
-        if code not in COMMAND_CATEGORY:
-            raise DoctrinePackError(f"unknown combat command code: {raw_code}")
-        if code in seen_codes:
-            raise DoctrinePackError(f"duplicate normalized command code: {code}")
-        seen_codes.add(code)
-        if not isinstance(raw_phrases, list):
+
+    def parse_phrases(code: str, value: object) -> tuple[str, ...]:
+        nonlocal count
+        if not isinstance(value, list):
             raise DoctrinePackError(f"command {code} phrases must be a list")
         phrases: list[str] = []
-        for raw_phrase in raw_phrases:
+        for raw_phrase in value:
             phrase = _bounded_string(raw_phrase, f"{code} command phrase", 160)
             normalized_phrase = phrase.casefold()
             previous = seen_phrases.get(normalized_phrase)
@@ -467,14 +506,152 @@ def _parse_commands(value: object) -> Mapping[str, tuple[str, ...]]:
                 raise DoctrinePackError(
                     f"doctrine pack exceeds {MAX_COMMAND_PHRASES} command phrases"
                 )
-        commands[code] = tuple(phrases)
-    return MappingProxyType(commands)
+        return tuple(phrases)
+
+    for raw_code, raw_phrases in raw_commands.items():
+        if not isinstance(raw_code, str):
+            raise DoctrinePackError("command codes must be strings")
+        code = raw_code.strip().upper()
+        if code not in COMMAND_CATEGORY:
+            raise DoctrinePackError(f"unknown combat command code: {raw_code}")
+        if code in seen_codes:
+            raise DoctrinePackError(f"duplicate normalized command code: {code}")
+        seen_codes.add(code)
+        commands[code] = parse_phrases(code, raw_phrases)
+
+    raw_custom_commands = document.get("custom_commands", {})
+    custom_commands = _require_mapping(
+        raw_custom_commands,
+        "commands.yml custom_commands",
+    )
+    if len(custom_commands) > MAX_CUSTOM_COMMANDS:
+        raise DoctrinePackError(
+            f"doctrine pack exceeds {MAX_CUSTOM_COMMANDS} custom commands"
+        )
+    for raw_code, raw_definition in custom_commands.items():
+        if not isinstance(raw_code, str):
+            raise DoctrinePackError("custom command codes must be strings")
+        code = raw_code.strip().upper()
+        if not _CUSTOM_COMMAND_CODE.fullmatch(code):
+            raise DoctrinePackError(
+                f"custom command code must use 2-40 uppercase letters, digits, or underscores: {raw_code}"
+            )
+        if code in COMMAND_CATEGORY:
+            raise DoctrinePackError(f"custom command code collides with built-in code: {code}")
+        if code in seen_codes:
+            raise DoctrinePackError(f"duplicate normalized command code: {code}")
+        seen_codes.add(code)
+        definition = _require_mapping(
+            raw_definition,
+            f"custom command {code}",
+        )
+        _require_exact_keys(
+            definition,
+            f"custom command {code}",
+            required={"category", "label", "phrases"},
+        )
+        category = _bounded_string(
+            definition["category"],
+            f"custom command {code} category",
+            20,
+        ).upper()
+        if category not in CUSTOM_COMMAND_CATEGORIES:
+            allowed = ", ".join(sorted(CUSTOM_COMMAND_CATEGORIES))
+            raise DoctrinePackError(
+                f"custom command {code} category must be one of {allowed}"
+            )
+        label = _bounded_string(
+            definition["label"],
+            f"custom command {code} label",
+            80,
+        )
+        phrases = parse_phrases(code, definition["phrases"])
+        commands[code] = phrases
+        definitions[code] = DoctrineCommandDefinition(
+            code=code,
+            category=category,
+            display_label=label,
+            phrases=phrases,
+        )
+    return MappingProxyType(commands), MappingProxyType(definitions)
+
+
+@dataclass(frozen=True)
+class DoctrineCorrection:
+    """One exact schema-v2 correction scoped globally or to the active pack."""
+
+    source_text: str
+    translated_text: str
+    source_language: str
+    target_language: str
+    scope: str
+
+
+def _parse_corrections(value: object) -> tuple[DoctrineCorrection, ...]:
+    document = _require_mapping(value, "corrections.yml")
+    _require_exact_keys(document, "corrections.yml", required={"corrections"})
+    raw_corrections = document["corrections"]
+    if not isinstance(raw_corrections, list):
+        raise DoctrinePackError("corrections.yml corrections must be a list")
+    if len(raw_corrections) > MAX_CORRECTIONS:
+        raise DoctrinePackError(
+            f"doctrine pack exceeds {MAX_CORRECTIONS} exact corrections"
+        )
+    parsed: list[DoctrineCorrection] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for index, raw_correction in enumerate(raw_corrections, 1):
+        label = f"corrections.yml entry {index}"
+        correction = _require_mapping(raw_correction, label)
+        _require_exact_keys(
+            correction,
+            label,
+            required={
+                "source_language",
+                "target_language",
+                "scope",
+                "source",
+                "translation",
+            },
+        )
+        source_language = normalize_language_code(
+            _bounded_string(correction["source_language"], f"{label} source language", 32)
+        )
+        target_language = normalize_language_code(
+            _bounded_string(correction["target_language"], f"{label} target language", 32)
+        )
+        if not source_language or not target_language:
+            raise DoctrinePackError(f"{label} contains an invalid language code")
+        scope = _bounded_string(correction["scope"], f"{label} scope", 16).casefold()
+        if scope not in CORRECTION_SCOPES:
+            raise DoctrinePackError(f"{label} scope must be global or pack")
+        source_text = normalize_correction_text(
+            _bounded_string(correction["source"], f"{label} source", 4_000)
+        )
+        translated_text = normalize_correction_text(
+            _bounded_string(correction["translation"], f"{label} translation", 4_000)
+        )
+        key = (scope, source_language, target_language, source_text)
+        if key in seen:
+            raise DoctrinePackError(
+                f"duplicate exact correction for {source_language}->{target_language} "
+                f"in {scope} scope: {source_text!r}"
+            )
+        seen.add(key)
+        parsed.append(DoctrineCorrection(
+            source_text=source_text,
+            translated_text=translated_text,
+            source_language=source_language,
+            target_language=target_language,
+            scope=scope,
+        ))
+    return tuple(parsed)
 
 
 @dataclass(frozen=True)
 class DoctrinePack:
     """Validated, immutable doctrine data for one active pack."""
 
+    schema_version: int
     pack_id: str
     name: str
     version: str
@@ -483,8 +660,14 @@ class DoctrinePack:
     terms_by_pair: Mapping[str, Mapping[str, str]]
     protected_entities: tuple[str, ...]
     command_phrases: Mapping[str, tuple[str, ...]]
+    command_definitions: Mapping[str, DoctrineCommandDefinition]
+    corrections: tuple[DoctrineCorrection, ...]
     source_path: Path = field(compare=False, repr=False)
     _command_lookup: Mapping[str, str] = field(compare=False, repr=False)
+    _correction_lookup: Mapping[tuple[str, str, str, str], str] = field(
+        compare=False,
+        repr=False,
+    )
 
     @property
     def scope(self) -> str:
@@ -505,7 +688,7 @@ class DoctrinePack:
         """Return stable metadata without machine-local timestamps or paths."""
 
         return MappingProxyType({
-            "schema_version": SCHEMA_VERSION,
+            "schema_version": self.schema_version,
             "id": self.pack_id,
             "name": self.name,
             "version": self.version,
@@ -522,6 +705,22 @@ class DoctrinePack:
     def phrases_for(self, command_code: str) -> tuple[str, ...]:
         return self.command_phrases.get((command_code or "").strip().upper(), ())
 
+    def command_category(self, command_code: str) -> str | None:
+        """Return the built-in or validated custom display category."""
+
+        code = (command_code or "").strip().upper()
+        if code in COMMAND_CATEGORY:
+            return COMMAND_CATEGORY[code]
+        definition = self.command_definitions.get(code)
+        return definition.category if definition is not None else None
+
+    def command_label(self, command_code: str) -> str:
+        """Return a custom display label or a readable built-in fallback."""
+
+        code = (command_code or "").strip().upper()
+        definition = self.command_definitions.get(code)
+        return definition.display_label if definition is not None else code.replace("_", " ")
+
     def command_for_phrase(self, phrase: str) -> str | None:
         """Match one complete literal phrase; regex-looking text stays literal."""
 
@@ -531,21 +730,83 @@ class DoctrinePack:
             return None
         return self._command_lookup.get(normalized)
 
+    def corrections_for(
+        self,
+        source_language: str,
+        target_language: str,
+        scope: str = "pack",
+    ) -> Mapping[str, str]:
+        """Return exact corrections for one validated pair and scope."""
+
+        source = normalize_language_code(source_language)
+        target = normalize_language_code(target_language)
+        normalized_scope = (scope or "").strip().casefold()
+        if not source or not target or normalized_scope not in CORRECTION_SCOPES:
+            return MappingProxyType({})
+        result = {
+            correction.source_text: correction.translated_text
+            for correction in self.corrections
+            if correction.source_language == source
+            and correction.target_language == target
+            and correction.scope == normalized_scope
+        }
+        return MappingProxyType(result)
+
+    def correction_for(
+        self,
+        source_text: str,
+        source_language: str,
+        target_language: str,
+        *,
+        include_global: bool = True,
+    ) -> str | None:
+        """Return an exact pack correction, then its optional global fallback."""
+
+        source = normalize_language_code(source_language)
+        target = normalize_language_code(target_language)
+        text = normalize_correction_text(source_text)
+        if not source or not target or not text:
+            return None
+        result = self._correction_lookup.get(("pack", source, target, text))
+        if result is None and include_global:
+            result = self._correction_lookup.get(("global", source, target, text))
+        return result
+
 
 def _build_pack(files: Mapping[str, bytes], source_path: Path) -> DoctrinePack:
     manifest = _parse_manifest(_load_yaml(files["manifest.yml"], "manifest.yml"))
+    schema_version, pack_id, name, version, description = manifest
+    if schema_version == 1 and "corrections.yml" in files:
+        raise DoctrinePackError("corrections.yml requires doctrine schema 2")
     terms = _parse_terms(_load_yaml(files["terms.yml"], "terms.yml"))
     protected_entities = _parse_protected_entities(
         _load_yaml(files["protected_entities.yml"], "protected_entities.yml")
     )
-    commands = _parse_commands(_load_yaml(files["commands.yml"], "commands.yml"))
+    commands, command_definitions = _parse_commands(
+        _load_yaml(files["commands.yml"], "commands.yml"),
+        schema_version,
+    )
+    corrections = (
+        _parse_corrections(_load_yaml(files["corrections.yml"], "corrections.yml"))
+        if "corrections.yml" in files
+        else ()
+    )
     command_lookup = MappingProxyType({
         phrase.casefold(): code
         for code, phrases in commands.items()
         for phrase in phrases
     })
-    pack_id, name, version, description = manifest
+    correction_lookup = MappingProxyType({
+        (
+            correction.scope,
+            correction.source_language,
+            correction.target_language,
+            correction.source_text,
+        ): correction.translated_text
+        for correction in corrections
+    })
     return DoctrinePack(
+        schema_version=schema_version,
         pack_id=pack_id,
         name=name,
         version=version,
@@ -554,8 +815,11 @@ def _build_pack(files: Mapping[str, bytes], source_path: Path) -> DoctrinePack:
         terms_by_pair=terms,
         protected_entities=protected_entities,
         command_phrases=commands,
+        command_definitions=command_definitions,
+        corrections=corrections,
         source_path=source_path,
         _command_lookup=command_lookup,
+        _correction_lookup=correction_lookup,
     )
 
 
@@ -609,3 +873,134 @@ def import_doctrine_pack(
         if staging.exists():
             shutil.rmtree(staging)
     return load_doctrine_pack(destination)
+
+
+def _yaml_bytes(value: object) -> bytes:
+    return yaml.safe_dump(
+        value,
+        allow_unicode=True,
+        sort_keys=False,
+    ).encode("utf-8")
+
+
+def export_correction_pack(
+    translation_memory: object,
+    destination: os.PathLike[str] | str,
+    *,
+    pack_id: str,
+    name: str,
+    version: str = "1.0.0",
+    description: str = "Exact fleet-chat corrections exported locally.",
+    doctrine_scope: str = "",
+    include_global: bool = True,
+    overwrite: bool = False,
+) -> DoctrinePack:
+    """Export global and one active-doctrine scope as a schema-v2 ZIP.
+
+    Full-message corrections remain exact correction records; they are never
+    converted into glossary terms. Non-global rows are exported as ``pack``
+    scope so they bind to the receiving pack rather than targeting an arbitrary
+    doctrine ID on another pilot's machine.
+    """
+
+    read_corrections = getattr(translation_memory, "corrections", None)
+    if not callable(read_corrections):
+        raise TypeError("translation_memory must expose corrections(scope)")
+    selected_scope = normalize_correction_text(doctrine_scope)
+    rows: list[CorrectionEntry] = []
+    if include_global:
+        rows.extend(read_corrections(""))
+    if selected_scope:
+        rows.extend(read_corrections(selected_scope))
+    if not rows:
+        raise DoctrinePackError("no exact corrections were selected for export")
+
+    correction_rows: list[dict[str, str]] = []
+    for row in rows:
+        if not isinstance(row, CorrectionEntry):
+            raise TypeError("translation memory returned an invalid correction entry")
+        correction_rows.append({
+            "source_language": row.source_language,
+            "target_language": row.target_language,
+            "scope": "global" if not row.doctrine_scope else "pack",
+            "source": row.source_text,
+            "translation": row.translated_text,
+        })
+
+    files = {
+        "manifest.yml": _yaml_bytes({
+            "schema_version": SCHEMA_VERSION,
+            "id": pack_id,
+            "name": name,
+            "version": version,
+            "description": description,
+        }),
+        "terms.yml": _yaml_bytes({"pairs": {}}),
+        "protected_entities.yml": _yaml_bytes({"entities": []}),
+        "commands.yml": _yaml_bytes({"commands": {}}),
+        "corrections.yml": _yaml_bytes({"corrections": correction_rows}),
+    }
+
+    path = Path(destination).expanduser()
+    if path.exists() and path.is_symlink():
+        raise DoctrinePackError("correction-pack destination may not be a symlink")
+    if path.exists() and not overwrite:
+        raise DoctrinePackError(f"correction-pack destination already exists: {path}")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DoctrinePackError(f"cannot create correction-pack directory: {exc}") from exc
+    _build_pack(files, path.resolve())
+
+    try:
+        handle, temporary_name = tempfile.mkstemp(
+            prefix=f".{path.name}-",
+            suffix=".tmp",
+            dir=path.parent,
+        )
+        os.close(handle)
+    except OSError as exc:
+        raise DoctrinePackError(f"cannot stage correction pack: {exc}") from exc
+    temporary = Path(temporary_name)
+    try:
+        with zipfile.ZipFile(temporary, "w", zipfile.ZIP_DEFLATED) as archive:
+            for filename in sorted(files):
+                archive.writestr(filename, files[filename])
+        os.replace(temporary, path)
+    except OSError as exc:
+        raise DoctrinePackError(f"cannot write correction pack: {exc}") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+    return load_doctrine_pack(path)
+
+
+def import_doctrine_corrections(
+    source: DoctrinePack | os.PathLike[str] | str,
+    translation_memory: object,
+    *,
+    doctrine_scope: str | None = None,
+    include_global: bool = True,
+) -> int:
+    """Import a pack's exact corrections into local correction memory.
+
+    ``pack`` rows bind to ``doctrine_scope`` or, by default, the loaded pack's
+    own stable scope. No serialized scope can write into an unrelated doctrine.
+    """
+
+    pack = source if isinstance(source, DoctrinePack) else load_doctrine_pack(source)
+    remember_many = getattr(translation_memory, "remember_many", None)
+    if not callable(remember_many):
+        raise TypeError("translation_memory must expose remember_many(entries)")
+    target_scope = normalize_correction_text(doctrine_scope or pack.scope)
+    entries = tuple(
+        CorrectionEntry(
+            source_text=correction.source_text,
+            translated_text=correction.translated_text,
+            source_language=correction.source_language,
+            target_language=correction.target_language,
+            doctrine_scope="" if correction.scope == "global" else target_scope,
+        )
+        for correction in pack.corrections
+        if include_global or correction.scope != "global"
+    )
+    return int(remember_many(entries))

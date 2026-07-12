@@ -60,3 +60,25 @@ def test_doctrine_can_add_only_an_exact_existing_command_code():
         "red cycle", doctrine_pack=Pack()
     )] == ["CEASE_FIRE"]
     assert classify_commands("red cycles", doctrine_pack=Pack()) == ()
+
+
+def test_doctrine_custom_command_uses_validated_category_and_label():
+    class Pack:
+        def command_for_phrase(self, phrase):
+            return "CHECK_DSCAN" if phrase.casefold() == "eyes on dscan" else None
+
+        @staticmethod
+        def command_category(code):
+            return "INTEL" if code == "CHECK_DSCAN" else None
+
+        @staticmethod
+        def command_label(code):
+            return "Check directional scan" if code == "CHECK_DSCAN" else code
+
+    match, = classify_commands("eyes on dscan", doctrine_pack=Pack())
+
+    assert (match.code, match.category, match.display_label) == (
+        "CHECK_DSCAN", "INTEL", "Check directional scan"
+    )
+    assert command_is_trusted("scout", match.code, match.category) is True
+    assert command_is_trusted("scout", "CUSTOM_MOVE", "MOVE") is False

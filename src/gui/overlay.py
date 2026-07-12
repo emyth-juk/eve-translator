@@ -801,6 +801,12 @@ class OverlayWindow(QMainWindow):
             return str(command.get('code', ''))
         return str(getattr(command, 'code', ''))
 
+    @staticmethod
+    def _command_category(command) -> str:
+        if isinstance(command, dict):
+            return str(command.get('category', ''))
+        return str(getattr(command, 'category', ''))
+
     def _message_visible(self, msg_data: dict) -> bool:
         mode = self.display_mode
         if mode == DISPLAY_MODE_MIRROR:
@@ -821,7 +827,11 @@ class OverlayWindow(QMainWindow):
             )
         if mode == DISPLAY_MODE_COMBAT:
             trusted_command = any(
-                command_is_trusted(role, self._command_code(command))
+                command_is_trusted(
+                    role,
+                    self._command_code(command),
+                    self._command_category(command),
+                )
                 for command in commands
             )
             return starred or trusted_command
@@ -933,10 +943,18 @@ class OverlayWindow(QMainWindow):
         for command in commands[:3]:
             code = str(self._command_field(command, 'code')).upper()
             category = str(self._command_field(command, 'category', 'COMMAND')).upper()
+            display_label = str(
+                self._command_field(command, 'display_label', '')
+                or code.replace('_', ' ')
+            )
             argument = str(self._command_field(command, 'argument', '') or '')
-            trusted = command_is_trusted(role, code)
+            trusted = command_is_trusted(role, code, category)
             border = '#f4c95d' if trusted else '#697386'
-            trust_label = 'FC VERIFIED' if trusted else 'UNVERIFIED'
+            trust_label = (
+                f"{role.upper()} VERIFIED"
+                if trusted and role in {'fc', 'scout'}
+                else 'UNVERIFIED'
+            )
             trust_color = '#f4c95d' if trusted else '#9ca3af'
             argument_html = (
                 f" <span style='color:#ffffff;font-size:14px;'>{html.escape(argument)}</span>"
@@ -960,7 +978,7 @@ class OverlayWindow(QMainWindow):
                 f"<div><span style='color:{trust_color};font-size:9px;font-weight:700;'>"
                 f"{html.escape(category)} &middot; {trust_label}</span> "
                 f"<span style='color:#f9fafb;font-size:14px;font-weight:700;'>"
-                f"{html.escape(code.replace('_', ' '))}</span>{argument_html}{state_note}</div>"
+                f"{html.escape(display_label)}</span>{argument_html}{state_note}</div>"
                 f"<div style='color:{col_def};font-size:9px;'>[{timestamp}] {sender_html}</div>"
                 f"{translated_line}"
                 f"<div style='color:#9ca3af;font-size:9px;'>&#8618; {original}</div>"

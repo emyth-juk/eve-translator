@@ -787,6 +787,7 @@ class TestSessionRuntimeState(unittest.TestCase):
             updated = session.handle_processed_message.call_args.args[0]
             self.assertEqual(updated.provider, 'Local correction')
             self.assertEqual(updated.revision, 3)
+            mgr.translation_memory.close()
     def test_live_preview_does_not_activate_provider_or_key(self):
         mgr = self._make_manager()
         mgr.config['shared'] = {

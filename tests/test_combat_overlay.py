@@ -88,6 +88,37 @@ def test_command_card_is_trusted_only_for_explicit_fc_and_shows_original():
         overlay.close()
 
 
+def test_custom_command_card_uses_safe_label_and_scout_trust_category():
+    intel = CommandMatch(
+        'CHECK_DSCAN', 'INTEL', source_clause='eyes on dscan',
+        display_label='Check directional scan',
+    )
+    move = CommandMatch(
+        'CUSTOM_MOVE', 'MOVE', source_clause='burn gate',
+        display_label='Burn to gate',
+    )
+    overlay = make_overlay(speaker_roles={'pilot': 'scout'})
+    try:
+        intel_rendered = overlay._format_message_html(
+            overlay_message_dict(
+                overlay,
+                message('intel', 'eyes on dscan', commands=(intel,)),
+            )
+        )
+        move_rendered = overlay._format_message_html(
+            overlay_message_dict(
+                overlay,
+                message('move', 'burn gate', commands=(move,)),
+            )
+        )
+
+        assert 'Check directional scan' in intel_rendered
+        assert 'SCOUT VERIFIED' in intel_rendered
+        assert 'UNVERIFIED' in move_rendered
+    finally:
+        overlay.close()
+
+
 def overlay_message_dict(overlay, processed):
     overlay.upsert_processed_message(processed)
     return overlay.chat_history[-1]

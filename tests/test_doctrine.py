@@ -7,9 +7,12 @@ import pytest
 from src.core.doctrine import (
     MAX_FILE_BYTES,
     DoctrinePackError,
+    export_correction_pack,
     import_doctrine_pack,
+    import_doctrine_corrections,
     load_doctrine_pack,
 )
+from src.core.translation_memory import TranslationMemory
 
 
 VALID_FILES = {
@@ -133,7 +136,7 @@ def test_oversized_file_is_rejected_from_compressed_zip(tmp_path):
         load_doctrine_pack(source)
 
 
-@pytest.mark.parametrize("schema", [0, 2, "1"])
+@pytest.mark.parametrize("schema", [0, 3, "1"])
 def test_invalid_or_unsupported_schema_is_rejected(tmp_path, schema):
     manifest = f"""\
 schema_version: {schema!r}
@@ -145,6 +148,190 @@ version: 1.2.0
 
     with pytest.raises(DoctrinePackError, match="unsupported doctrine schema"):
         load_doctrine_pack(source)
+
+
+def test_schema_v2_adds_safe_custom_command_definitions(tmp_path):
+    manifest = VALID_FILES["manifest.yml"].replace(b"schema_version: 1", b"schema_version: 2")
+    commands = b"""\
+commands:
+  ALIGN:
+    - form on the outgate
+custom_commands:
+  BASTION_UP:
+    category: SUPPORT
+    label: Bastion up
+    phrases:
+      - green bastion
+"""
+    source = _write_pack(
+        tmp_path / "pack",
+        {"manifest.yml": manifest, "commands.yml": commands},
+    )
+
+    pack = load_doctrine_pack(source)
+
+    assert pack.schema_version == 2
+    assert pack.command_for_phrase("GREEN BASTION") == "BASTION_UP"
+    assert pack.command_category("BASTION_UP") == "SUPPORT"
+    assert pack.command_label("BASTION_UP") == "Bastion up"
+    assert pack.command_category("ALIGN") == "MOVE"
+    assert pack.metadata["schema_version"] == 2
+
+
+@pytest.mark.parametrize(
+    ("definition", "match"),
+    [
+        (
+            "category: EXECUTE\n    label: Bastion up\n    phrases: [green bastion]",
+            "category must be one of",
+        ),
+        (
+            "category: SUPPORT\n    label: Bastion up\n    phrases: [green bastion]\n    trusted_speakers: [Boss]",
+            "unknown fields: trusted_speakers",
+        ),
+    ],
+)
+def test_custom_commands_reject_untrusted_taxonomy_or_authority_fields(
+    tmp_path,
+    definition,
+    match,
+):
+    manifest = VALID_FILES["manifest.yml"].replace(b"schema_version: 1", b"schema_version: 2")
+    commands = f"""\
+commands: {{}}
+custom_commands:
+  BASTION_UP:
+    {definition}
+""".encode()
+    source = _write_pack(
+        tmp_path / "pack",
+        {"manifest.yml": manifest, "commands.yml": commands},
+    )
+
+    with pytest.raises(DoctrinePackError, match=match):
+        load_doctrine_pack(source)
+
+
+def test_custom_command_cannot_override_a_builtin_code(tmp_path):
+    manifest = VALID_FILES["manifest.yml"].replace(b"schema_version: 1", b"schema_version: 2")
+    commands = b"""\
+commands: {}
+custom_commands:
+  JUMP:
+    category: MOVE
+    label: Different jump
+    phrases: [take it]
+"""
+    source = _write_pack(
+        tmp_path / "pack",
+        {"manifest.yml": manifest, "commands.yml": commands},
+    )
+
+    with pytest.raises(DoctrinePackError, match="collides with built-in"):
+        load_doctrine_pack(source)
+
+
+def test_schema_v1_rejects_v2_command_fields_and_correction_file(tmp_path):
+    custom_commands = b"commands: {}\ncustom_commands: {}\n"
+    with pytest.raises(DoctrinePackError, match="unknown fields: custom_commands"):
+        load_doctrine_pack(
+            _write_pack(tmp_path / "custom", {"commands.yml": custom_commands})
+        )
+    with pytest.raises(DoctrinePackError, match="requires doctrine schema 2"):
+        load_doctrine_pack(
+            _write_pack(
+                tmp_path / "corrections",
+                {"corrections.yml": b"corrections: []\n"},
+            )
+        )
+
+
+def test_schema_v2_exact_corrections_are_pair_and_scope_safe(tmp_path):
+    manifest = VALID_FILES["manifest.yml"].replace(b"schema_version: 1", b"schema_version: 2")
+    corrections = b"""\
+corrections:
+  - source_language: fr
+    target_language: en
+    scope: global
+    source: Ne sautez pas!
+    translation: Do not jump!
+  - source_language: fr
+    target_language: en
+    scope: pack
+    source: Ne sautez pas!
+    translation: Hold the gate!
+"""
+    pack = load_doctrine_pack(_write_pack(
+        tmp_path / "pack",
+        {"manifest.yml": manifest, "corrections.yml": corrections},
+    ))
+
+    assert pack.correction_for(" Ne   sautez pas! ", "FR", "en") == "Hold the gate!"
+    assert pack.correction_for("ne sautez pas!", "fr", "en") is None
+    assert dict(pack.corrections_for("fr", "en", "global")) == {
+        "Ne sautez pas!": "Do not jump!",
+    }
+
+
+@pytest.mark.parametrize(
+    ("corrections", "match"),
+    [
+        (
+            b"corrections:\n  - source_language: fr\n    target_language: en\n    scope: armor@1\n    source: hold\n    translation: hold\n",
+            "scope must be global or pack",
+        ),
+        (
+            b"corrections:\n  - source_language: fr\n    target_language: en\n    scope: pack\n    source: hold\n    translation: hold\n    trusted_speaker: Boss\n",
+            "unknown fields: trusted_speaker",
+        ),
+    ],
+)
+def test_corrections_reject_arbitrary_scopes_and_authority_fields(
+    tmp_path,
+    corrections,
+    match,
+):
+    manifest = VALID_FILES["manifest.yml"].replace(b"schema_version: 1", b"schema_version: 2")
+    source = _write_pack(
+        tmp_path / "pack",
+        {"manifest.yml": manifest, "corrections.yml": corrections},
+    )
+
+    with pytest.raises(DoctrinePackError, match=match):
+        load_doctrine_pack(source)
+
+
+def test_export_and_import_correction_pack_keeps_messages_out_of_glossary(tmp_path):
+    source_memory = TranslationMemory(tmp_path / "source.sqlite3")
+    source_memory.remember("Ne sautez pas!", "Do not jump!", "fr", "en")
+    source_memory.remember(
+        "Broadcast armor now",
+        "Send armor now",
+        "en",
+        "de",
+        "armor-hacs@1.2.0",
+    )
+
+    exported = export_correction_pack(
+        source_memory,
+        tmp_path / "fleet-corrections.zip",
+        pack_id="fleet-corrections",
+        name="Fleet Corrections",
+        doctrine_scope="armor-hacs@1.2.0",
+    )
+
+    assert exported.schema_version == 2
+    assert len(exported.corrections) == 2
+    assert dict(exported.terms_for("fr", "en")) == {}
+    target_memory = TranslationMemory(tmp_path / "target.sqlite3")
+    assert import_doctrine_corrections(exported, target_memory) == 2
+    assert target_memory.lookup("Ne sautez pas!", "fr", "en") == "Do not jump!"
+    assert target_memory.lookup(
+        "Broadcast armor now",
+        "en",
+        "de",
+        exported.scope,
+    ) == "Send armor now"
 
 
 def test_unknown_fields_cannot_grant_speaker_trust(tmp_path):
