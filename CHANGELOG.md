@@ -5,7 +5,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.4] - 2026-07-11
+## [1.4] - 2026-07-12
 
 ### Added
 - Combat, Bilingual, and Mirror overlay modes with a compact status header.
@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A generated multilingual EVE entity index sourced from NoirSoldats' converted CCP SDE SQLite release.
 - ID-linked SDE locale mappings that distinguish official type names from fleet shorthand and player nicknames.
 - Provider-native DeepL burst batching and opt-in, source-isolated rolling context.
-- Truthful Fleet and Local readiness states in the system tray: Off, Waiting, Active, and Error.
+- Truthful Fleet, Local, and Any Chat readiness states in the system tray: Off, Waiting, Active, and Error.
 - Automatic recovery when an enabled chat log becomes available after startup.
 - Explicit Disabled, Google, and DeepL provider selection with cloud-use explanations.
 - Masked DeepL key entry, reveal control, and a provider connection test using only a built-in phrase.
@@ -41,6 +41,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Correction memory now uses one guarded SQLite connection, scoped/global lookup in one query, and a bounded positive/negative cache.
 - Fleet, Local, and Any Chat discovery now share one cached directory snapshot on a dedicated worker thread instead of repeatedly scanning on the GUI thread.
 - Built-in session labels, defaults, geometry, log routing, and source-owned metadata now come from one descriptor table.
+- Release builds now pin runtime and top-level build/test dependencies, validate tag/version consistency, run Ruff and the full test suite before packaging, and embed Windows version metadata.
+- Windows releases now publish one `windows_x64` ZIP that keeps the executable, project and third-party notices, checksums, component manifest, and exact license texts together.
+- Packaging now includes only the Qt plugins the Windows Widgets app needs, excluding unused PDF, SVG, network, image-codec, alternate-platform, and GPL-only Qt Virtual Keyboard components.
+- Runtime and build dependencies were refreshed to patched versions, including Qt/PySide 6.11.1 and Requests 2.34.2, while CI actions are pinned to reviewed commits.
+- Google translation now uses a small internal, time-bounded mobile-web adapter instead of the historically compromised `deep-translator` package.
+- Local-system detection now scans only newly appended log bytes and keeps a bounded cache instead of rereading entire Local logs.
 
 ### Fixed
 - Vanilla SDE names now outrank shorter player aliases by full span, including unchanged or ambiguous locale names that act as no-op guards.
@@ -65,6 +71,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A second app launch now exits with a clear already-running message instead of competing for both global hotkeys and showing misleading shortcut warnings.
 - Global shortcut conflicts now preserve the Windows error, identify the affected action and chord, and appear in one combined notification while tray actions remain usable.
 - Persistent chat-log discovery failures preserve the last-good sources, use bounded retry backoff, and become visible Error states instead of silent Waiting states.
+- Config and correction-memory files created by a newer schema are detected and left untouched instead of being overwritten or downgraded.
+- Partially written UTF-16 chat records are retained for the next poll instead of being dropped, while active-log polling stays responsive.
+- Chat-log discovery can no longer delay shutdown indefinitely; exit now uses a bounded wait before cleanup.
+- Fleet auto-selection now uses a stable filename tie-breaker when creation and modification times match.
+- Cancelling first-run log-folder selection now exits cleanly before worker threads start, and a regular file is no longer accepted as the chat-log directory.
+- Overlay geometry is preserved when a session is disabled, an inactive Any Chat source is selected, or the app exits.
+- Shutdown now cancels waits for in-flight provider calls and suppresses late results instead of waiting for the full provider deadline.
+
+### Known limitations
+- Any Chat follows one selected logged source and cannot detect which EVE chat tab is currently visible.
+- Windows may reject a global shortcut already owned by another application; the equivalent system-tray action remains available.
+- Windows release executables are currently unsigned, so Microsoft Defender SmartScreen may show an unrecognized-app warning.
+- Provider-native burst batching is available for DeepL only; Google requests remain sequential.
+- The bundled SDE entity index is a pinned snapshot; entities introduced by later EVE builds require a regenerated index.
+- Keyless Google mode depends on a public mobile web endpoint, not an official API, and may be rate-limited or changed by Google.
 
 ## [1.3] - 2026-06-29
 
@@ -115,7 +136,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **CI/CD Pipeline**: 
     - GitHub Actions workflow (`run_tests.yml`) for cross-platform testing (Windows/Ubuntu).
-    - Automated Releases (`release.yml`) triggered by tags, building signed executables and source zips.
+    - Automated Releases (`release.yml`) triggered by tags, building Windows executables and publishing release assets.
     - Automated release note extraction.
 - **Testing**: Added comprehensive test suites:
     - `test_integration_pipeline.py`: End-to-End flow verification.

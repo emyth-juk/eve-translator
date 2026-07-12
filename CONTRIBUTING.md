@@ -27,9 +27,15 @@ The most common way to contribute is by adding or correcting EVE terms in the gl
 
 ## Development Setup
 
-1.  Clone repo.
-2.  Install requirements: `pip install -r requirements.txt`.
-3.  Run `python -m src.main`.
+Development is supported and CI-tested on 64-bit Windows with Python 3.10,
+3.11, and 3.12. Release builds use Python 3.10.
+
+1. Clone the repository.
+2. Create a virtual environment: `py -3.10 -m venv .venv`.
+3. Install the development dependencies: `.venv\Scripts\python -m pip install -r requirements-dev.txt`.
+4. Run the app: `.venv\Scripts\python -m src.main`.
+5. Run the tests: `.venv\Scripts\python -m pytest`.
+6. Run the linter: `.venv\Scripts\python -m ruff check src tests scripts packaging`.
 
 ## License
 By contributing, you agree that your contributions will be licensed under its MIT License.

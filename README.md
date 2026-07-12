@@ -24,6 +24,7 @@ Real-time overlay translator for EVE Online Fleet, Local, and other logged chat 
 ## Requirements
 - Windows PC running EVE Online.
 - Choose a provider in Settings. DeepL requires a Free or Pro API key; Google does not require a key.
+- Google mode uses Google Translate's public mobile web endpoint rather than an official Google Cloud API. It may be rate-limited or changed by Google.
 - Selecting Google or DeepL sends message text to that cloud provider. Translation remains disabled until you explicitly select one.
 - EVE client chat logging enabled. In EVE: **Settings → Chat → Log Chat to File**.
 
@@ -36,8 +37,9 @@ Real-time overlay translator for EVE Online Fleet, Local, and other logged chat 
 6. Keep the key private; it’s tied to your account and monthly quota.
 
 ## Quick Start (Players)
-1. Download: grab the latest `.exe` from the GitHub [Releases Page](https://github.com/emyth-juk/eve-translator/releases).
-2. Run: double-click `EVETranslator_vX.Y.exe`.
+1. Download: grab the latest `EVETranslator_vX.Y_windows_x64.zip` from the GitHub [Releases Page](https://github.com/emyth-juk/eve-translator/releases).
+2. Extract the ZIP, then run `EVETranslator_vX.Y.exe` from the extracted folder. Keep the accompanying notices and license files with it.
+   The current Windows builds are unsigned, so Microsoft Defender SmartScreen may show an unrecognized-app warning.
 3. Choose translation: open **Settings → Provider**, select Google or DeepL, and review the cloud-use notice.
 4. For DeepL, enter your API key and use **Test Provider** before saving.
 5. Point to your chat logs if needed: Settings → Log Directory (default is usually auto-detected).
@@ -119,11 +121,22 @@ Speaker roles are exact, local mappings. The app never infers authority from a n
 - Logs for support: `%USERPROFILE%\.eve_translator\logs\translator.log`.
 
 ## For Developers (optional)
-- Install: `pip install -r requirements.txt`  
-- Run: `python -m src.main`  
-- Tests: `pytest` (headless on Linux may need `xvfb-run pytest`)  
+- Supported development interpreters: Python 3.10, 3.11, and 3.12 on Windows; release builds use Python 3.10.
+- Runtime install: `python -m pip install -r requirements.txt`
+- Development install: `python -m pip install -r requirements-dev.txt`
+- Run: `python -m src.main`
+- Tests: `python -m pytest`
+- Lint: `python -m ruff check src tests scripts packaging`
 - Refresh the protected-name index from a pinned [NoirSoldats EVE SDE Converter](https://github.com/noirsoldats/eve-sde-converter) SQLite release with `python scripts/build_protected_entities.py --help`; see `scripts/README.md`. This project does not reimplement CCP SDE conversion.
-- Build (Windows): `build_exe.bat` produces `dist/EVETranslator_vX.Y.exe`.
+- Build (Windows): `build_exe.bat` produces the executable plus `dist/EVETranslator_vX.Y_windows_x64.zip` with its notices, component manifest, checksums, and license texts.
+
+## Legal and Third-Party Notices
+
+EVE Translator is an independent project and is not affiliated with or endorsed by CCP hf.
+
+© 2014 CCP hf. All rights reserved. "EVE", "EVE Online", "CCP", and all related logos and images are trademarks or registered trademarks of CCP hf.
+
+This application uses Qt for Python/PySide6 and Qt under the GNU Lesser General Public License version 3. See `THIRD_PARTY_NOTICES.txt`, `LICENSES/LGPL-3.0-only.txt`, and `LICENSES/GPL-3.0-only.txt` for copyright, source-availability, and relinking information.
 
 ## Changelog & Contributing
 - Changes: see `CHANGELOG.md`.  
