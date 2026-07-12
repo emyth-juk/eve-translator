@@ -172,6 +172,7 @@ class TranslatorManager(QObject):
         self.compose_hotkey = None
         self.compose_dialog = None
         self.settings_dialog = None
+        self._provider_status_snapshot = {}
 
         # Shared Processing Components
         parser = LineParser()
@@ -206,6 +207,9 @@ class TranslatorManager(QObject):
             entity_index_path=(
                 self.config.get('shared', {}).get('entity_index_path') or None
             ),
+        )
+        self.translation_scheduler.provider_status_ready.connect(
+            self._provider_status_applied
         )
         # Apply the first snapshot before moving the worker. Later updates use
         # the queued signal so provider state is only mutated by its owner thread.
@@ -416,9 +420,29 @@ class TranslatorManager(QObject):
         if saved is False:
             tray_icon = getattr(self, 'tray_icon', None)
             if tray_icon is not None:
+                newer_schema = getattr(
+                    config_store,
+                    'unsupported_schema_version',
+                    None,
+                )
+                if isinstance(newer_schema, int) and not isinstance(
+                    newer_schema,
+                    bool,
+                ):
+                    title = "Settings are read-only"
+                    detail = (
+                        f"This settings file uses newer schema {newer_schema}. "
+                        "EVE Translator 1.4 will not overwrite it."
+                    )
+                else:
+                    title = "EVE Translator settings were not saved"
+                    detail = (
+                        "Check disk access. Provider and session changes may "
+                        "revert after restart."
+                    )
                 tray_icon.showMessage(
-                    "EVE Translator settings were not saved",
-                    "Check disk access. Provider and session changes may revert after restart.",
+                    title,
+                    detail,
                     QSystemTrayIcon.MessageIcon.Warning,
                     10000,
                 )
@@ -471,7 +495,7 @@ class TranslatorManager(QObject):
             'compose_hotkey', 'Ctrl+Shift+T'
         )
         self.compose_action = QAction(
-            f"Compose translation â€” {compose_chord}",
+            f"Compose translation — {compose_chord}",
             self.tray_menu,
         )
         self.compose_action.triggered.connect(self.open_compose_dialog)
@@ -523,6 +547,16 @@ class TranslatorManager(QObject):
 
     def _show_provider_setup_notice(self):
         config_store = getattr(self, 'config_store', None)
+        newer_schema = getattr(config_store, 'unsupported_schema_version', None)
+        if isinstance(newer_schema, int) and not isinstance(newer_schema, bool):
+            self.tray_icon.showMessage(
+                "Newer settings file detected",
+                f"Schema {newer_schema} is newer than this app supports. "
+                "Defaults are running read-only; the file will not be overwritten.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                15000,
+            )
+            return
         if not getattr(config_store, 'provider_selection_required', False):
             return
 
@@ -553,18 +587,24 @@ class TranslatorManager(QObject):
         self._broadcast_session_states()
         self._sessions_initialized = True
 
-    def _compose_provider_label(self) -> str:
-        service = getattr(self, 'translation_service', None)
-        status = (
-            service.get_provider_status()
-            if service is not None and hasattr(service, 'get_provider_status')
-            else {}
-        )
+    def _compose_provider_label(self, status: dict | None = None) -> str:
+        if not isinstance(status, dict):
+            status = getattr(self, '_provider_status_snapshot', {})
         primary = str(status.get('name') or 'configured cloud provider')
         fallback = status.get('fallback')
         if isinstance(fallback, dict) and fallback.get('enabled'):
             return f"{primary} provider with consented {fallback.get('name')} fallback"
         return f"{primary} provider"
+
+    @Slot(dict)
+    def _provider_status_applied(self, status: dict) -> None:
+        """Publish only provider state applied by the scheduler thread."""
+        self._provider_status_snapshot = dict(status) if isinstance(status, dict) else {}
+        dialog = getattr(self, 'compose_dialog', None)
+        if dialog is not None:
+            dialog.set_provider_label(
+                self._compose_provider_label(self._provider_status_snapshot)
+            )
 
     @Slot()
     def open_compose_dialog(self) -> None:
@@ -606,8 +646,16 @@ class TranslatorManager(QObject):
         dialog = getattr(self, 'settings_dialog', None)
         if dialog is not None:
             dialog.set_provider_usage(usage)
-        used = usage.get('used') if isinstance(usage, dict) else None
-        limit = usage.get('limit') if isinstance(usage, dict) else None
+        deepl_usage = usage if isinstance(usage, dict) else {}
+        if deepl_usage.get('provider') == 'google':
+            fallback = deepl_usage.get('fallback')
+            deepl_usage = (
+                fallback
+                if isinstance(fallback, dict) and fallback.get('provider') == 'deepl'
+                else {}
+            )
+        used = deepl_usage.get('used')
+        limit = deepl_usage.get('limit')
         if (
             isinstance(used, int)
             and not isinstance(used, bool)
@@ -760,11 +808,6 @@ class TranslatorManager(QObject):
                 self._apply_scanner_config()
 
                 self._save_config()
-                compose_dialog = getattr(self, 'compose_dialog', None)
-                if compose_dialog is not None:
-                    compose_dialog.set_provider_label(
-                        self._compose_provider_label()
-                    )
             else:
                 # Cancelled: Restore original config
                 logger.info("Settings cancelled. Restoring original config.")
@@ -944,9 +987,10 @@ class TranslatorManager(QObject):
             if key in updated_config:
                 self.config['sessions'][session_id][key] = updated_config[key]
 
-        # Notify worker of shared config changes
-        self._queue_worker_config()
         if shared_changed:
+            # Provider and translation state belongs to worker threads; do not
+            # enqueue it for display-only position or HUD changes.
+            self._queue_worker_config()
             self._apply_config_update()
         self._apply_scanner_config()
 
@@ -973,7 +1017,7 @@ class TranslatorManager(QObject):
                 payload.get('target_language', self.config['shared'].get('target_language', 'en')),
                 doctrine_scope,
             )
-        except (OSError, ValueError, sqlite3.Error) as exc:
+        except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
             logger.warning("Could not save local correction: %s", exc)
             tray_icon = getattr(self, 'tray_icon', None)
             if tray_icon is not None:
@@ -1195,6 +1239,24 @@ class TranslatorManager(QObject):
                     tooltip_parts.append(
                         f"Google local estimate: {estimated:,} characters"
                     )
+                fallback = usage.get('fallback') if isinstance(usage, dict) else None
+                if (
+                    isinstance(fallback, dict)
+                    and fallback.get('provider') == 'deepl'
+                ):
+                    used = fallback.get('used')
+                    limit = fallback.get('limit')
+                    if (
+                        isinstance(used, int)
+                        and not isinstance(used, bool)
+                        and isinstance(limit, int)
+                        and not isinstance(limit, bool)
+                        and limit > 0
+                    ):
+                        tooltip_parts.append(
+                            f"DeepL fallback quota: {used:,}/{limit:,} "
+                            f"({used / limit:.0%})"
+                        )
         tooltip_parts.append(
             f"Overlays: {'Locked' if getattr(self, 'overlay_locked', False) else 'Interactive'}"
         )
@@ -1668,7 +1730,7 @@ class TranslatorManager(QObject):
                 QMetaObject.invokeMethod(
                     scheduler,
                     'stop',
-                    Qt.ConnectionType.BlockingQueuedConnection,
+                    Qt.ConnectionType.QueuedConnection,
                 )
             translation_thread.requestInterruption()
             translation_thread.quit()

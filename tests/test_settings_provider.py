@@ -353,6 +353,33 @@ def test_google_usage_is_clearly_a_local_estimate_without_provider_limit():
     dialog.close()
 
 
+def test_google_usage_also_shows_consented_deepl_fallback_quota():
+    config = get_default_config()
+    config['shared']['translation_provider'] = 'google'
+    config['shared']['provider_fallback_enabled'] = True
+    config['shared']['deepl_api_key'] = 'fallback-key'
+    dialog = SettingsDialog(config)
+
+    dialog.set_provider_usage({
+        'provider': 'google',
+        'available': True,
+        'estimated_characters': 12_345,
+        'fallback': {
+            'provider': 'deepl',
+            'available': True,
+            'used': 800_000,
+            'limit': 1_000_000,
+        },
+    })
+
+    usage_text = dialog.lbl_provider_usage.text()
+    assert 'Google local runtime estimate: 12,345 characters' in usage_text
+    assert 'DeepL fallback: 800,000 / 1,000,000 characters used' in usage_text
+    assert 'Warning: fallback quota usage is at or above 80%' in usage_text
+    assert '#c0392b' in dialog.lbl_provider_usage.styleSheet()
+    dialog.close()
+
+
 def test_usage_error_is_generic_and_stale_provider_response_is_ignored():
     config = get_default_config()
     config['shared']['translation_provider'] = 'google'
@@ -399,4 +426,24 @@ def test_correction_export_creates_doctrine_zip_without_glossary_conversion():
         overwrite=True,
     )
     assert '2 exact corrections' in information.call_args.args[2]
+    dialog.close()
+
+
+def test_correction_export_pack_id_drops_punctuation_exposed_by_truncation():
+    service = MagicMock()
+    service.entity_index = None
+    service.translation_memory.count.return_value = 1
+    dialog = SettingsDialog(get_default_config(), translation_service=service)
+    filename = f"C:/tmp/{'a' * 63}-extra.zip"
+
+    with patch(
+        'src.gui.settings.QFileDialog.getSaveFileName',
+        return_value=(filename, 'Doctrine packs (*.zip)'),
+    ), patch(
+        'src.core.doctrine.export_correction_pack',
+        return_value=SimpleNamespace(corrections=(object(),)),
+    ) as export, patch('src.gui.settings.QMessageBox.information'):
+        dialog.btn_export_corrections.click()
+
+    assert export.call_args.kwargs['pack_id'] == 'a' * 63
     dialog.close()

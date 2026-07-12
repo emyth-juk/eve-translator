@@ -440,6 +440,18 @@ class TestSessionRuntimeState(unittest.TestCase):
             mgr.tray_icon.showMessage.call_args.args[1],
         )
 
+    def test_provider_setup_notice_accepts_only_integer_future_schema(self):
+        mgr = self._make_manager()
+        mgr.config_store = MagicMock(
+            provider_selection_required=False,
+            unsupported_schema_version=7,
+        )
+
+        mgr._show_provider_setup_notice()
+
+        mgr.tray_icon.showMessage.assert_called_once()
+        self.assertIn('Schema 7', mgr.tray_icon.showMessage.call_args.args[1])
+
     def test_disabled_local_stays_off_when_character_log_rotates(self):
         from src.core.character_info import CharacterInfo
 
@@ -1044,6 +1056,52 @@ class TestHandleSessionConfigChange(unittest.TestCase):
 
             mgr._handle_session_config_change('fleet', {'font_size': 14})
             mgr._queue_worker_config.assert_called_once_with()
+
+    def test_display_only_changes_do_not_queue_provider_config(self):
+        with patch('src.main.TranslatorManager.__init__', lambda self: None):
+            from src.main import TranslatorManager
+            mgr = TranslatorManager()
+            mgr.config = {
+                'shared': {'font_size': 10},
+                'sessions': {'fleet': {'display_mode': 'bilingual'}},
+            }
+            mgr.sessions = {}
+            mgr._save_config = MagicMock()
+            mgr._queue_worker_config = MagicMock()
+            mgr._apply_config_update = MagicMock()
+            mgr._apply_scanner_config = MagicMock()
+
+            mgr._handle_session_config_change(
+                'fleet',
+                {'display_mode': 'combat', 'x': 500},
+            )
+
+            mgr._queue_worker_config.assert_not_called()
+            mgr._apply_config_update.assert_not_called()
+            self.assertEqual(
+                mgr.config['sessions']['fleet']['display_mode'],
+                'combat',
+            )
+
+    def test_compose_provider_label_changes_only_from_applied_snapshot(self):
+        with patch('src.main.TranslatorManager.__init__', lambda self: None):
+            from src.main import TranslatorManager
+            mgr = TranslatorManager()
+
+        mgr.translation_service = MagicMock()
+        mgr.compose_dialog = MagicMock()
+        status = {
+            'name': 'Google',
+            'fallback': {'enabled': True, 'name': 'DeepL'},
+        }
+
+        mgr._provider_status_applied(status)
+
+        self.assertEqual(mgr._provider_status_snapshot, status)
+        mgr.compose_dialog.set_provider_label.assert_called_once_with(
+            'Google provider with consented DeepL fallback'
+        )
+        mgr.translation_service.get_provider_status.assert_not_called()
 
     def test_worker_config_signal_receives_an_isolated_snapshot(self):
         with patch('src.main.TranslatorManager.__init__', lambda self: None):

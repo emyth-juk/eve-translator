@@ -1,10 +1,52 @@
 from datetime import datetime
+import threading
+import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
+
+from PySide6.QtCore import QCoreApplication
 
 from src.core.message import ProcessedMessage, TranslationState
 from src.core.tokenizer import EVELinkTokenizer
-from src.services.processing import LogProcessingWorker, TranslationJob, TranslationScheduler
+from src.services.processing import (
+    ConfigGenerationGate,
+    ConfigGenerationSnapshot,
+    LogProcessingWorker,
+    TranslationJob,
+    TranslationScheduler,
+)
+
+
+def test_config_generation_gate_auto_increments_atomically():
+    gate = ConfigGenerationGate()
+    generations = []
+    result_lock = threading.Lock()
+
+    def request_generation():
+        generation = gate.request_next()
+        with result_lock:
+            generations.append(generation)
+
+    threads = [threading.Thread(target=request_generation) for _ in range(20)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(0.5)
+
+    assert sorted(generations) == list(range(1, 21))
+    assert gate.snapshot() == ConfigGenerationSnapshot(requested=20, applied=0)
+    assert gate.pending() is True
+
+
+def test_config_generation_gate_external_request_apply_and_snapshot_are_monotonic():
+    gate = ConfigGenerationGate()
+
+    assert gate.request(4) == ConfigGenerationSnapshot(requested=4, applied=0)
+    assert gate.request(2) == ConfigGenerationSnapshot(requested=4, applied=0)
+    assert gate.apply(3) == ConfigGenerationSnapshot(requested=4, applied=3)
+    assert gate.pending() is True
+    assert gate.apply(4) == ConfigGenerationSnapshot(requested=4, applied=4)
+    assert gate.pending() is False
 
 
 def _make_worker(*, should_translate, translation=("translated", True, "Test")):
@@ -411,6 +453,50 @@ def test_scheduler_initializes_sde_index_before_translation_work():
     assert ready == [loaded_index]
 
 
+def test_scheduler_defers_sde_load_until_entity_protection_is_enabled():
+    service = MagicMock()
+    service.entity_index = None
+    loaded_index = SimpleNamespace(entity_count=42, available=True)
+    loader = MagicMock(return_value=loaded_index)
+    scheduler = TranslationScheduler(
+        service,
+        entity_index_loader=loader,
+        entity_index_path="generated.json",
+    )
+    ready = []
+    scheduler.entity_index_ready.connect(ready.append)
+
+    scheduler.update_config({'entity_protection': False})
+    scheduler.initialize_entity_index()
+
+    loader.assert_not_called()
+    assert ready == [None]
+
+    scheduler.update_config({'entity_protection': True})
+
+    loader.assert_called_once_with("generated.json")
+    assert ready == [None, loaded_index]
+    assert service.set_entity_index.call_args == call(loaded_index)
+
+
+def test_scheduler_reloads_active_doctrine_when_same_path_is_reapplied():
+    service = MagicMock()
+    service.entity_index = None
+    scheduler = TranslationScheduler(service)
+    first = SimpleNamespace(revision="fleet@1:first")
+    second = SimpleNamespace(revision="fleet@1:second")
+
+    with patch(
+        'src.core.doctrine.load_doctrine_pack',
+        side_effect=[first, second],
+    ) as load:
+        scheduler.update_config({'active_doctrine_pack': 'fleet-pack.zip'})
+        scheduler.update_config({'active_doctrine_pack': 'fleet-pack.zip'})
+
+    assert load.call_count == 2
+    assert service.set_doctrine_pack.call_args_list == [call(first), call(second)]
+
+
 def test_scheduler_translates_outbound_compose_request_and_reports_failures():
     service = MagicMock()
     service.entity_index = None
@@ -440,6 +526,7 @@ def test_scheduler_translates_outbound_compose_request_and_reports_failures():
 
 
 def test_scheduler_refreshes_provider_usage_without_gui_thread_network_call():
+    app = QCoreApplication.instance() or QCoreApplication([])
     service = MagicMock()
     service.entity_index = None
     service.get_provider_usage.return_value = {
@@ -447,14 +534,68 @@ def test_scheduler_refreshes_provider_usage_without_gui_thread_network_call():
     }
     scheduler = TranslationScheduler(service)
     emitted = []
-    scheduler.provider_usage_ready.connect(emitted.append)
+    ready = threading.Event()
+
+    def capture(usage):
+        emitted.append(usage)
+        ready.set()
+
+    scheduler.provider_usage_ready.connect(capture)
 
     scheduler.refresh_provider_usage()
 
+    deadline = time.monotonic() + 0.5
+    while not ready.is_set() and time.monotonic() < deadline:
+        app.processEvents()
+        time.sleep(0.005)
+    assert ready.is_set()
     service.get_provider_usage.assert_called_once_with(refresh=True)
     assert emitted == [{
         'provider': 'deepl', 'available': True, 'used': 80, 'limit': 100,
     }]
+
+
+def test_scheduler_publishes_provider_status_only_after_latest_config_applies():
+    service = MagicMock()
+    service.entity_index = None
+    service.get_provider_status.return_value = {
+        'mode': 'deepl',
+        'name': 'DeepL',
+        'available': True,
+        'reason': '',
+    }
+    scheduler = TranslationScheduler(service)
+    emitted = []
+    scheduler.provider_status_ready.connect(emitted.append)
+
+    scheduler.request_config_update(2)
+    scheduler.apply_queued_config(1, {'translation_provider': 'google'})
+
+    assert emitted == []
+
+    scheduler.apply_queued_config(2, {'translation_provider': 'deepl'})
+
+    assert emitted == [service.get_provider_status.return_value]
+
+
+def test_scheduler_detects_auto_source_for_outbound_eve_aware_translation():
+    service = MagicMock()
+    service.entity_index = None
+    service.translate_message.return_value = ("Do not jump", True, "DeepL")
+    scheduler = TranslationScheduler(service)
+    scheduler._compose_detector = MagicMock()
+    scheduler._compose_detector.should_translate.return_value = (True, "fr")
+
+    scheduler.translate_composed_message(7, "Ne sautez pas", "auto", "en")
+
+    scheduler._compose_detector.should_translate.assert_called_once_with(
+        "Ne sautez pas",
+        target_lang="en",
+        ignored_langs=set(),
+    )
+    service.translate_message.assert_called_once_with(
+        "Ne sautez pas", "en", source_lang="fr"
+    )
 
 
 def replace_job(job, **changes):

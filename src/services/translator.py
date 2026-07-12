@@ -2,6 +2,7 @@ import hashlib
 import logging
 import re
 import threading
+import time
 from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -19,13 +20,21 @@ from src.app_config import (
     resolve_translation_provider,
 )
 from src.core.glossary import EVEGlossary
-from src.core.languages import normalize_locale as _normalize_language_code
+from src.core.languages import (
+    normalize_language_code as _base_language_code,
+    normalize_locale as _normalize_language_code,
+)
 from src.core.lexicon import LexiconTerm, LongestLexiconMatcher
 
 logger = logging.getLogger(__name__)
 TRANSLATION_CACHE_SIZE = 512
+GLOSSARY_CACHE_SIZE = 16
+LEXICON_MATCHER_CACHE_SIZE = 32
 PROVIDER_CALL_TIMEOUT_SECONDS = 12.0
 DEEPL_CALL_TIMEOUT_SECONDS = 90.0
+GOOGLE_CALL_TIMEOUT_SECONDS = 15.0
+PROVIDER_USAGE_TIMEOUT_SECONDS = 20.0
+PROVIDER_ORPHAN_COOLDOWN_SECONDS = 120.0
 GOOGLE_CONNECT_TIMEOUT_SECONDS = 4.0
 GOOGLE_READ_TIMEOUT_SECONDS = 8.0
 
@@ -56,6 +65,13 @@ class ProviderCallTimeout(TimeoutError):
     """Raised when a provider call exceeds the app's responsiveness budget."""
 
 
+@dataclass
+class _OrphanedCall:
+    thread: threading.Thread
+    quarantine_after: float
+    quarantined: bool = False
+
+
 class _BoundedCallRunner:
     """Run at most one provider request and stop waiting at a fixed deadline.
 
@@ -65,54 +81,117 @@ class _BoundedCallRunner:
     """
 
     _orphan_lock = threading.Lock()
-    _orphaned_threads: dict[str, set[threading.Thread]] = {}
+    _orphaned_threads: dict[
+        str,
+        dict[threading.Thread, _OrphanedCall],
+    ] = {}
 
-    def __init__(self, scope, timeout_seconds=PROVIDER_CALL_TIMEOUT_SECONDS):
+    def __init__(
+        self,
+        scope,
+        timeout_seconds=PROVIDER_CALL_TIMEOUT_SECONDS,
+        orphan_cooldown_seconds=PROVIDER_ORPHAN_COOLDOWN_SECONDS,
+    ):
         self.scope = scope
         self.timeout_seconds = timeout_seconds
+        self.orphan_cooldown_seconds = max(0.0, float(orphan_cooldown_seconds))
         self._state_lock = threading.Lock()
         self._active_thread = None
         self._timed_out = False
 
     @classmethod
-    def _scope_has_active_orphan(cls, scope) -> bool:
+    def _scope_orphan_state(
+        cls,
+        scope,
+        active_thread: threading.Thread | None = None,
+    ) -> tuple[bool, bool]:
+        """Return ``(blocked, active_is_quarantined)`` for one provider scope.
+
+        After its cooldown, one never-returning request is quarantined and no
+        longer blocks sequential retries.  A second live timeout is never
+        quarantined while the first remains alive, bounding the policy to one
+        ignored orphan plus one current request instead of leaking threads on
+        every retry.
+        """
+
         with cls._orphan_lock:
-            active = {
-                thread
-                for thread in cls._orphaned_threads.get(scope, set())
+            records = {
+                thread: record
+                for thread, record in cls._orphaned_threads.get(scope, {}).items()
                 if thread.is_alive()
             }
-            if active:
-                cls._orphaned_threads[scope] = active
-                return True
-            cls._orphaned_threads.pop(scope, None)
-            return False
+            if not records:
+                cls._orphaned_threads.pop(scope, None)
+                return False, False
+
+            quarantined = next(
+                (record for record in records.values() if record.quarantined),
+                None,
+            )
+            if quarantined is None:
+                now = time.monotonic()
+                eligible = sorted(
+                    (
+                        record
+                        for record in records.values()
+                        if now >= record.quarantine_after
+                    ),
+                    key=lambda record: record.quarantine_after,
+                )
+                if eligible:
+                    eligible[0].quarantined = True
+
+            cls._orphaned_threads[scope] = records
+            active_record = records.get(active_thread)
+            return (
+                any(not record.quarantined for record in records.values()),
+                bool(active_record and active_record.quarantined),
+            )
 
     def _mark_timed_out(self):
+        with self._state_lock:
+            active_thread = self._active_thread
+        if active_thread is None:
+            return
         with self._orphan_lock:
-            self._orphaned_threads.setdefault(self.scope, set()).add(
-                self._active_thread
+            self._orphaned_threads.setdefault(self.scope, {}).setdefault(
+                active_thread,
+                _OrphanedCall(
+                    thread=active_thread,
+                    quarantine_after=(
+                        time.monotonic() + self.orphan_cooldown_seconds
+                    ),
+                ),
             )
         with self._state_lock:
-            self._timed_out = True
+            if self._active_thread is active_thread:
+                self._timed_out = True
 
     @property
     def available(self) -> bool:
         with self._state_lock:
-            if (
-                self._timed_out
-                and self._active_thread is not None
-                and not self._active_thread.is_alive()
+            active_thread = self._active_thread
+            timed_out = self._timed_out
+        blocked, active_is_quarantined = self._scope_orphan_state(
+            self.scope,
+            active_thread,
+        )
+        with self._state_lock:
+            if self._active_thread is active_thread and timed_out and (
+                active_thread is None
+                or not active_thread.is_alive()
+                or active_is_quarantined
             ):
+                self._active_thread = None
                 self._timed_out = False
             own_call_available = not self._timed_out
-        return own_call_available and not self._scope_has_active_orphan(self.scope)
+        return own_call_available and not blocked
 
     @property
     def unavailable_reason(self) -> str:
         if self.available:
             return ""
-        return "The previous provider request timed out and is still closing. Retry later or restart."
+        return "The previous provider request timed out and is still closing. Retry later."
 
     def run(self, callback):
         result = []
@@ -127,7 +206,7 @@ class _BoundedCallRunner:
             finally:
                 finished.set()
 
-        if self._scope_has_active_orphan(self.scope):
+        if not self.available:
             raise ProviderCallTimeout("A timed-out provider request is still pending")
 
         with self._state_lock:
@@ -136,7 +215,6 @@ class _BoundedCallRunner:
                 and self._active_thread.is_alive()
             )
         if active_request:
-            self._mark_timed_out()
             raise ProviderCallTimeout("A previous provider request is still pending")
 
         with self._state_lock:
@@ -280,7 +358,11 @@ class GoogleTransProvider(TranslationProvider):
         self.translator = GoogleTranslator(source='auto', target='en')
         self._http_session = requests.Session()
         self._timeout_requests = _TimeoutRequests(self._http_session)
-        self._call_runner = _BoundedCallRunner("google")
+        # Let the transport's 4s connect + 8s read limits fire before the
+        # outer guard, leaving headroom for parsing and thread scheduling.
+        self._call_runner = _BoundedCallRunner(
+            "google", timeout_seconds=GOOGLE_CALL_TIMEOUT_SECONDS
+        )
         self._usage_lock = threading.Lock()
         self._estimated_characters = 0
 
@@ -362,6 +444,7 @@ class DeepLProvider(TranslationProvider):
         import deepl
 
         self.translator = deepl.Translator(api_key)
+        self._usage_translator = deepl.Translator(api_key)
         # The SDK applies bounded 10-second socket attempts plus retry backoff.
         # Keep our outer guard beyond that documented retry envelope so it does
         # not orphan a healthy SDK call after the old 12-second deadline.
@@ -370,6 +453,10 @@ class DeepLProvider(TranslationProvider):
         )
         self._usage_lock = threading.Lock()
         self._usage_snapshot = {'available': False}
+        self._usage_call_runner = _BoundedCallRunner(
+            "deepl-usage",
+            timeout_seconds=PROVIDER_USAGE_TIMEOUT_SECONDS,
+        )
 
     @property
     def name(self) -> str:
@@ -466,7 +553,9 @@ class DeepLProvider(TranslationProvider):
     def get_usage(self, *, refresh: bool = False) -> dict:
         if refresh:
             try:
-                usage = self._call_runner.run(self.translator.get_usage)
+                usage = self._usage_call_runner.run(
+                    self._usage_translator.get_usage
+                )
                 character = getattr(usage, 'character', None)
                 count = getattr(character, 'count', None)
                 limit = getattr(character, 'limit', None)
@@ -550,9 +639,15 @@ class TranslationService:
         self._fallback_enabled = False
         self._translation_cache = OrderedDict()
         self._glossary_factory = glossary_factory
-        self._glossaries: dict[tuple[str, str], EVEGlossary] = {}
-        self._glossary_revisions: dict[tuple[str, str], str] = {}
-        self._lexicon_matchers: dict[tuple, LongestLexiconMatcher] = {}
+        self._glossaries: OrderedDict[
+            tuple[str, str], EVEGlossary
+        ] = OrderedDict()
+        self._glossary_revisions: OrderedDict[
+            tuple[str, str], str
+        ] = OrderedDict()
+        self._lexicon_matchers: OrderedDict[
+            tuple, LongestLexiconMatcher
+        ] = OrderedDict()
         self._target_lang = 'en'
         self.translation_memory = translation_memory
         self.entity_index = entity_index
@@ -619,11 +714,38 @@ class TranslationService:
         return status
 
     def get_provider_usage(self, *, refresh: bool = True) -> dict:
-        """Return primary-provider usage; call from the scheduler thread."""
+        """Return primary and consented-fallback usage snapshots.
+
+        Refreshes run on the scheduler's dedicated usage thread.  In
+        particular, a Google-primary configuration still exposes the exact
+        DeepL quota consumed by its consented fallback.
+        """
 
         with self._provider_lock:
             mode = self._provider_mode
             provider = self.provider
+            fallback_enabled = self._fallback_enabled
+            fallback_mode = self._fallback_mode
+            fallback_provider = self._fallback_provider
+
+        snapshot = self._provider_usage_snapshot(provider, mode, refresh=refresh)
+        if fallback_enabled:
+            snapshot['fallback'] = self._provider_usage_snapshot(
+                fallback_provider,
+                fallback_mode,
+                refresh=refresh,
+            )
+        return snapshot
+
+    @staticmethod
+    def _provider_usage_snapshot(
+        provider: TranslationProvider | None,
+        mode: str,
+        *,
+        refresh: bool,
+    ) -> dict:
+        if provider is None:
+            return {'provider': mode, 'available': False}
         get_usage = getattr(provider, 'get_usage', None)
         if not callable(get_usage):
             return {'provider': mode, 'available': False}
@@ -666,6 +788,21 @@ class TranslationService:
     def set_doctrine_pack(self, doctrine_pack: Any) -> None:
         self.doctrine_pack = doctrine_pack
         self._clear_translation_cache()
+
+    def set_fallback_authorizer(self, authorizer: Callable[[], bool] | None) -> None:
+        """Install a scheduler-owned consent-generation check for fallback."""
+
+        self._fallback_authorizer = authorizer if callable(authorizer) else None
+
+    def _fallback_authorized(self) -> bool:
+        authorizer = getattr(self, '_fallback_authorizer', None)
+        if authorizer is None:
+            return True
+        try:
+            return bool(authorizer())
+        except Exception as exc:
+            logger.error("Fallback authorization check failed: %s", type(exc).__name__)
+            return False
 
     @staticmethod
     def _normalized_provider_mode(provider_mode: str) -> str:
@@ -881,6 +1018,16 @@ class TranslationService:
                 target_lang=target,
             )
             self._glossaries[pair] = glossary
+            while len(self._glossaries) > GLOSSARY_CACHE_SIZE:
+                expired_pair, _ = self._glossaries.popitem(last=False)
+                self._glossary_revisions.pop(expired_pair, None)
+                for key in tuple(self._lexicon_matchers):
+                    if key and key[0] == expired_pair:
+                        self._lexicon_matchers.pop(key, None)
+        else:
+            self._glossaries.move_to_end(pair)
+            if pair in self._glossary_revisions:
+                self._glossary_revisions.move_to_end(pair)
         return glossary
 
     @staticmethod
@@ -903,6 +1050,8 @@ class TranslationService:
             terms = getattr(glossary, 'terms', {})
             revision = self._mapping_digest(terms if isinstance(terms, Mapping) else {})
             self._glossary_revisions[pair] = revision
+        else:
+            self._glossary_revisions.move_to_end(pair)
         return revision
 
     def _active_doctrine(self) -> Any:
@@ -1117,6 +1266,7 @@ class TranslationService:
         key = self._lexicon_context(source_lang, target_lang, glossary)
         matcher = self._lexicon_matchers.get(key)
         if matcher is not None:
+            self._lexicon_matchers.move_to_end(key)
             return matcher
 
         entity_terms: Mapping[str, str] = {}
@@ -1150,6 +1300,8 @@ class TranslationService:
             ),
         ])
         self._lexicon_matchers[key] = matcher
+        while len(self._lexicon_matchers) > LEXICON_MATCHER_CACHE_SIZE:
+            self._lexicon_matchers.popitem(last=False)
         return matcher
 
     def _clear_translation_cache(self):
@@ -1339,32 +1491,33 @@ class TranslationService:
             return None
         restored = translated
         for placeholder, original in tokens.items():
-            exact_count = restored.count(placeholder)
-            if exact_count == 1:
-                restored = restored.replace(placeholder, original, 1)
-                continue
-            if exact_count > 1:
-                logger.warning("Provider duplicated a protected EVE entity placeholder")
-                return None
-
             token_match = re.fullmatch(
                 r"(_+)(EVE(?:DOCTRINE|ENTITY))_(\d+)(_+)",
                 placeholder,
                 flags=re.IGNORECASE,
             )
             if token_match is None:
-                logger.warning("Provider changed a protected EVE entity placeholder")
-                return None
+                exact_count = restored.count(placeholder)
+                if exact_count != 1:
+                    logger.warning("Provider changed a protected EVE entity placeholder")
+                    return None
+                restored = restored.replace(placeholder, original, 1)
+                continue
             leading, family, number, trailing = token_match.groups()
+
+            def spaced_underscores(value: str) -> str:
+                return r"_\s*" * (len(value) - 1) + r"_"
+
             flexible_pattern = re.compile(
-                r"(?<!_)"
-                + "".join(r"_\s*" for _ in leading)
+                r"(?<!\w)"
+                + spaced_underscores(leading)
+                + r"\s*"
                 + re.escape(family)
                 + r"\s*_\s*"
                 + re.escape(number)
                 + r"\s*"
-                + "".join(r"_\s*" for _ in trailing)
-                + r"(?!_)",
+                + spaced_underscores(trailing)
+                + r"(?!\w)",
                 flags=re.IGNORECASE,
             )
             matches = list(flexible_pattern.finditer(restored))
@@ -1392,6 +1545,11 @@ class TranslationService:
         for provider in providers:
             if provider is None:
                 continue
+            if provider is fallback and not self._fallback_authorized():
+                logger.info(
+                    "Fallback skipped because provider consent/config changed"
+                )
+                break
             last_provider_name = provider.name
             try:
                 if (
@@ -1445,7 +1603,8 @@ class TranslationService:
                 fallback_available = (
                     self._fallback_enabled and self._fallback_provider is not None
                 )
-            if fallback_available:
+                primary_name = self.provider.name
+            if fallback_available and provider_name == primary_name:
                 translated, provider_name = self._translate_via_provider(
                     prepared.request_text,
                     target_lang,
@@ -1482,6 +1641,12 @@ class TranslationService:
         corrected = self._lookup_correction(message, source_lang, target_lang)
         if corrected is not None:
             return corrected, True, "Local correction"
+        if (
+            _base_language_code(source_lang, 'auto')
+            == _base_language_code(target_lang, 'unknown')
+            and _base_language_code(source_lang, 'auto') not in {'auto', 'unknown'}
+        ):
+            return message, True, "Local"
         cache_key = self._message_cache_key(
             message,
             target_lang,
@@ -1537,6 +1702,13 @@ class TranslationService:
             corrected = self._lookup_correction(message, source, target)
             if corrected is not None:
                 results[index] = (corrected, True, "Local correction")
+                continue
+            if (
+                _base_language_code(source, 'auto')
+                == _base_language_code(target, 'unknown')
+                and _base_language_code(source, 'auto') not in {'auto', 'unknown'}
+            ):
+                results[index] = (message, True, "Local")
                 continue
             cache_key = self._message_cache_key(message, target, source, context)
             cached = self._get_cached_translation(cache_key)

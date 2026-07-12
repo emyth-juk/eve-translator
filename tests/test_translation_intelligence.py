@@ -9,7 +9,9 @@ from src.core.entity_protection import (
 from src.core.translation_memory import TranslationMemory
 from src.services.translator import (
     DeepLProvider,
+    GLOSSARY_CACHE_SIZE,
     GoogleTransProvider,
+    LEXICON_MATCHER_CACHE_SIZE,
     TranslationService,
 )
 
@@ -128,6 +130,50 @@ def test_regional_target_language_is_preserved_for_layered_glossary_loading():
     assert service.glossary.target_lang == "de-de"
 
 
+def test_glossary_cache_is_bounded_and_refreshes_recent_pairs():
+    service = TranslationService(
+        provider=SingleProvider(),
+        glossary_factory=RecordingGlossaryFactory(),
+    )
+
+    for number in range(GLOSSARY_CACHE_SIZE - 1):
+        service._get_glossary(f"l{number}", "en")
+    service._get_glossary("zh", "en")  # Refresh the initial pair.
+    service._get_glossary(f"l{GLOSSARY_CACHE_SIZE}", "en")
+
+    assert len(service._glossaries) == GLOSSARY_CACHE_SIZE
+    assert ("zh", "en") in service._glossaries
+    assert ("l0", "en") not in service._glossaries
+
+
+def test_lexicon_matcher_cache_is_bounded_and_refreshes_recent_contexts():
+    service = TranslationService(
+        provider=SingleProvider(),
+        glossary_factory=RecordingGlossaryFactory(),
+    )
+    glossary = service._get_glossary("fr", "en")
+    keys = []
+    for number in range(LEXICON_MATCHER_CACHE_SIZE):
+        service.doctrine_pack = SimpleNamespace(
+            scope="fleet",
+            revision=str(number),
+        )
+        keys.append(service._lexicon_context("fr", "en", glossary))
+        service._lexicon_matcher("fr", "en", glossary, {})
+
+    service.doctrine_pack = SimpleNamespace(scope="fleet", revision="0")
+    service._lexicon_matcher("fr", "en", glossary, {})
+    service.doctrine_pack = SimpleNamespace(
+        scope="fleet",
+        revision=str(LEXICON_MATCHER_CACHE_SIZE),
+    )
+    service._lexicon_matcher("fr", "en", glossary, {})
+
+    assert len(service._lexicon_matchers) == LEXICON_MATCHER_CACHE_SIZE
+    assert keys[0] in service._lexicon_matchers
+    assert keys[1] not in service._lexicon_matchers
+
+
 def test_exact_local_correction_bypasses_disabled_or_cloud_provider(tmp_path):
     memory = TranslationMemory(tmp_path / "memory.sqlite3")
     memory.remember("Ne sautez pas!", "Do not jump!", "fr", "en")
@@ -241,6 +287,33 @@ def test_doctrine_placeholder_restores_with_spaces_around_separators():
     )
 
 
+def test_placeholder_restoration_preserves_surrounding_whitespace():
+    restored = TranslationService._restore_protected_entities(
+        "Primary _ _ eveentity _ 1 _ _  now",
+        {"__EVEENTITY_1__": "Raven"},
+    )
+
+    assert restored == "Primary Raven  now"
+
+
+def test_placeholder_restoration_rejects_mixed_duplicate_variants():
+    restored = TranslationService._restore_protected_entities(
+        "__EVEENTITY_1__ and _ _ eveentity _ 1 _ _",
+        {"__EVEENTITY_1__": "Raven"},
+    )
+
+    assert restored is None
+
+
+def test_placeholder_restoration_rejects_word_embedded_variant():
+    restored = TranslationService._restore_protected_entities(
+        "x__eveentity_1__y",
+        {"__EVEENTITY_1__": "Raven"},
+    )
+
+    assert restored is None
+
+
 def test_missing_or_duplicated_placeholder_fails_closed_to_original():
     entity_index = ProtectedEntityIndex([ProtectedEntity("Raven", "ship")])
     missing = TranslationService(
@@ -264,6 +337,31 @@ def test_missing_or_duplicated_placeholder_fails_closed_to_original():
     assert duplicated.translate_message("Primary Raven", "fr", "en") == (
         "Primary Raven", False, "Single"
     )
+
+
+def test_same_base_language_uses_local_correction_then_skips_provider():
+    class Corrections:
+        calls = []
+
+        @classmethod
+        def lookup(cls, message, source, target, scope):
+            cls.calls.append((message, source, target, scope))
+            return "Corrected formup" if message == "formup" else None
+
+    provider = SingleProvider()
+    service = TranslationService(provider=provider, translation_memory=Corrections())
+
+    assert service.translate_message("formup", "en-US", "en") == (
+        "Corrected formup", True, "Local correction"
+    )
+    assert service.translate_message("already English", "en-US", "en-GB") == (
+        "already English", True, "Local"
+    )
+    assert provider.calls == []
+    assert Corrections.calls == [
+        ("formup", "en", "en-us", ""),
+        ("already English", "en-gb", "en-us", ""),
+    ]
 
 
 def test_official_sde_names_canonicalize_before_yaml_ship_aliases():
@@ -473,6 +571,22 @@ def test_batch_uses_one_provider_request_and_restores_each_entity():
     sent, target, source, context = provider.batch_calls[0]
     assert sent == ["Primary __EVEENTITY_1__", "Warp __EVEENTITY_1__"]
     assert (target, source, context) == ("fr", "en", "FC said hold")
+    assert provider.single_calls == []
+
+
+def test_batch_skips_provider_when_source_and_target_share_base_language():
+    provider = BatchProvider()
+    service = TranslationService(provider=provider)
+
+    assert service.translate_batch_messages(
+        ["Bom dia", "Alinhar no portao"],
+        "pt-BR",
+        "pt",
+    ) == [
+        ("Bom dia", True, "Local"),
+        ("Alinhar no portao", True, "Local"),
+    ]
+    assert provider.batch_calls == []
     assert provider.single_calls == []
 
 

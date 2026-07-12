@@ -208,6 +208,60 @@ def test_fallback_is_used_only_after_explicit_consent_and_primary_failure():
     }
 
 
+def test_fallback_is_skipped_when_consent_changes_during_primary_call():
+    consent = {'allowed': True}
+
+    class RevokingPrimary(CountingProvider):
+        def translate(self, text, target_lang='en', source_lang=None):
+            consent['allowed'] = False
+            return super().translate(text, target_lang, source_lang)
+
+    google = RevokingPrimary([None])
+    google.name = "Google"
+    deepl = CountingProvider(["Hallo"])
+    deepl.name = "DeepL"
+    service = TranslationService(provider_factories={
+        'google': MagicMock(return_value=google),
+        'deepl': MagicMock(return_value=deepl),
+    })
+    service.set_config({
+        'translation_provider': 'google',
+        'provider_fallback_enabled': True,
+        'deepl_api_key': 'consented-key',
+        'target_language': 'de',
+    })
+    service.set_fallback_authorizer(lambda: consent['allowed'])
+
+    assert service.translate_message("Hello", "de", "en") == (
+        "Hello", False, "Google"
+    )
+    assert google.calls == 1
+    assert deepl.calls == 0
+
+
+def test_failed_fallback_is_not_invoked_twice():
+    google = CountingProvider([None])
+    google.name = "Google"
+    deepl = CountingProvider([None])
+    deepl.name = "DeepL"
+    service = TranslationService(provider_factories={
+        'google': MagicMock(return_value=google),
+        'deepl': MagicMock(return_value=deepl),
+    })
+    service.set_config({
+        'translation_provider': 'google',
+        'provider_fallback_enabled': True,
+        'deepl_api_key': 'consented-key',
+        'target_language': 'de',
+    })
+
+    assert service.translate_message("Hello", "de", "en") == (
+        "Hello", False, "DeepL"
+    )
+    assert google.calls == 1
+    assert deepl.calls == 1
+
+
 def test_fallback_is_never_constructed_or_called_without_consent():
     google = CountingProvider([None])
     google.name = "Google"
@@ -270,6 +324,45 @@ def test_provider_usage_is_requested_from_primary_with_safe_mode_label():
         'estimated_characters': 123,
     }
     provider.get_usage.assert_called_once_with(refresh=True)
+
+
+def test_provider_usage_includes_consented_deepl_fallback_quota():
+    google = CountingProvider([])
+    google.name = "Google"
+    google.get_usage = MagicMock(return_value={
+        'available': True,
+        'estimated_characters': 123,
+    })
+    deepl = CountingProvider([])
+    deepl.name = "DeepL"
+    deepl.get_usage = MagicMock(return_value={
+        'available': True,
+        'used': 80,
+        'limit': 100,
+    })
+    service = TranslationService(provider_factories={
+        'google': MagicMock(return_value=google),
+        'deepl': MagicMock(return_value=deepl),
+    })
+    service.set_config({
+        'translation_provider': 'google',
+        'provider_fallback_enabled': True,
+        'deepl_api_key': 'consented-key',
+    })
+
+    assert service.get_provider_usage(refresh=True) == {
+        'provider': 'google',
+        'available': True,
+        'estimated_characters': 123,
+        'fallback': {
+            'provider': 'deepl',
+            'available': True,
+            'used': 80,
+            'limit': 100,
+        },
+    }
+    google.get_usage.assert_called_once_with(refresh=True)
+    deepl.get_usage.assert_called_once_with(refresh=True)
 
 
 def test_provider_status_uses_one_atomic_provider_snapshot():

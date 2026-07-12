@@ -92,6 +92,7 @@ class ComposeDialog(QDialog):
 
         self._request_counter = 0
         self._active_request_id: int | None = None
+        self._active_request_stale = False
         self._last_completed_request_id: int | None = None
 
         layout = QVBoxLayout(self)
@@ -266,6 +267,11 @@ class ComposeDialog(QDialog):
     @Slot()
     def request_translation(self) -> int | None:
         """Emit one asynchronous translation request and return its ID."""
+        # Keyboard shortcuts can invoke this slot even while the button is
+        # disabled.  Keep exactly one outbound cloud request active at a time.
+        if self._active_request_id is not None:
+            self._refresh_request_action()
+            return None
         text = self.source_text_edit.toPlainText().strip()
         source = self.source_language()
         target = self.target_language()
@@ -285,12 +291,14 @@ class ComposeDialog(QDialog):
         self._request_counter += 1
         request_id = self._request_counter
         self._active_request_id = request_id
+        self._active_request_stale = False
         self.output_text_edit.clear()
         self.copy_button.setEnabled(False)
         self.status_label.setStyleSheet("color: #777;")
         self.status_label.setText("Translating...")
-        self.translate_button.setText("Translate &again")
+        self.translate_button.setText("Translating...")
         self.translation_requested.emit(request_id, text, source, target)
+        self._refresh_request_action()
         return request_id
 
     @Slot(int, str)
@@ -298,11 +306,15 @@ class ComposeDialog(QDialog):
         """Display the current request's result; ignore superseded responses."""
         if request_id != self._active_request_id:
             return False
+        if self._active_request_stale:
+            self._discard_stale_response()
+            return False
         result = str(translated_text or "").strip()
         if not result:
             return self.fail_translation(request_id, "The provider returned an empty translation.")
 
         self._active_request_id = None
+        self._active_request_stale = False
         self._last_completed_request_id = request_id
         self.output_text_edit.setPlainText(result)
         self.copy_button.setEnabled(True)
@@ -317,7 +329,11 @@ class ComposeDialog(QDialog):
         """Display a safe current-request error; ignore superseded responses."""
         if request_id != self._active_request_id:
             return False
+        if self._active_request_stale:
+            self._discard_stale_response()
+            return False
         self._active_request_id = None
+        self._active_request_stale = False
         message = str(error_message or "Translation failed.").strip()
         self._set_error(message[:500])
         self.translate_button.setText("&Translate")
@@ -337,18 +353,22 @@ class ComposeDialog(QDialog):
 
     @Slot()
     def _request_input_changed(self) -> None:
-        # Editing any request field makes an in-flight response stale.  The
-        # worker may still finish, but its old request ID can no longer update
-        # the dialog.
+        # Editing any request field makes an in-flight response stale. Keep the
+        # request marker until its callback arrives so edits cannot be used to
+        # queue overlapping provider calls.
         request_was_active = self._active_request_id is not None
         result_was_visible = bool(self.output_text_edit.toPlainText())
         if request_was_active:
-            self._active_request_id = None
+            self._active_request_stale = True
         if request_was_active or result_was_visible:
             self.output_text_edit.clear()
             self.copy_button.setEnabled(False)
             self.status_label.setStyleSheet("color: #777;")
-            self.status_label.setText("Message changed - translate again when ready.")
+            self.status_label.setText(
+                "Message changed - waiting for the current translation to finish."
+                if request_was_active
+                else "Message changed - translate again when ready."
+            )
             self.translate_button.setText("&Translate")
         elif self.status_label.text() != "Ready":
             self.status_label.setStyleSheet("")
@@ -361,15 +381,32 @@ class ComposeDialog(QDialog):
         target = self.target_language()
         source_valid = source == "auto" or bool(LANGUAGE_CODE_PATTERN.fullmatch(source))
         target_valid = bool(LANGUAGE_CODE_PATTERN.fullmatch(target))
-        self.translate_button.setEnabled(text_present and source_valid and target_valid)
+        self.translate_button.setEnabled(
+            text_present
+            and source_valid
+            and target_valid
+            and self._active_request_id is None
+        )
 
     def _set_error(self, message: str) -> None:
         self.status_label.setStyleSheet("color: #c0392b;")
         self.status_label.setText(message)
 
-    def _invalidate_pending_request(self) -> None:
+    def _discard_stale_response(self) -> None:
         self._active_request_id = None
+        self._active_request_stale = False
+        self.output_text_edit.clear()
+        self.copy_button.setEnabled(False)
+        self.status_label.setStyleSheet("color: #777;")
+        self.status_label.setText(
+            "Previous translation discarded - translate the updated message when ready."
+        )
         self.translate_button.setText("&Translate")
+        self._refresh_request_action()
+
+    def _invalidate_pending_request(self) -> None:
+        if self._active_request_id is not None:
+            self._active_request_stale = True
 
     def reject(self) -> None:
         self._invalidate_pending_request()

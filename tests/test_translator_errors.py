@@ -11,6 +11,8 @@ from src.services.translator import (
     GOOGLE_READ_TIMEOUT_SECONDS,
     DeepLProvider,
     GoogleTransProvider,
+    ProviderCallTimeout,
+    _BoundedCallRunner,
 )
 
 class TestTranslatorErrors(unittest.TestCase):
@@ -165,6 +167,74 @@ class TestTranslatorErrors(unittest.TestCase):
                 time.sleep(0.005)
 
         self.assertTrue(replacement_provider.available)
+
+    def test_stuck_provider_call_recovers_after_bounded_orphan_cooldown(self):
+        release_request = threading.Event()
+        scope = f"provider-recovery-{id(release_request)}"
+        runner = _BoundedCallRunner(
+            scope,
+            timeout_seconds=0.01,
+            orphan_cooldown_seconds=0.02,
+        )
+        calls = []
+
+        def stuck_request():
+            calls.append("stuck")
+            release_request.wait()
+            return "late"
+
+        try:
+            with self.assertRaises(ProviderCallTimeout):
+                runner.run(stuck_request)
+            with self.assertRaises(ProviderCallTimeout):
+                runner.run(lambda: calls.append("too-early"))
+            self.assertEqual(calls, ["stuck"])
+
+            deadline = time.monotonic() + 0.5
+            while not runner.available and time.monotonic() < deadline:
+                time.sleep(0.005)
+
+            self.assertTrue(runner.available)
+            self.assertEqual(runner.run(lambda: "recovered"), "recovered")
+            self.assertFalse(release_request.is_set())
+        finally:
+            release_request.set()
+
+    def test_only_one_live_orphan_can_be_quarantined_per_provider_scope(self):
+        first_release = threading.Event()
+        second_release = threading.Event()
+        scope = f"provider-one-orphan-{id(first_release)}"
+        runner = _BoundedCallRunner(
+            scope,
+            timeout_seconds=0.01,
+            orphan_cooldown_seconds=0.02,
+        )
+        calls = []
+
+        def wait_for(release, label):
+            calls.append(label)
+            release.wait()
+            return label
+
+        try:
+            with self.assertRaises(ProviderCallTimeout):
+                runner.run(lambda: wait_for(first_release, "first"))
+            deadline = time.monotonic() + 0.5
+            while not runner.available and time.monotonic() < deadline:
+                time.sleep(0.005)
+            self.assertTrue(runner.available)
+
+            with self.assertRaises(ProviderCallTimeout):
+                runner.run(lambda: wait_for(second_release, "second"))
+            time.sleep(0.04)
+
+            self.assertFalse(runner.available)
+            with self.assertRaises(ProviderCallTimeout):
+                runner.run(lambda: calls.append("third"))
+            self.assertEqual(calls, ["first", "second"])
+        finally:
+            first_release.set()
+            second_release.set()
 
 if __name__ == '__main__':
     unittest.main()

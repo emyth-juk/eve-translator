@@ -435,11 +435,11 @@ class SettingsDialog(QDialog):
         memory = getattr(self._translation_service, 'translation_memory', None)
         try:
             correction_count = memory.count() if memory is not None else 0
-        except (OSError, sqlite3.Error):
+        except (OSError, RuntimeError, sqlite3.Error):
             correction_count = 0
         self.lbl_correction_count = QLabel(f"{correction_count:,} exact local corrections")
         form_local.addRow("Correction memory:", self.lbl_correction_count)
-        self.btn_export_corrections = QPushButton("Export corrections ZIPâ€¦")
+        self.btn_export_corrections = QPushButton("Export corrections ZIP…")
         self.btn_export_corrections.setEnabled(memory is not None and correction_count > 0)
         self.btn_export_corrections.clicked.connect(self._export_correction_pack)
         form_local.addRow("Share corrections:", self.btn_export_corrections)
@@ -517,7 +517,10 @@ class SettingsDialog(QDialog):
         if destination.suffix.casefold() != '.zip':
             destination = destination.with_suffix('.zip')
         pack_id = re.sub(r'[^a-z0-9._-]+', '-', destination.stem.casefold())
-        pack_id = pack_id.strip('._-')[:64] or 'fleet-corrections'
+        pack_id = (
+            pack_id.strip('._-')[:64].rstrip('._-')
+            or 'fleet-corrections'
+        )
         doctrine_scope = ''
         active = self.config['shared'].get('active_doctrine_pack', '')
         if active:
@@ -689,6 +692,9 @@ class SettingsDialog(QDialog):
 
     def _show_provider_usage_idle(self):
         provider_mode = self._selected_provider_mode()
+        self.btn_refresh_provider_usage.setEnabled(
+            provider_mode != TRANSLATION_PROVIDER_DISABLED
+        )
         self.lbl_provider_usage.setStyleSheet("color: gray;")
         if provider_mode == TRANSLATION_PROVIDER_DISABLED:
             message = "Usage unavailable while translation is disabled."
@@ -697,6 +703,8 @@ class SettingsDialog(QDialog):
                 "Local runtime estimate not refreshed. Google provides no "
                 "provider usage limit."
             )
+            if self.chk_provider_fallback.isChecked():
+                message += " DeepL fallback quota not refreshed."
         else:
             message = "DeepL usage not refreshed."
         self.lbl_provider_usage.setText(message)
@@ -707,6 +715,7 @@ class SettingsDialog(QDialog):
             return
         self.lbl_provider_usage.setStyleSheet("color: gray;")
         self.lbl_provider_usage.setText("Refreshing provider usage...")
+        self.btn_refresh_provider_usage.setEnabled(False)
         self.provider_usage_requested.emit()
 
     @staticmethod
@@ -726,9 +735,14 @@ class SettingsDialog(QDialog):
         DeepL accepts ``used``/``limit`` (or its SDK-style
         ``character_count``/``character_limit`` aliases). Google accepts
         ``estimated_characters`` and is always labelled as a local estimate.
+        A consented DeepL fallback is rendered from the nested ``fallback``
+        snapshot so its real quota cannot be hidden by a Google primary.
         """
         if not isinstance(usage, dict):
             usage = {}
+        self.btn_refresh_provider_usage.setEnabled(
+            self._selected_provider_mode() != TRANSLATION_PROVIDER_DISABLED
+        )
 
         selected_provider = self._selected_provider_mode()
         provider = usage.get('provider', selected_provider)
@@ -792,11 +806,44 @@ class SettingsDialog(QDialog):
                     "Google usage estimate is unavailable. Try again."
                 )
                 return
-            self.lbl_provider_usage.setStyleSheet("color: gray;")
-            self.lbl_provider_usage.setText(
+            message = (
                 f"Google local runtime estimate: {estimated:,} characters. "
                 "Estimate only; Google provides no provider usage limit."
             )
+            warning = False
+            fallback = usage.get('fallback')
+            if (
+                isinstance(fallback, dict)
+                and fallback.get('provider') == TRANSLATION_PROVIDER_DEEPL
+                and self.chk_provider_fallback.isChecked()
+            ):
+                fallback_used = self._usage_count(
+                    fallback.get('used', fallback.get('character_count'))
+                )
+                fallback_limit = self._usage_count(
+                    fallback.get('limit', fallback.get('character_limit'))
+                )
+                if (
+                    fallback.get('error')
+                    or fallback.get('unavailable')
+                    or fallback.get('available') is False
+                    or fallback_used is None
+                    or fallback_limit in {None, 0}
+                ):
+                    message += " DeepL fallback usage is unavailable."
+                else:
+                    percent = fallback_used / fallback_limit * 100
+                    warning = percent >= 80
+                    message += (
+                        f" DeepL fallback: {fallback_used:,} / "
+                        f"{fallback_limit:,} characters used ({percent:.1f}%)."
+                    )
+                    if warning:
+                        message += " Warning: fallback quota usage is at or above 80%."
+            self.lbl_provider_usage.setStyleSheet(
+                "color: #c0392b;" if warning else "color: gray;"
+            )
+            self.lbl_provider_usage.setText(message)
             return
 
         self._show_provider_usage_idle()

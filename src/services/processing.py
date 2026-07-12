@@ -20,6 +20,56 @@ class ConfigUpdatePending(RuntimeError):
     """Internal control flow used to defer work until new consent is applied."""
 
 
+@dataclass(frozen=True)
+class ConfigGenerationSnapshot:
+    requested: int
+    applied: int
+
+    @property
+    def pending(self) -> bool:
+        return self.requested > self.applied
+
+
+class ConfigGenerationGate:
+    """Thread-safe requested/applied generation boundary for worker handoffs."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._requested = 0
+        self._applied = 0
+
+    def _snapshot_unlocked(self) -> ConfigGenerationSnapshot:
+        return ConfigGenerationSnapshot(
+            requested=self._requested,
+            applied=self._applied,
+        )
+
+    def request_next(self) -> int:
+        """Allocate the next generation for the analysis worker."""
+        with self._lock:
+            self._requested += 1
+            return self._requested
+
+    def request(self, generation: int) -> ConfigGenerationSnapshot:
+        """Accept an externally allocated generation for the scheduler."""
+        with self._lock:
+            self._requested = max(self._requested, generation)
+            return self._snapshot_unlocked()
+
+    def apply(self, generation: int) -> ConfigGenerationSnapshot:
+        """Mark a generation applied and return one atomic state snapshot."""
+        with self._lock:
+            self._applied = max(self._applied, generation)
+            return self._snapshot_unlocked()
+
+    def snapshot(self) -> ConfigGenerationSnapshot:
+        with self._lock:
+            return self._snapshot_unlocked()
+
+    def pending(self) -> bool:
+        return self.snapshot().pending
+
+
 class WorkerSignals(QObject):
     message_ready = Signal(object)
     translation_requested = Signal(object)
@@ -75,9 +125,7 @@ class LogProcessingWorker(QObject):
         self.signals = WorkerSignals()
         self.config = {'ignored_languages': ['en'], 'target_language': 'en'}
         self._message_counter = itertools.count(1)
-        self._config_generation_lock = threading.Lock()
-        self._requested_config_generation = 0
-        self._applied_config_generation = 0
+        self._config_gate = ConfigGenerationGate()
         self._deferred_batches = deque()
         self.doctrine_pack = None
 
@@ -87,16 +135,10 @@ class LogProcessingWorker(QObject):
         This method only touches a lock-protected integer, so the GUI thread may
         call it directly without mutating worker-owned provider state.
         """
-        with self._config_generation_lock:
-            self._requested_config_generation += 1
-            return self._requested_config_generation
+        return self._config_gate.request_next()
 
     def _config_update_pending(self) -> bool:
-        with self._config_generation_lock:
-            return (
-                self._requested_config_generation
-                > self._applied_config_generation
-            )
+        return self._config_gate.pending()
 
     @Slot(dict)
     def update_config(self, config):
@@ -106,17 +148,9 @@ class LogProcessingWorker(QObject):
     @Slot(int, dict)
     def apply_queued_config(self, generation, config):
         self._apply_config(config)
-        with self._config_generation_lock:
-            self._applied_config_generation = max(
-                self._applied_config_generation,
-                generation,
-            )
-            newer_update_pending = (
-                self._requested_config_generation
-                > self._applied_config_generation
-            )
+        generation_state = self._config_gate.apply(generation)
 
-        if newer_update_pending:
+        if generation_state.pending:
             return
 
         deferred_batches = list(self._deferred_batches)
@@ -279,7 +313,7 @@ class LogProcessingWorker(QObject):
                 tokens=dict(tokenized.tokens),
                 commands=commands,
                 speaker_role=role,
-                config_generation=self._applied_config_generation,
+                config_generation=self._config_gate.snapshot().applied,
             ))
             return
 
@@ -416,6 +450,7 @@ class TranslationScheduler(QObject):
     compose_translation_ready = Signal(int, str)
     compose_translation_failed = Signal(int, str)
     provider_usage_ready = Signal(dict)
+    provider_status_ready = Signal(dict)
 
     def __init__(
         self,
@@ -437,13 +472,26 @@ class TranslationScheduler(QObject):
         self._jobs: deque[TranslationJob] = deque()
         self._deferred_jobs: deque[TranslationJob] = deque()
         self._context = defaultdict(deque)
-        self._generation_lock = threading.Lock()
-        self._requested_generation = 0
-        self._applied_generation = 0
+        self._config_gate = ConfigGenerationGate()
         self._entity_index = getattr(translator_service, 'entity_index', None)
         self._entity_index_loader = entity_index_loader
         self._entity_index_path = entity_index_path
         self._entity_index_initialized = entity_index_loader is None
+        self._entity_initialization_armed = False
+        self._compose_detector = None
+        self._usage_refresh_lock = threading.Lock()
+        self._usage_refresh_in_flight = False
+        self._stopping = False
+        set_fallback_authorizer = getattr(
+            translator_service,
+            'set_fallback_authorizer',
+            None,
+        )
+        if callable(set_fallback_authorizer):
+            set_fallback_authorizer(
+                lambda: not self._config_update_pending()
+                and not self._stopping
+            )
         self._doctrine_path = None
         self._flush_timer = QTimer(self)
         self._flush_timer.setSingleShot(True)
@@ -460,6 +508,17 @@ class TranslationScheduler(QObject):
         immediately while provider work waits for complete entity protection.
         """
 
+        self._entity_initialization_armed = True
+        if not self.config.get('entity_protection', True):
+            set_entity_index = getattr(
+                self.translator_service,
+                'set_entity_index',
+                None,
+            )
+            if callable(set_entity_index):
+                set_entity_index(None)
+            self.entity_index_ready.emit(None)
+            return
         if self._entity_index_initialized:
             return
         self._entity_index_initialized = True
@@ -485,14 +544,35 @@ class TranslationScheduler(QObject):
         if not callable(get_usage):
             self.provider_usage_ready.emit({'available': False, 'error': True})
             return
-        try:
-            usage = get_usage(refresh=True)
-        except Exception as exc:
-            logger.error("Unexpected provider usage failure: %s", type(exc).__name__)
-            usage = {'available': False, 'error': True}
-        self.provider_usage_ready.emit(
-            usage if isinstance(usage, dict) else {'available': False, 'error': True}
-        )
+        with self._usage_refresh_lock:
+            if self._usage_refresh_in_flight or self._stopping:
+                return
+            self._usage_refresh_in_flight = True
+
+        def run_usage_refresh():
+            try:
+                usage = get_usage(refresh=True)
+            except Exception as exc:
+                logger.error(
+                    "Unexpected provider usage failure: %s",
+                    type(exc).__name__,
+                )
+                usage = {'available': False, 'error': True}
+            with self._usage_refresh_lock:
+                self._usage_refresh_in_flight = False
+                stopping = self._stopping
+            if not stopping:
+                self.provider_usage_ready.emit(
+                    usage
+                    if isinstance(usage, dict)
+                    else {'available': False, 'error': True}
+                )
+
+        threading.Thread(
+            target=run_usage_refresh,
+            name="provider-usage-refresh",
+            daemon=True,
+        ).start()
 
     @Slot(int, str, str, str)
     def translate_composed_message(
@@ -520,15 +600,39 @@ class TranslationScheduler(QObject):
                 "Outbound messages are limited to 5,000 characters.",
             )
             return
+        source = normalize_locale(source_language, 'auto')
+        if source in {'auto', 'unknown'}:
+            try:
+                if self._compose_detector is None:
+                    from src.core.detector import LanguageDetector
+                    self._compose_detector = LanguageDetector()
+                _translate, detected = self._compose_detector.should_translate(
+                    message,
+                    target_lang=target_language,
+                    ignored_langs=set(),
+                )
+                if detected not in {'auto', 'unknown'}:
+                    source = detected
+            except Exception as exc:
+                logger.warning(
+                    "Could not detect outbound source language: %s",
+                    type(exc).__name__,
+                )
         try:
             translated, success, provider = self.translator_service.translate_message(
                 message,
                 target_language,
-                source_lang=source_language,
+                source_lang=source,
             )
         except Exception as exc:
             logger.error("Unexpected outbound translation failure: %s", type(exc).__name__)
             translated, success, provider = message, False, "Translation provider"
+        if self._config_update_pending():
+            self.compose_translation_failed.emit(
+                request_id,
+                "Provider settings changed while translating. Try again.",
+            )
+            return
         if success and isinstance(translated, str) and translated.strip():
             self.compose_translation_ready.emit(request_id, translated)
             return
@@ -541,14 +645,13 @@ class TranslationScheduler(QObject):
     @Slot(dict)
     def update_config(self, config):
         self._apply_config(config)
+        self._emit_provider_status()
 
     def request_config_update(self, generation: int) -> None:
-        with self._generation_lock:
-            self._requested_generation = max(self._requested_generation, generation)
+        self._config_gate.request(generation)
 
     def _config_update_pending(self) -> bool:
-        with self._generation_lock:
-            return self._requested_generation > self._applied_generation
+        return self._config_gate.pending()
 
     @Slot(int, dict)
     def apply_queued_config(self, generation: int, config: dict) -> None:
@@ -561,61 +664,85 @@ class TranslationScheduler(QObject):
         waiting_jobs.extend(self._deferred_jobs)
         self._deferred_jobs.clear()
         self._apply_config(config)
-        with self._generation_lock:
-            self._applied_generation = max(self._applied_generation, generation)
-            pending = self._requested_generation > self._applied_generation
-        if pending:
+        generation_state = self._config_gate.apply(generation)
+        if generation_state.pending:
             self._deferred_jobs.extend(waiting_jobs)
             return
+        self._emit_provider_status()
         target = self.config.get('target_language', 'en')
         for job in waiting_jobs:
             self.queue_job(replace(
                 job,
                 target_language=target,
-                config_generation=self._applied_generation,
+                config_generation=generation_state.applied,
             ))
 
     def _apply_config(self, config) -> None:
+        entity_protection_was_enabled = self.config.get('entity_protection', True)
         self.config = config.copy() if isinstance(config, dict) else {}
         self.translator_service.set_config(self.config)
+        entity_protection_enabled = self.config.get('entity_protection', True)
         set_entity_index = getattr(self.translator_service, 'set_entity_index', None)
         if callable(set_entity_index):
             set_entity_index(
-                self._entity_index if self.config.get('entity_protection', True) else None
+                self._entity_index
+                if entity_protection_enabled and self._entity_index_initialized
+                else None
             )
+        if (
+            entity_protection_enabled
+            and not self._entity_index_initialized
+            and self._entity_initialization_armed
+        ):
+            self.initialize_entity_index()
+        elif (
+            not entity_protection_enabled
+            and entity_protection_was_enabled
+            and self._entity_initialization_armed
+        ):
+            self.entity_index_ready.emit(None)
         doctrine_path = self.config.get('active_doctrine_pack', '')
-        if doctrine_path != self._doctrine_path:
-            doctrine = None
-            if doctrine_path:
-                try:
-                    from src.core.doctrine import load_doctrine_pack
-                    doctrine = load_doctrine_pack(doctrine_path)
-                except Exception as exc:
-                    logger.warning("Ignoring invalid active doctrine pack: %s", exc)
-            set_doctrine = getattr(self.translator_service, 'set_doctrine_pack', None)
-            if callable(set_doctrine):
-                set_doctrine(doctrine)
-            self._doctrine_path = doctrine_path
+        doctrine = None
+        if doctrine_path:
+            try:
+                from src.core.doctrine import load_doctrine_pack
+                doctrine = load_doctrine_pack(doctrine_path)
+            except Exception as exc:
+                logger.warning("Ignoring invalid active doctrine pack: %s", exc)
+        set_doctrine = getattr(self.translator_service, 'set_doctrine_pack', None)
+        if callable(set_doctrine):
+            set_doctrine(doctrine)
+        self._doctrine_path = doctrine_path
         self._context.clear()
+
+    def _emit_provider_status(self) -> None:
+        get_provider_status = getattr(
+            self.translator_service,
+            'get_provider_status',
+            None,
+        )
+        if callable(get_provider_status):
+            status = get_provider_status()
+            self.provider_status_ready.emit(
+                status if isinstance(status, dict) else {}
+            )
 
     @Slot(object)
     def queue_job(self, job) -> None:
         if not isinstance(job, TranslationJob):
             return
-        with self._generation_lock:
-            requested = self._requested_generation
-            applied = self._applied_generation
-        if requested > applied or job.config_generation > applied:
+        generation_state = self._config_gate.snapshot()
+        if generation_state.pending or job.config_generation > generation_state.applied:
             self._deferred_jobs.append(job)
             return
-        if job.config_generation < applied:
+        if job.config_generation < generation_state.applied:
             # Cross-thread delivery can let the scheduler apply a config before
             # the analysis worker's older job signal arrives. Retarget it now;
             # there may be no later config event to drain a deferred queue.
             job = replace(
                 job,
                 target_language=self.config.get('target_language', 'en'),
-                config_generation=applied,
+                config_generation=generation_state.applied,
             )
         high_priority = bool(job.commands or job.speaker_role)
         burst_enabled = bool(self.config.get('burst_optimization', True))
@@ -764,6 +891,8 @@ class TranslationScheduler(QObject):
 
     @Slot()
     def stop(self) -> None:
+        with self._usage_refresh_lock:
+            self._stopping = True
         self._flush_timer.stop()
         self._jobs.clear()
         self._deferred_jobs.clear()
