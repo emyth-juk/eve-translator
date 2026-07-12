@@ -57,12 +57,15 @@ def test_release_validates_tag_and_runs_quality_checks_before_build():
         ROOT / ".github" / "workflows" / "release.yml"
     ).read_text(encoding="utf-8")
 
-    validate_position = release_workflow.index("- name: Validate Tag Matches App Version")
+    validate_position = release_workflow.index("- name: Validate Release Tag and Commit")
     checks_position = release_workflow.index("- name: Run Release Checks")
     build_position = release_workflow.index("- name: Build Executable")
 
     assert "RELEASE_TAG: ${{ github.ref_name }}" in release_workflow
+    assert "RELEASE_COMMIT: ${{ github.sha }}" in release_workflow
     assert 'expected_tag = f"v{__version__}"' in release_workflow
+    assert '"--is-ancestor"' in release_workflow
+    assert '"refs/remotes/origin/main"' in release_workflow
     assert "-r requirements-build.txt -r requirements-dev.txt" in release_workflow
     assert "python -m ruff check src tests scripts packaging" in release_workflow
     assert "python -m pytest -q" in release_workflow
@@ -109,6 +112,8 @@ def test_workflows_pin_third_party_actions_to_reviewed_commits():
 
     assert "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd" in workflows
     assert "actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405" in workflows
+    assert "actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a" in workflows
+    assert "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c" in workflows
     assert "softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b" in workflows
 
     test_workflow = (
@@ -126,7 +131,7 @@ def test_release_publishes_one_zip_with_project_and_third_party_notices():
     build_script = (ROOT / "build_exe.bat").read_text(encoding="utf-8")
     notices = (ROOT / "THIRD_PARTY_NOTICES.txt").read_text(encoding="utf-8")
 
-    archive = "dist/EVETranslator_${{ github.ref_name }}_windows_x64.zip"
+    archive = "release-build/dist/EVETranslator_${{ github.ref_name }}_windows_x64.zip"
     assert f"          {archive}\n" in release_workflow
     assert "Package Windows Release" in release_workflow
     assert "scripts/package_windows_release.py" in release_workflow
@@ -144,3 +149,39 @@ def test_release_publishes_one_zip_with_project_and_third_party_notices():
     assert "licenses-used-in-qt.html" in notices
     assert (ROOT / "LICENSES" / "LGPL-3.0-only.txt").is_file()
     assert (ROOT / "LICENSES" / "GPL-3.0-only.txt").is_file()
+
+
+def test_virustotal_release_scan_is_secret_scoped_and_gates_publication():
+    release_workflow = (
+        ROOT / ".github" / "workflows" / "release.yml"
+    ).read_text(encoding="utf-8")
+
+    build_start = release_workflow.index("  build:")
+    scan_start = release_workflow.index("  scan:")
+    publish_start = release_workflow.index("  publish:")
+    build_job = release_workflow[build_start:scan_start]
+    scan_job = release_workflow[scan_start:publish_start]
+    publish_job = release_workflow[publish_start:]
+
+    assert "permissions: {}" in release_workflow[:build_start]
+    assert "contents: read" in build_job
+    assert "contents: write" not in build_job
+    assert "environment:\n      name: virustotal-release" in scan_job
+    assert "VIRUSTOTAL_API_KEY: ${{ secrets.VIRUSTOTAL_API_KEY }}" in scan_job
+    assert "VIRUSTOTAL_API_KEY" not in build_job
+    assert "VIRUSTOTAL_API_KEY" not in publish_job
+    assert "contents: write" not in scan_job
+    assert "contents: write" in publish_job
+    assert "persist-credentials: false" in build_job
+    assert "persist-credentials: false" in scan_job
+
+    assert "scripts/scan_virustotal.py" in scan_job
+    assert "--manifest" in scan_job
+    assert "--github-output" in scan_job
+    assert "--github-summary" in scan_job
+    assert "timeout-minutes: 20" in scan_job
+    assert "needs: build" in scan_job
+    assert "needs: scan" in publish_job
+    assert "draft: ${{ needs.scan.outputs.has_detections != 'false' }}" in publish_job
+
+    assert build_start < scan_start < publish_start

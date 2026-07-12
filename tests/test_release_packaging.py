@@ -24,6 +24,32 @@ def test_release_dependency_tree_is_exact_and_excludes_retired_scraper():
     assert "beautifulsoup4" not in pins
 
 
+def test_release_scan_requirements_are_exact_and_match_runtime_pins():
+    runtime_pins = load_release_requirements(ROOT)
+    scan_lines = (ROOT / "requirements-release-scan.txt").read_text(
+        encoding="utf-8"
+    ).splitlines()
+    scan_pins = {}
+    for line in scan_lines:
+        line = line.partition("#")[0].strip()
+        if not line:
+            continue
+        name, version = line.split("==", maxsplit=1)
+        scan_pins[name.casefold()] = version
+
+    assert scan_pins
+    assert scan_pins == {
+        name: runtime_pins[name]
+        for name in (
+            "requests",
+            "charset-normalizer",
+            "idna",
+            "urllib3",
+            "certifi",
+        )
+    }
+
+
 def _fake_project(tmp_path: Path) -> tuple[Path, Path]:
     root = tmp_path / "repo"
     (root / "src").mkdir(parents=True)
