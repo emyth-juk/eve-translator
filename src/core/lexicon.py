@@ -6,6 +6,8 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Iterable
 
+from src.core.span_matching import LongestSpanMatcher, is_strict_latin_case
+
 
 @dataclass(frozen=True)
 class LexiconTerm:
@@ -33,96 +35,23 @@ class LongestLexiconMatcher:
             # name that is spelled identically in both locales.
             if not source or not target:
                 continue
-            strict_case = self._strict_case(source)
+            strict_case = is_strict_latin_case(source)
             key = (source if strict_case else source.casefold(), strict_case)
             existing = deduped.get(key)
             normalized = LexiconTerm(source, target, int(item.priority))
             if existing is None or normalized.priority > existing.priority:
                 deduped[key] = normalized
 
-        self._buckets: dict[str, list[tuple[LexiconTerm, bool]]] = {}
-        for term in deduped.values():
-            bucket = self._bucket_key(term.source)
-            if not bucket:
-                continue
-            self._buckets.setdefault(bucket, []).append(
-                (term, self._strict_case(term.source))
-            )
-        for candidates in self._buckets.values():
-            candidates.sort(
-                key=lambda item: (-len(item[0].source), -item[0].priority, item[0].source)
-            )
+        self._matcher = LongestSpanMatcher(
+            deduped.values(),
+            source=lambda term: term.source,
+            strict_case=lambda term: is_strict_latin_case(term.source),
+            order_key=lambda term: (-len(term.source), -term.priority, term.source),
+        )
 
     @property
     def available(self) -> bool:
-        return bool(self._buckets)
-
-    @staticmethod
-    def _strict_case(text: str) -> bool:
-        return any(
-            character.isalpha()
-            and (
-                character.isascii()
-                or "LATIN" in unicodedata.name(character, "")
-            )
-            for character in text
-        )
-
-    @staticmethod
-    def _is_word_character(character: str) -> bool:
-        return character.isalnum() or character == "_"
-
-    @staticmethod
-    def _is_cjk_script(character: str) -> bool:
-        return bool(character) and (
-            "\u3400" <= character <= "\u9fff"
-            or "\u3040" <= character <= "\u30ff"
-            or "\uac00" <= character <= "\ud7af"
-        )
-
-    @classmethod
-    def _bucket_key(cls, text: str, start: int = 0) -> str:
-        if start >= len(text):
-            return ""
-        if cls._is_cjk_script(text[start]):
-            return text[start].casefold()
-        if cls._is_word_character(text[start]):
-            cursor = start
-            while cursor < len(text) and cls._is_word_character(text[cursor]):
-                cursor += 1
-            return text[start:cursor].casefold()
-        return text[start].casefold()
-
-    @classmethod
-    def _boundary_ok(cls, text: str, start: int, end: int, source: str) -> bool:
-        if cls._is_cjk_script(source[0]):
-            return True
-        if start > 0 and cls._is_word_character(text[start - 1]):
-            return False
-        if end < len(text) and cls._is_word_character(text[end]):
-            return False
-        return True
-
-    def _match(self, text: str, start: int) -> tuple[int, LexiconTerm] | None:
-        if (
-            start > 0
-            and self._is_word_character(text[start - 1])
-            and not self._is_cjk_script(text[start])
-        ):
-            return None
-        for term, strict_case in self._buckets.get(self._bucket_key(text, start), ()):
-            end = start + len(term.source)
-            if end > len(text) or not self._boundary_ok(text, start, end, term.source):
-                continue
-            source = text[start:end]
-            matched = (
-                source == term.source
-                if strict_case
-                else source.casefold() == term.source.casefold()
-            )
-            if matched:
-                return end, term
-        return None
+        return self._matcher.available
 
     def replace(self, text: str) -> str:
         if not text or not self.available:
@@ -131,7 +60,7 @@ class LongestLexiconMatcher:
         cursor = 0
         changed = False
         while cursor < len(text):
-            match = self._match(text, cursor)
+            match = self._matcher.match(text, cursor)
             if not match:
                 parts.append(text[cursor])
                 cursor += 1

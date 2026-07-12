@@ -6,17 +6,20 @@ import json
 import logging
 import threading
 import unicodedata
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
 from src.core.languages import normalize_language_code
+from src.core.span_matching import LongestSpanMatcher, is_strict_latin_case
 from src.utils.paths import get_resource_path
 
 logger = logging.getLogger(__name__)
 ENTITY_INDEX_SCHEMA_VERSION = 2
 SUPPORTED_ENTITY_INDEX_SCHEMAS = frozenset({1, ENTITY_INDEX_SCHEMA_VERSION})
+ENTITY_TRANSLATION_CACHE_SIZE = 16
 
 
 @dataclass(frozen=True)
@@ -56,9 +59,9 @@ class ProtectedEntityIndex:
         localized_entities: Iterable[LocalizedEntity] = (),
     ):
         self.metadata = dict(metadata or {})
-        self._buckets: dict[str, list[ProtectedEntity]] = {}
         self.entity_count = 0
         seen: set[tuple[str, str]] = set()
+        normalized_entities: list[ProtectedEntity] = []
         for entity in entities:
             name = unicodedata.normalize("NFKC", entity.name or "").strip()
             key = (name.casefold(), entity.category)
@@ -66,20 +69,27 @@ class ProtectedEntityIndex:
                 continue
             seen.add(key)
             normalized_entity = ProtectedEntity(name, entity.category, entity.strict_case)
-            bucket = self._bucket_key(name)
-            if not bucket:
-                continue
-            self._buckets.setdefault(bucket, []).append(normalized_entity)
+            normalized_entities.append(normalized_entity)
             self.entity_count += 1
-        for candidates in self._buckets.values():
-            candidates.sort(key=lambda item: len(item.name), reverse=True)
+        self._matcher = LongestSpanMatcher(
+            normalized_entities,
+            source=lambda entity: entity.name,
+            strict_case=lambda entity: entity.strict_case,
+        )
         self.localized_entities = tuple(localized_entities)
-        self._translation_buckets: dict[
-            tuple[str, str], dict[str, list[_EntityAlias]]
-        ] = {}
-        self._translation_maps: dict[tuple[str, str], dict[str, str]] = {}
-        self._lexicon_maps: dict[tuple[str, str], dict[str, str]] = {}
-        self._translation_lock = threading.Lock()
+        self._translation_buckets: OrderedDict[
+            tuple[str, str], LongestSpanMatcher[_EntityAlias]
+        ] = OrderedDict()
+        self._translation_maps: OrderedDict[
+            tuple[str, str], dict[str, str]
+        ] = OrderedDict()
+        self._lexicon_maps: OrderedDict[
+            tuple[str, str], dict[str, str]
+        ] = OrderedDict()
+        # Public cache views build and touch the same three LRU maps as one
+        # atomic operation.  Re-entrancy keeps that invariant when a public
+        # lookup calls the shared builder while holding the lock.
+        self._translation_lock = threading.RLock()
 
     @classmethod
     def empty(cls) -> "ProtectedEntityIndex":
@@ -167,91 +177,22 @@ class ProtectedEntityIndex:
         return str(value)
 
     @staticmethod
-    def _is_word_character(character: str) -> bool:
-        return character.isalnum() or character == "_"
-
-    @staticmethod
-    def _is_cjk_script(character: str) -> bool:
-        return bool(character) and (
-            '\u3400' <= character <= '\u9fff'
-            or '\u3040' <= character <= '\u30ff'
-            or '\uac00' <= character <= '\ud7af'
-        )
-
-    def _boundary_ok(self, text: str, start: int, end: int) -> bool:
-        if start > 0 and self._is_word_character(text[start - 1]):
-            return False
-        if end < len(text) and self._is_word_character(text[end]):
-            return False
-        return True
-
-    @staticmethod
     def _normalize_locale(language: str | None) -> str:
         return normalize_language_code(language, "")
-
-    @staticmethod
-    def _strict_case(name: str) -> bool:
-        return any(
-            character.isalpha()
-            and (
-                character.isascii()
-                or "LATIN" in unicodedata.name(character, "")
-            )
-            for character in name
-        )
-
-    @classmethod
-    def _bucket_key(cls, text: str, start: int = 0) -> str:
-        if start >= len(text):
-            return ""
-        cursor = start
-        if cls._is_cjk_script(text[cursor]):
-            return text[cursor].casefold()
-        if cls._is_word_character(text[cursor]):
-            while cursor < len(text) and cls._is_word_character(text[cursor]):
-                cursor += 1
-            return text[start:cursor].casefold()
-        return text[start].casefold()
-
-    def _longest_match(self, text: str, start: int) -> tuple[int, ProtectedEntity] | None:
-        if (
-            start > 0
-            and self._is_word_character(text[start - 1])
-            and not self._is_cjk_script(text[start])
-        ):
-            return None
-        candidates = self._buckets.get(self._bucket_key(text, start), ())
-        for entity in candidates:
-            end = start + len(entity.name)
-            is_cjk_name = self._is_cjk_script(entity.name[0])
-            if end > len(text) or (
-                not is_cjk_name and not self._boundary_ok(text, start, end)
-            ):
-                continue
-            source = text[start:end]
-            if entity.strict_case:
-                matched = source == entity.name
-            else:
-                matched = source.casefold() == entity.name.casefold()
-            if matched:
-                return end, entity
-        return None
 
     def _build_translation_buckets(
         self,
         source_language: str,
         target_language: str,
-    ) -> dict[str, list[_EntityAlias]]:
+    ) -> LongestSpanMatcher[_EntityAlias]:
         pair = (
             self._normalize_locale(source_language),
             self._normalize_locale(target_language) or "en",
         )
-        cached = self._translation_buckets.get(pair)
-        if cached is not None:
-            return cached
         with self._translation_lock:
             cached = self._translation_buckets.get(pair)
             if cached is not None:
+                self._touch_translation_pair(pair)
                 return cached
             source_locale, target_locale = pair
             candidates: dict[str, tuple[str, dict[str, str]]] = {}
@@ -267,7 +208,7 @@ class ProtectedEntityIndex:
                     candidates[key] = (source_value, targets)
                 targets[target.casefold()] = target
 
-            buckets: dict[str, list[_EntityAlias]] = {}
+            aliases: list[_EntityAlias] = []
             lexicon_map: dict[str, str] = {}
             for source, targets in candidates.values():
                 # Ambiguous source names must not be guessed across type IDs.
@@ -278,22 +219,36 @@ class ProtectedEntityIndex:
                     continue
                 target = next(iter(targets.values()))
                 lexicon_map[source] = target
-                alias = _EntityAlias(source, target, self._strict_case(source))
-                bucket = self._bucket_key(source)
-                if bucket:
-                    buckets.setdefault(bucket, []).append(alias)
-            for aliases in buckets.values():
-                aliases.sort(key=lambda item: len(item.source), reverse=True)
+                aliases.append(_EntityAlias(source, target, is_strict_latin_case(source)))
+            matcher = LongestSpanMatcher(
+                aliases,
+                source=lambda alias: alias.source,
+                strict_case=lambda alias: alias.strict_case,
+            )
             self._translation_maps[pair] = {
                 alias.source: alias.target
-                for aliases in buckets.values()
                 for alias in aliases
             }
             self._lexicon_maps[pair] = lexicon_map
             # Publish the bucket cache last; its presence is the ready marker
-            # read outside the lock by all three public views.
-            self._translation_buckets[pair] = buckets
-            return buckets
+            # shared by all three synchronized public views.
+            self._translation_buckets[pair] = matcher
+            self._touch_translation_pair(pair)
+            while len(self._translation_buckets) > ENTITY_TRANSLATION_CACHE_SIZE:
+                expired_pair, _ = self._translation_buckets.popitem(last=False)
+                self._translation_maps.pop(expired_pair, None)
+                self._lexicon_maps.pop(expired_pair, None)
+            return matcher
+
+    def _touch_translation_pair(self, pair: tuple[str, str]) -> None:
+        """Keep the three pair caches in the same least-recently-used order."""
+        for cache in (
+            self._translation_buckets,
+            self._translation_maps,
+            self._lexicon_maps,
+        ):
+            if pair in cache:
+                cache.move_to_end(pair)
 
     def translations_for(
         self,
@@ -305,8 +260,10 @@ class ProtectedEntityIndex:
             self._normalize_locale(source_language),
             self._normalize_locale(target_language) or "en",
         )
-        self._build_translation_buckets(*pair)
-        return self._translation_maps.get(pair, {})
+        with self._translation_lock:
+            self._build_translation_buckets(*pair)
+            self._touch_translation_pair(pair)
+            return self._translation_maps.get(pair, {})
 
     def lexicon_terms_for(
         self,
@@ -318,37 +275,10 @@ class ProtectedEntityIndex:
             self._normalize_locale(source_language),
             self._normalize_locale(target_language) or "en",
         )
-        self._build_translation_buckets(*pair)
-        return self._lexicon_maps.get(pair, {})
-
-    def _longest_alias_match(
-        self,
-        text: str,
-        start: int,
-        buckets: dict[str, list[_EntityAlias]],
-    ) -> tuple[int, _EntityAlias] | None:
-        if (
-            start > 0
-            and self._is_word_character(text[start - 1])
-            and not self._is_cjk_script(text[start])
-        ):
-            return None
-        for alias in buckets.get(self._bucket_key(text, start), ()):
-            end = start + len(alias.source)
-            is_cjk_name = self._is_cjk_script(alias.source[0])
-            if end > len(text) or (
-                not is_cjk_name and not self._boundary_ok(text, start, end)
-            ):
-                continue
-            source = text[start:end]
-            matched = (
-                source == alias.source
-                if alias.strict_case
-                else source.casefold() == alias.source.casefold()
-            )
-            if matched:
-                return end, alias
-        return None
+        with self._translation_lock:
+            self._build_translation_buckets(*pair)
+            self._touch_translation_pair(pair)
+            return self._lexicon_maps.get(pair, {})
 
     def canonicalize(
         self,
@@ -359,13 +289,13 @@ class ProtectedEntityIndex:
         """Replace official localized type names with their target-locale name."""
         if not text or not self.localized_entities:
             return text or ""
-        buckets = self._build_translation_buckets(source_language, target_language)
-        if not buckets:
+        matcher = self._build_translation_buckets(source_language, target_language)
+        if not matcher.available:
             return text
         parts: list[str] = []
         cursor = 0
         while cursor < len(text):
-            match = self._longest_alias_match(text, cursor, buckets)
+            match = matcher.match(text, cursor)
             if not match:
                 parts.append(text[cursor])
                 cursor += 1
@@ -382,7 +312,7 @@ class ProtectedEntityIndex:
         tokens: dict[str, str] = {}
         cursor = 0
         while cursor < len(text):
-            match = self._longest_match(text, cursor)
+            match = self._matcher.match(text, cursor)
             if not match:
                 parts.append(text[cursor])
                 cursor += 1

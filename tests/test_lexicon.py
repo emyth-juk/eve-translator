@@ -43,5 +43,11 @@ def test_latin_alias_requires_word_boundaries_and_preserves_case():
     assert matcher.replace("geddon") == "geddon"
 
 
+def test_cjk_alias_does_not_require_latin_word_boundaries():
+    matcher = LongestLexiconMatcher([LexiconTerm("\u7a7a\u5821", "Astrahus", 10)])
+
+    assert matcher.replace("A\u7a7a\u5821B") == "A Astrahus B"
+
+
 def test_no_terms_leaves_whitespace_untouched():
     assert LongestLexiconMatcher().replace("keep   spacing") == "keep   spacing"

@@ -1,6 +1,7 @@
 import json
 
 from src.core.entity_protection import (
+    ENTITY_TRANSLATION_CACHE_SIZE,
     LocalizedEntity,
     ProtectedEntity,
     ProtectedEntityIndex,
@@ -31,6 +32,18 @@ def test_strict_case_avoids_common_english_false_positive():
 def test_word_boundaries_avoid_partial_entity_matches():
     index = ProtectedEntityIndex([ProtectedEntity("Raven", "ship")])
     assert index.protect("Ravenous").tokens == {}
+
+
+def test_entity_matcher_preserves_explicit_case_and_cjk_boundary_policies():
+    index = ProtectedEntityIndex([
+        ProtectedEntity("Raven", "ship", strict_case=True),
+        ProtectedEntity("Megathron", "ship", strict_case=False),
+        ProtectedEntity("\u7a7a\u5821", "structure", strict_case=True),
+    ])
+
+    result = index.protect("A\u7a7a\u5821B raven Raven MEGATHRON")
+
+    assert list(result.tokens.values()) == ["\u7a7a\u5821", "Raven", "MEGATHRON"]
 
 
 def test_invalid_or_missing_index_falls_back_without_blocking(tmp_path):
@@ -87,8 +100,12 @@ def test_official_localized_names_canonicalize_by_type_id_and_target_locale():
     assert index.canonicalize("空堡 on grid", "zh-CN", "en-US") == (
         "Astrahus on grid"
     )
+    assert index.canonicalize("A空堡B", "zh", "en") == "AAstrahusB"
     assert index.canonicalize("空堡 on grid", "zh", "de") == (
         "Astralhus on grid"
+    )
+    assert index.canonicalize("astrahus Astrahus", "en", "de") == (
+        "astrahus Astralhus"
     )
     assert index.canonicalize("小堡 on grid", "zh", "en") == "小堡 on grid"
 
@@ -116,3 +133,26 @@ def test_identical_locale_name_remains_an_official_span_mapping():
     assert index.translations_for("en", "fr")["Raven Navy Issue"] == (
         "Raven Navy Issue"
     )
+
+
+def test_localized_translation_views_use_one_bounded_lru_cache():
+    locales = {
+        f"l{number}": f"Raven {number}"
+        for number in range(ENTITY_TRANSLATION_CACHE_SIZE + 1)
+    }
+    index = ProtectedEntityIndex(localized_entities=[LocalizedEntity(
+        1,
+        "ship",
+        {"en": "Raven", **locales},
+    )])
+
+    for number in range(ENTITY_TRANSLATION_CACHE_SIZE):
+        index.translations_for(f"l{number}", "en")
+    index.lexicon_terms_for("l0", "en")  # Refresh the oldest pair.
+    index.translations_for(f"l{ENTITY_TRANSLATION_CACHE_SIZE}", "en")
+
+    assert len(index._translation_buckets) == ENTITY_TRANSLATION_CACHE_SIZE
+    assert set(index._translation_buckets) == set(index._translation_maps)
+    assert set(index._translation_buckets) == set(index._lexicon_maps)
+    assert ("l0", "en") in index._translation_buckets
+    assert ("l1", "en") not in index._translation_buckets
