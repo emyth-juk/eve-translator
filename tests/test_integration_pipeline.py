@@ -67,12 +67,13 @@ class TestIntegrationPipeline(unittest.TestCase):
         # Session -> Worker
         self.session.lines_ready.connect(worker.process_lines)
         
-        # Worker -> Session (Custom slot to adapt arguments)
-        # Worker emits (session_id, text, sender, timestamp, original, is_translated)
-        # Session.add_message(text, sender, timestamp, original, is_translated)
-        def route_message(sid, text, sender, timestamp, orig, is_trans):
-            if sid == self.session.session_id:
-                self.session.add_message(text, sender, timestamp, orig, is_trans)
+        # Worker -> Session
+        def route_message(message):
+            if (
+                message.session_id == self.session.session_id
+                and message.source_id == self.session.source_id
+            ):
+                self.session.handle_processed_message(message)
         
         worker.signals.message_ready.connect(route_message)
         
@@ -94,15 +95,19 @@ class TestIntegrationPipeline(unittest.TestCase):
         # Since logic is synchronous in this test (no threads, direct signal connection), 
         # calls should complete immediately.
         
-        self.assertTrue(mock_overlay.add_message.called, "Overlay add_message should have been called")
-        
-        args, _ = mock_overlay.add_message.call_args
-        # args: (text, sender, timestamp, original_text, is_translated)
-        
-        self.assertIn("[MOCK] 大家好", args[0]) # Translated text
-        self.assertEqual(args[1], "Pilot A")
-        self.assertEqual(args[3], "大家好")     # Original
-        self.assertTrue(args[4])              # Is Translated flag
+        self.assertTrue(
+            mock_overlay.upsert_processed_message.called,
+            "Overlay should receive a processed message",
+        )
+        messages = [
+            call.args[0]
+            for call in mock_overlay.upsert_processed_message.call_args_list
+        ]
+        final = messages[-1]
+        self.assertIn("[MOCK] 大家好", final.text)
+        self.assertEqual(final.sender, "Pilot A")
+        self.assertEqual(final.original_text, "大家好")
+        self.assertEqual(final.state.value, "translated")
 
 if __name__ == '__main__':
     unittest.main()

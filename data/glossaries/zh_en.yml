@@ -169,9 +169,7 @@ modules:
 # STRUCTURES & LOCATIONS
 # ==========================================
 structures:
-  铁壁: Keepstar
   强袭: Fortizar
-  空堡: Astrahus
   主权: IHub (Sovereignty Hub)
   空间站: Station
   跳桥: Jump Bridge

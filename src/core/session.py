@@ -1,5 +1,6 @@
 import logging
 import time
+import uuid
 from pathlib import Path
 from PySide6.QtCore import QObject, QCoreApplication, QFileSystemWatcher, Qt, QTimer, Signal
 
@@ -14,8 +15,8 @@ class ChatSession(QObject):
     """
 
     # Signal emitted when new lines are ready for processing
-    # session_id, lines[]
-    lines_ready = Signal(str, list)
+    # session_id, source_id, lines[]
+    lines_ready = Signal(str, str, list)
     # Signal emitted when config changes in overlay
     config_changed = Signal(str, dict)
     # Signal to request session toggle
@@ -26,6 +27,8 @@ class ChatSession(QObject):
     character_selected = Signal(str)
     # Signal to request application shutdown
     exit_requested = Signal()
+    # Exact local correction request, routed to the translation service.
+    correction_submitted = Signal(str, dict)
 
     def __init__(self, session_id: str, log_path: str,
                  overlay_config: dict, parent=None):
@@ -41,6 +44,7 @@ class ChatSession(QObject):
         super().__init__(parent)
 
         self.session_id = session_id
+        self.source_id = uuid.uuid4().hex
         self.log_path = Path(log_path)
         self.config = overlay_config
 
@@ -62,6 +66,10 @@ class ChatSession(QObject):
         self.overlay.request_settings.connect(self.request_settings)
         self.overlay.character_selected.connect(self.character_selected)
         self.overlay.exit_requested.connect(self.exit_requested)
+        self.overlay.speaker_role_changed.connect(self._handle_speaker_role_changed)
+        self.overlay.correction_submitted.connect(
+            lambda payload: self.correction_submitted.emit(self.session_id, payload)
+        )
 
         # Polling timer
         self.poll_timer = QTimer()
@@ -99,7 +107,7 @@ class ChatSession(QObject):
                     last_lines = self.tailer.read_last_n_lines(history_lines)
                     if last_lines:
                         logger.info(f"[{self.session_id}] Loaded {len(last_lines)} existing messages")
-                        self.lines_ready.emit(self.session_id, last_lines)
+                        self.lines_ready.emit(self.session_id, self.source_id, last_lines)
                 else:
                     logger.info(f"[{self.session_id}] Log is stale (>30m old). Skipping history backfill.")
             except OSError:
@@ -154,6 +162,8 @@ class ChatSession(QObject):
             return
 
         logger.info(f"[{self.session_id}] Switching to new fleet log: {new_log_path}")
+        # Invalidate any provider result still in flight for the previous log.
+        self.source_id = uuid.uuid4().hex
 
         # Stop polling temporarily
         self.poll_timer.stop()
@@ -187,7 +197,7 @@ class ChatSession(QObject):
                     if last_lines:
                         logger.info(f"[{self.session_id}] Loaded {len(last_lines)} messages from new fleet log")
                         # Emit these lines for processing
-                        self.lines_ready.emit(self.session_id, last_lines)
+                        self.lines_ready.emit(self.session_id, self.source_id, last_lines)
                 else:
                     logger.info(f"[{self.session_id}] Log is stale (>30m old). Skipping history backfill.")
             except OSError:
@@ -268,7 +278,7 @@ class ChatSession(QObject):
         new_lines = self.tailer.read_new_lines()
         if new_lines:
             # Emit to worker with session_id
-            self.lines_ready.emit(self.session_id, new_lines)
+            self.lines_ready.emit(self.session_id, self.source_id, new_lines)
 
     def add_message(self, text: str, sender: str, timestamp: str,
                     original_text: str, is_translated: bool):
@@ -276,6 +286,11 @@ class ChatSession(QObject):
         if self.overlay:
             self.overlay.add_message(text, sender, timestamp,
                                     original_text, is_translated)
+
+    def handle_processed_message(self, message):
+        """Add or update a structured message emitted by the processing worker."""
+        if self.overlay:
+            self.overlay.upsert_processed_message(message)
 
     def get_config(self) -> dict:
         """Get current overlay config (position, size, etc.)."""
@@ -305,3 +320,14 @@ class ChatSession(QObject):
 
     def _handle_session_toggle(self, target_session_id):
         self.request_toggle.emit(target_session_id)
+
+    def _handle_speaker_role_changed(self, sender: str, role: str):
+        roles = dict(self.config.get('speaker_roles', {}))
+        from src.core.combat import normalize_speaker_name
+        normalized = normalize_speaker_name(sender)
+        if role:
+            roles[normalized] = role
+        else:
+            roles.pop(normalized, None)
+        self.config['speaker_roles'] = roles
+        self.config_changed.emit(self.session_id, self.config)

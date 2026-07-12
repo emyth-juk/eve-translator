@@ -25,40 +25,77 @@ class EVEGlossary:
     """
     
     def __init__(self, source_lang='zh', target_lang='en'):
-        self.source_lang = source_lang
-        self.target_lang = target_lang
+        self.source_lang = self._normalize_language(source_lang, 'zh')
+        self.target_lang = self._normalize_language(target_lang, 'en')
         self.terms: Dict[str, str] = self._load_glossary()
         
         # Sort terms by length (descending) to ensure longest matches are replaced first.
         self.sorted_terms = sorted(self.terms.items(), key=lambda x: len(x[0]), reverse=True)
         
+    @staticmethod
+    def _normalize_language(value, default: str) -> str:
+        if not isinstance(value, str):
+            return default
+        normalized = value.strip().lower().replace('_', '-')
+        return normalized or default
+
+    def _pair_filenames(self) -> list[str]:
+        """Return base-to-exact locale pairs in override order."""
+        source_base = self.source_lang.split('-', 1)[0]
+        target_base = self.target_lang.split('-', 1)[0]
+        candidates = (
+            (source_base, target_base),
+            (self.source_lang, target_base),
+            (source_base, self.target_lang),
+            (self.source_lang, self.target_lang),
+        )
+        filenames = []
+        for source, target in candidates:
+            filename = f"{source}_{target}.yml"
+            if filename not in filenames:
+                filenames.append(filename)
+        return filenames
+
     def _load_glossary(self) -> Dict[str, str]:
-        """Load glossary from YAML files with fallback."""
+        """Merge base pair fallback with exact regional and custom overrides."""
         terms = {}
-        
-        # 1. Bundled Glossary
-        filename = f"{self.source_lang}_{self.target_lang}.yml"
-        # Adjusted path: src/core/glossary.py -> up 2 levels -> data/glossaries
-        # Using get_resource_path to handle PyInstaller
-        bundled_path = get_resource_path(os.path.join("data", "glossaries", filename))
-        
-        if os.path.exists(bundled_path):
-            terms.update(self._load_yaml_glossary(bundled_path))
-            logger.info(f"Loaded bundled glossary: {filename} ({len(terms)} terms)")
-        else:
-            logger.warning(f"Bundled glossary not found: {bundled_path}")
-            
-        # 2. User Custom Glossary (~/.eve_translator/glossaries/)
+        filenames = self._pair_filenames()
+
+        # 1. Bundled base fallback, then any more-specific regional pair.
+        for filename in filenames:
+            bundled_path = get_resource_path(
+                os.path.join("data", "glossaries", filename)
+            )
+            if not os.path.exists(bundled_path):
+                continue
+            bundled_terms = self._load_yaml_glossary(bundled_path)
+            terms.update(bundled_terms)
+            logger.info(
+                "Loaded bundled glossary: %s (%s terms)",
+                filename,
+                len(bundled_terms),
+            )
+
+        # 2. User base customizations, then exact regional overrides.
         user_dir = Path.home() / ".eve_translator" / "glossaries"
-        user_file = user_dir / f"custom_{filename}"
-        
-        if user_file.exists():
-             custom_terms = self._load_yaml_glossary(str(user_file))
-             terms.update(custom_terms)
-             logger.info(f"Loaded custom glossary: {user_file.name} ({len(custom_terms)} terms)")
+        for filename in filenames:
+            user_file = user_dir / f"custom_{filename}"
+            if not user_file.exists():
+                continue
+            custom_terms = self._load_yaml_glossary(str(user_file))
+            terms.update(custom_terms)
+            logger.info(
+                "Loaded custom glossary: %s (%s terms)",
+                user_file.name,
+                len(custom_terms),
+            )
 
         # 3. Hardcoded Fallback (only if empty and is default zh->en)
-        if not terms and self.source_lang == 'zh' and self.target_lang == 'en':
+        if (
+            not terms
+            and self.source_lang.split('-', 1)[0] == 'zh'
+            and self.target_lang.split('-', 1)[0] == 'en'
+        ):
             logger.warning("No glossary files found. Using hardcoded fallback.")
             return self._get_hardcoded_fallback()
             

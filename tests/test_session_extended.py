@@ -134,7 +134,8 @@ class TestSessionConfigUpdate(unittest.TestCase):
         signal_spy.assert_called()
         args = signal_spy.call_args[0]
         self.assertEqual(args[0], 'fleet')
-        self.assertEqual(len(args[1]), 1)
+        self.assertEqual(args[1], session.source_id)
+        self.assertEqual(len(args[2]), 1)
 
         session.stop()
 
@@ -153,6 +154,7 @@ class TestSessionConfigUpdate(unittest.TestCase):
 
         session = ChatSession('fleet', self.log_path, config)
         session.start()
+        original_source_id = session.source_id
 
         # Switch to new log
         session.switch_fleet_log(new_log_path, "NewPilot")
@@ -161,6 +163,7 @@ class TestSessionConfigUpdate(unittest.TestCase):
         mock_tailer.close.assert_called()
         mock_ow.clear_messages.assert_called()
         self.assertEqual(str(session.log_path), new_log_path)
+        self.assertNotEqual(session.source_id, original_source_id)
 
         session.stop()
 

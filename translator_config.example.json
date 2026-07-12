@@ -8,10 +8,24 @@
             "de"
         ],
         "target_language": "en",
+        "translation_provider": "disabled",
+        "provider_choice_confirmed": false,
         "deepl_api_key": "YOUR_DESCRIBED_DEEPL_API_KEY_HERE",
         "color_default": "#e0e0e0",
         "color_translated": "#00ffff",
-        "color_highlight": "yellow"
+        "color_highlight": "yellow",
+        "speaker_roles": {
+            "example fleet boss": "fc",
+            "example scout": "scout"
+        },
+        "global_hotkey": "Ctrl+Shift+L",
+        "entity_protection": true,
+        "entity_index_path": "",
+        "burst_optimization": true,
+        "burst_batch_size": 5,
+        "context_assist": false,
+        "context_messages": 3,
+        "active_doctrine_pack": ""
     },
     "sessions": {
         "fleet": {
@@ -21,7 +35,10 @@
             "h": 400,
             "background_color": "#33001a",
             "title_prefix": "[FLEET]",
-            "enabled": true
+            "enabled": true,
+            "display_mode": "mirror",
+            "compact_header": true,
+            "command_cards": true
         },
         "local": {
             "x": 420,
@@ -30,7 +47,10 @@
             "h": 400,
             "background_color": "#001a33",
             "title_prefix": "[LOCAL]",
-            "enabled": false
+            "enabled": false,
+            "display_mode": "mirror",
+            "compact_header": true,
+            "command_cards": true
         }
     }
 }

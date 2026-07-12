@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from src.core.detector import LanguageDetector
 from src.services.translator import TranslationService, MockTranslator
@@ -46,6 +46,161 @@ def test_translator_mock():
     res = service.translate_message("Test", "en")
     # translate_message returns (text, success, provider_name)
     assert res == ("[MOCK] Test", True, "Mock")
+
+
+def test_translation_service_starts_disabled_without_constructing_cloud_provider():
+    google_factory = MagicMock()
+    deepl_factory = MagicMock()
+    service = TranslationService(provider_factories={
+        'google': google_factory,
+        'deepl': deepl_factory,
+    })
+
+    assert service.get_provider_status() == {
+        'mode': 'disabled',
+        'name': 'Disabled',
+        'available': False,
+        'reason': 'Translation provider is disabled.',
+    }
+    assert service.translate_message("Bonjour", "en", "fr") == (
+        "Bonjour", False, "Disabled"
+    )
+    google_factory.assert_not_called()
+    deepl_factory.assert_not_called()
+
+
+def test_explicit_google_selection_constructs_google_provider():
+    provider = CountingProvider(["hello"])
+    provider.name = "Google"
+    google_factory = MagicMock(return_value=provider)
+    service = TranslationService(provider_factories={'google': google_factory})
+
+    service.set_config({
+        'translation_provider': 'google',
+        'target_language': 'en',
+        'deepl_api_key': 'preserved-deepl-secret',
+    })
+
+    assert service.provider_mode == 'google'
+    assert service.provider_name == 'Google'
+    assert service.provider_available is True
+    assert service.translate_message("Bonjour", "en", "fr") == (
+        "hello", True, "Google"
+    )
+    google_factory.assert_called_once_with('')
+
+
+def test_legacy_deepl_key_selects_deepl_but_no_key_disables():
+    provider = CountingProvider(["hello"])
+    provider.name = "DeepL"
+    deepl_factory = MagicMock(return_value=provider)
+    service = TranslationService(provider_factories={'deepl': deepl_factory})
+
+    service.set_config({'target_language': 'en', 'deepl_api_key': 'legacy-key'})
+    assert service.provider_mode == 'deepl'
+    deepl_factory.assert_called_once_with('legacy-key')
+
+    service.set_config({'target_language': 'en', 'deepl_api_key': ''})
+    assert service.provider_mode == 'disabled'
+    assert service.provider_available is False
+
+
+def test_explicit_deepl_without_key_is_unavailable_and_does_not_fallback():
+    deepl_factory = MagicMock()
+    google_factory = MagicMock()
+    service = TranslationService(provider_factories={
+        'deepl': deepl_factory,
+        'google': google_factory,
+    })
+
+    service.set_config({
+        'translation_provider': 'deepl',
+        'target_language': 'en',
+        'deepl_api_key': '',
+    })
+
+    assert service.get_provider_status() == {
+        'mode': 'deepl',
+        'name': 'DeepL',
+        'available': False,
+        'reason': 'DeepL API key is required.',
+    }
+    deepl_factory.assert_not_called()
+    google_factory.assert_not_called()
+
+
+def test_invalid_deepl_key_type_fails_closed_without_crashing():
+    service = TranslationService()
+
+    service.set_config({
+        'translation_provider': 'deepl',
+        'target_language': 'en',
+        'deepl_api_key': 12345,
+    })
+
+    assert service.get_provider_status() == {
+        'mode': 'deepl',
+        'name': 'DeepL',
+        'available': False,
+        'reason': 'DeepL API key is required.',
+    }
+
+
+def test_invalid_target_language_type_falls_back_to_english():
+    service = TranslationService()
+
+    service.set_config({
+        'translation_provider': 'disabled',
+        'target_language': 12345,
+    })
+
+    assert service.glossary.target_lang == 'en'
+    assert service.translate_message('Bonjour', 12345, 'fr') == (
+        'Bonjour', False, 'Disabled'
+    )
+
+
+def test_unavailable_provider_retries_when_same_config_is_applied():
+    provider = CountingProvider(["hello"])
+    provider.name = "Google"
+    google_factory = MagicMock(side_effect=[RuntimeError("offline"), provider])
+    service = TranslationService(provider_factories={'google': google_factory})
+    config = {'translation_provider': 'google', 'target_language': 'en'}
+
+    service.set_config(config)
+    assert service.provider_available is False
+
+    service.set_config(config)
+    assert service.provider_available is True
+    assert service.provider_name == 'Google'
+    assert google_factory.call_count == 2
+
+
+def test_provider_test_is_injectable_and_does_not_change_active_provider():
+    provider = CountingProvider(["Verbindung test"])
+    provider.name = "Google"
+    google_factory = MagicMock(return_value=provider)
+    service = TranslationService(provider_factories={'google': google_factory})
+
+    result = service.test_provider(
+        'google', deepl_api_key='do-not-forward-this-key', target_lang='en'
+    )
+
+    assert result.success is True
+    assert result.provider_name == 'Google'
+    assert service.provider_mode == 'disabled'
+    google_factory.assert_called_once_with('')
+
+
+def test_provider_test_failure_does_not_expose_api_key():
+    secret = 'super-secret-key'
+    deepl_factory = MagicMock(side_effect=RuntimeError(secret))
+    service = TranslationService(provider_factories={'deepl': deepl_factory})
+
+    result = service.test_provider('deepl', secret, 'en')
+
+    assert result.success is False
+    assert secret not in result.message
 
 
 def test_translation_cache_hit_avoids_provider_call():

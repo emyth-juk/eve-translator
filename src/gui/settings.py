@@ -1,24 +1,57 @@
 import copy
 import os
+import re
+import threading
+import sqlite3
+from pathlib import Path
 
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QSlider, QSpinBox, QCheckBox, QPushButton,
                                QColorDialog, QFormLayout, QGroupBox, QWidget, QTabWidget,
-                               QFileDialog, QLineEdit)
-from PySide6.QtCore import Qt, Signal
+                               QFileDialog, QLineEdit, QComboBox, QMessageBox)
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor
+from src.app_config import (
+    DISPLAY_MODE_BILINGUAL,
+    DISPLAY_MODE_COMBAT,
+    DISPLAY_MODE_MIRROR,
+    TRANSLATION_PROVIDER_DEEPL,
+    TRANSLATION_PROVIDER_DISABLED,
+    TRANSLATION_PROVIDER_GOOGLE,
+    normalize_translation_provider_config,
+)
+from src.services.translator import TranslationService
 from src.version import __version__
+
+
+PROVIDER_TEST_TIMEOUT_MS = 15_000
+LANGUAGE_CODE_PATTERN = re.compile(r"^[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?$")
+
+
+class ProviderTestSignals(QObject):
+    finished = Signal(int, object, str)
+
 
 class SettingsDialog(QDialog):
     # Signal carrying the updated config dict (full structure)
     settings_changed = Signal(dict)
 
-    def __init__(self, full_config, parent=None):
+    def __init__(self, full_config, parent=None, translation_service=None):
         super().__init__(parent)
         self.setWindowTitle(f"Global Settings - v{__version__}")
-        self.resize(400, 500)
+        self.resize(520, 700)
         # Deep copy config to allow reversion/modification
         self.config = copy.deepcopy(full_config)
+        normalize_translation_provider_config(self.config.setdefault('shared', {}))
+        self._translation_service = translation_service
+        self.pending_doctrine_source = None
+        self._pending_doctrine_pack = None
+        self._provider_test_signals = ProviderTestSignals(self)
+        self._provider_test_signals.finished.connect(self._provider_test_finished)
+        self._provider_test_token = 0
+        self._provider_test_running = False
+        self.btn_save = QPushButton("Save")
+        self.btn_save.clicked.connect(self.accept)
         
         self.main_layout = QVBoxLayout(self)
         
@@ -39,17 +72,20 @@ class SettingsDialog(QDialog):
         self.tab_local = QWidget()
         self._init_session_tab(self.tab_local, 'local')
         self.tabs.addTab(self.tab_local, "Local Overlay")
+
+        # 4. EVE-aware translation controls stay out of the dense General tab.
+        self.tab_intelligence = QWidget()
+        self._init_intelligence_tab()
+        self.tabs.addTab(self.tab_intelligence, "Translation Intelligence")
         
         # Buttons
         btn_box = QHBoxLayout()
-        btn_save = QPushButton("Save")
-        btn_save.clicked.connect(self.accept)
         btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.reject)
         
         # Optional: Reset Layouts button?
         
-        btn_box.addWidget(btn_save)
+        btn_box.addWidget(self.btn_save)
         btn_box.addWidget(btn_cancel)
         self.main_layout.addLayout(btn_box)
 
@@ -60,7 +96,8 @@ class SettingsDialog(QDialog):
         grp_paths = QGroupBox("Paths")
         form_paths = QFormLayout(grp_paths)
         
-        self.edit_log_dir = QLineEdit(self.config['shared'].get('log_dir', ''))
+        log_dir = self._config_text(self.config['shared'].get('log_dir', ''))
+        self.edit_log_dir = QLineEdit(log_dir)
         self.edit_log_dir.setReadOnly(True)
         
         btn_browse = QPushButton("Browse...")
@@ -117,8 +154,28 @@ class SettingsDialog(QDialog):
         self.chk_autoscroll.setChecked(self.config['shared'].get('auto_scroll', True))
         self.chk_autoscroll.stateChanged.connect(self._notify_change)
         form_beh.addRow(self.chk_autoscroll)
-        
-        self.edit_target = self._make_line_edit(self.config['shared'].get('target_language', 'en'))
+
+        self.combo_provider = QComboBox()
+        self.combo_provider.addItem("Disabled (no translation)", TRANSLATION_PROVIDER_DISABLED)
+        self.combo_provider.addItem("Google (cloud)", TRANSLATION_PROVIDER_GOOGLE)
+        self.combo_provider.addItem("DeepL (cloud)", TRANSLATION_PROVIDER_DEEPL)
+        provider_mode = self.config['shared'].get(
+            'translation_provider', TRANSLATION_PROVIDER_DISABLED
+        )
+        provider_index = self.combo_provider.findData(provider_mode)
+        self.combo_provider.setCurrentIndex(max(provider_index, 0))
+        form_beh.addRow("Provider:", self.combo_provider)
+
+        self.lbl_provider_hint = QLabel()
+        self.lbl_provider_hint.setWordWrap(True)
+        self.lbl_provider_hint.setStyleSheet("color: gray; font-style: italic;")
+        form_beh.addRow("", self.lbl_provider_hint)
+
+        target_language = self._config_text(
+            self.config['shared'].get('target_language', 'en'),
+            default='en',
+        ) or 'en'
+        self.edit_target = self._make_line_edit(target_language)
         form_beh.addRow("Target Lang (ISO):", self.edit_target)
         
         # Ignored
@@ -127,10 +184,37 @@ class SettingsDialog(QDialog):
         self.edit_ignored = self._make_line_edit(ign_str)
         form_beh.addRow("Ignored Langs:", self.edit_ignored)
         
-        # API Key
-        self.edit_deepl = self._make_line_edit(self.config['shared'].get('deepl_api_key', ''))
-        self.edit_deepl.setPlaceholderText("Leave empty for Google")
-        form_beh.addRow("DeepL API Key:", self.edit_deepl)
+        # API key is masked by default and preserved when another provider is selected.
+        deepl_api_key = self._config_text(self.config['shared'].get('deepl_api_key', ''))
+        self.edit_deepl = self._make_line_edit(deepl_api_key)
+        self.edit_deepl.setEchoMode(QLineEdit.EchoMode.Password)
+        self.chk_reveal_deepl = QCheckBox("Show")
+        self.chk_reveal_deepl.toggled.connect(self._set_api_key_revealed)
+
+        api_key_row = QHBoxLayout()
+        api_key_row.addWidget(self.edit_deepl)
+        api_key_row.addWidget(self.chk_reveal_deepl)
+        form_beh.addRow("DeepL API Key:", api_key_row)
+
+        self.btn_test_provider = QPushButton("Test Provider")
+        self.btn_test_provider.clicked.connect(self._test_provider)
+        self.lbl_provider_test = QLabel("")
+        self.lbl_provider_test.setWordWrap(True)
+
+        provider_test_row = QHBoxLayout()
+        provider_test_row.addWidget(self.btn_test_provider)
+        provider_test_row.addWidget(self.lbl_provider_test, 1)
+        form_beh.addRow("", provider_test_row)
+
+        self.lbl_provider_validation = QLabel("")
+        self.lbl_provider_validation.setWordWrap(True)
+        self.lbl_provider_validation.setStyleSheet("color: #c0392b;")
+        form_beh.addRow("", self.lbl_provider_validation)
+
+        self.combo_provider.currentIndexChanged.connect(self._provider_mode_changed)
+        self.edit_deepl.textChanged.connect(self._provider_input_changed)
+        self.edit_target.textChanged.connect(self._provider_input_changed)
+        self._update_provider_controls()
         
         layout.addWidget(grp_beh)
         
@@ -164,6 +248,43 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(tab_widget)
         
         session_cfg = self.config['sessions'][session_id]
+
+        grp_hud = QGroupBox("Combat HUD")
+        form_hud = QFormLayout(grp_hud)
+        mode_combo = QComboBox()
+        mode_combo.addItem("Combat — trusted calls and starred speakers", DISPLAY_MODE_COMBAT)
+        mode_combo.addItem("Bilingual — translated and starred messages", DISPLAY_MODE_BILINGUAL)
+        mode_combo.addItem("Mirror — complete chat feed", DISPLAY_MODE_MIRROR)
+        selected_mode = session_cfg.get('display_mode', DISPLAY_MODE_MIRROR)
+        mode_combo.setCurrentIndex(max(0, mode_combo.findData(selected_mode)))
+        mode_combo.currentIndexChanged.connect(self._notify_change)
+        form_hud.addRow("Display mode:", mode_combo)
+
+        compact_header = QCheckBox("Show compact channel/status header")
+        compact_header.setChecked(session_cfg.get('compact_header', True))
+        compact_header.stateChanged.connect(self._notify_change)
+        form_hud.addRow(compact_header)
+
+        command_cards = QCheckBox("Render exact command cards")
+        command_cards.setChecked(session_cfg.get('command_cards', True))
+        command_cards.stateChanged.connect(self._notify_change)
+        form_hud.addRow(command_cards)
+
+        hint = QLabel(
+            "Star speakers or mark FC/scout roles from an unlocked overlay. "
+            "Only explicit FC roles create verified execution cards."
+        )
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color: gray; font-style: italic;")
+        form_hud.addRow("", hint)
+        layout.addWidget(grp_hud)
+        if not hasattr(self, '_session_hud_controls'):
+            self._session_hud_controls = {}
+        self._session_hud_controls[session_id] = (
+            mode_combo,
+            compact_header,
+            command_cards,
+        )
         
         # Visibility check? (Just implicit via enable/disable in tray)
         
@@ -227,6 +348,116 @@ class SettingsDialog(QDialog):
         
         layout.addStretch()
 
+    def _init_intelligence_tab(self):
+        layout = QVBoxLayout(self.tab_intelligence)
+        shared = self.config['shared']
+
+        grp_runtime = QGroupBox("Translation pipeline")
+        form_runtime = QFormLayout(grp_runtime)
+        self.chk_burst_optimization = QCheckBox(
+            "Burst optimization (recommended; up to five compatible messages)"
+        )
+        self.chk_burst_optimization.setChecked(shared.get('burst_optimization', True))
+        self.chk_burst_optimization.stateChanged.connect(self._notify_change)
+        form_runtime.addRow(self.chk_burst_optimization)
+
+        self.chk_context_assist = QCheckBox(
+            "Context assist (sends recent same-channel lines to supported cloud providers)"
+        )
+        self.chk_context_assist.setChecked(shared.get('context_assist', False))
+        self.chk_context_assist.stateChanged.connect(self._notify_change)
+        form_runtime.addRow(self.chk_context_assist)
+
+        context_note = QLabel(
+            "Context is off by default, never crosses Fleet/Local or log sources, "
+            "and is used only through a provider-native context API."
+        )
+        context_note.setWordWrap(True)
+        context_note.setStyleSheet("color: gray; font-style: italic;")
+        form_runtime.addRow("", context_note)
+        layout.addWidget(grp_runtime)
+
+        grp_entities = QGroupBox("EVE name protection")
+        form_entities = QFormLayout(grp_entities)
+        self.chk_entity_protection = QCheckBox("Protect SDE and doctrine entity names")
+        self.chk_entity_protection.setChecked(shared.get('entity_protection', True))
+        self.chk_entity_protection.stateChanged.connect(self._notify_change)
+        form_entities.addRow(self.chk_entity_protection)
+        index = getattr(self._translation_service, 'entity_index', None)
+        if index is not None and getattr(index, 'available', False):
+            index_text = (
+                f"Installed · SDE {getattr(index, 'sde_version', '') or 'unknown'} "
+                f"· {getattr(index, 'entity_count', 0):,} names"
+            )
+        else:
+            index_text = "No generated index installed; translation continues normally"
+        self.lbl_entity_index = QLabel(index_text)
+        self.lbl_entity_index.setWordWrap(True)
+        form_entities.addRow("Entity index:", self.lbl_entity_index)
+        layout.addWidget(grp_entities)
+
+        grp_local = QGroupBox("Local intelligence")
+        form_local = QFormLayout(grp_local)
+        memory = getattr(self._translation_service, 'translation_memory', None)
+        try:
+            correction_count = memory.count() if memory is not None else 0
+        except (OSError, sqlite3.Error):
+            correction_count = 0
+        self.lbl_correction_count = QLabel(f"{correction_count:,} exact local corrections")
+        form_local.addRow("Correction memory:", self.lbl_correction_count)
+
+        self.lbl_doctrine = QLabel()
+        self.lbl_doctrine.setWordWrap(True)
+        doctrine_row = QHBoxLayout()
+        doctrine_row.addWidget(self.lbl_doctrine, 1)
+        btn_import = QPushButton("Import ZIP…")
+        btn_import.clicked.connect(self._import_doctrine_pack)
+        doctrine_row.addWidget(btn_import)
+        btn_deactivate = QPushButton("Deactivate")
+        btn_deactivate.clicked.connect(self._deactivate_doctrine_pack)
+        doctrine_row.addWidget(btn_deactivate)
+        form_local.addRow("Doctrine pack:", doctrine_row)
+        self._refresh_doctrine_label()
+        layout.addWidget(grp_local)
+        layout.addStretch()
+
+    def _refresh_doctrine_label(self):
+        if self._pending_doctrine_pack is not None:
+            self.lbl_doctrine.setText(
+                f"{self._pending_doctrine_pack.name} "
+                f"v{self._pending_doctrine_pack.version} (ready to import on Save)"
+            )
+            return
+        active = self.config['shared'].get('active_doctrine_pack', '')
+        self.lbl_doctrine.setText(Path(active).name if active else "Built-in only")
+
+    def _import_doctrine_pack(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import doctrine pack",
+            "",
+            "Doctrine packs (*.zip);;All files (*)",
+        )
+        if not filename:
+            return
+        try:
+            from src.core.doctrine import load_doctrine_pack
+            validated = load_doctrine_pack(filename)
+        except Exception as exc:
+            QMessageBox.warning(self, "Doctrine pack rejected", str(exc))
+            return
+        self.pending_doctrine_source = filename
+        self._pending_doctrine_pack = validated
+        self._refresh_doctrine_label()
+        self._notify_change()
+
+    def _deactivate_doctrine_pack(self):
+        self.pending_doctrine_source = None
+        self._pending_doctrine_pack = None
+        self.config['shared']['active_doctrine_pack'] = ''
+        self._refresh_doctrine_label()
+        self._notify_change()
+
     def _make_color_btn(self, shared_key, initial_hex):
         btn = QPushButton()
         btn.setStyleSheet(f"background-color: {initial_hex};")
@@ -237,6 +468,159 @@ class SettingsDialog(QDialog):
         from PySide6.QtWidgets import QLineEdit
         le = QLineEdit(text)
         return le
+
+    @staticmethod
+    def _config_text(value, default=''):
+        """Return safe line-edit text for values loaded from user-editable JSON."""
+        return value.strip() if isinstance(value, str) else default
+
+    def _selected_provider_mode(self):
+        return self.combo_provider.currentData() or TRANSLATION_PROVIDER_DISABLED
+
+    def _set_api_key_revealed(self, revealed):
+        echo_mode = (
+            QLineEdit.EchoMode.Normal if revealed else QLineEdit.EchoMode.Password
+        )
+        self.edit_deepl.setEchoMode(echo_mode)
+
+    def _provider_mode_changed(self, *args):
+        self._cancel_provider_test()
+        self.lbl_provider_test.clear()
+        self._update_provider_controls()
+        self._notify_change()
+
+    def _provider_input_changed(self, *args):
+        self._cancel_provider_test()
+        self.lbl_provider_test.clear()
+        self._update_provider_controls()
+        self._notify_change()
+
+    def _cancel_provider_test(self):
+        if self._provider_test_running:
+            self._provider_test_token += 1
+            self._provider_test_running = False
+            self._update_provider_controls()
+
+    def _update_provider_controls(self):
+        provider_mode = self._selected_provider_mode()
+        uses_deepl = provider_mode == TRANSLATION_PROVIDER_DEEPL
+        if not uses_deepl and self.chk_reveal_deepl.isChecked():
+            # Never leave a stored DeepL key visible after switching providers.
+            self.chk_reveal_deepl.setChecked(False)
+        self.edit_deepl.setEnabled(uses_deepl)
+        self.chk_reveal_deepl.setEnabled(uses_deepl)
+        self.btn_test_provider.setEnabled(
+            provider_mode != TRANSLATION_PROVIDER_DISABLED
+            and not self._provider_test_running
+        )
+
+        if provider_mode == TRANSLATION_PROVIDER_DISABLED:
+            hint = "Translation is disabled; no chat text is sent to a cloud provider."
+            placeholder = "Select DeepL to configure an API key"
+        elif provider_mode == TRANSLATION_PROVIDER_GOOGLE:
+            hint = (
+                "Google translation sends message text to a cloud service. "
+                "The provider test sends only a built-in test phrase."
+            )
+            placeholder = "Stored for DeepL; not used by Google"
+        else:
+            hint = (
+                "DeepL translation sends message text to DeepL. "
+                "The provider test sends only a built-in test phrase."
+            )
+            placeholder = "Required for DeepL"
+
+        self.lbl_provider_hint.setText(hint)
+        self.edit_deepl.setPlaceholderText(placeholder)
+        validation_error = self._provider_validation_error()
+        self.lbl_provider_validation.setText(validation_error)
+        self.btn_save.setEnabled(not validation_error)
+        if validation_error:
+            self.btn_test_provider.setEnabled(False)
+
+    def _provider_validation_error(self):
+        provider_mode = self._selected_provider_mode()
+        target_lang = self.edit_target.text().strip() or 'en'
+        if (
+            provider_mode != TRANSLATION_PROVIDER_DISABLED
+            and not LANGUAGE_CODE_PATTERN.fullmatch(target_lang)
+        ):
+            return "Enter a target language such as en, de, zh, or pt-BR."
+        if (
+            provider_mode == TRANSLATION_PROVIDER_DEEPL
+            and not self.edit_deepl.text().strip()
+        ):
+            return "A DeepL API key is required before saving DeepL."
+        return ""
+
+    def _test_provider(self):
+        provider_mode = self._selected_provider_mode()
+        api_key = self.edit_deepl.text().strip()
+        provider_api_key = api_key if provider_mode == TRANSLATION_PROVIDER_DEEPL else ""
+        target_lang = self.edit_target.text().strip() or 'en'
+
+        if self._translation_service is None:
+            self._translation_service = TranslationService()
+
+        self._provider_test_token += 1
+        token = self._provider_test_token
+        self._provider_test_running = True
+        self._update_provider_controls()
+        self.lbl_provider_test.setStyleSheet("color: gray;")
+        self.lbl_provider_test.setText("Testing...")
+
+        def run_test():
+            try:
+                result = self._translation_service.test_provider(
+                    provider_mode,
+                    provider_api_key,
+                    target_lang,
+                )
+            except Exception:
+                # Provider libraries may include request metadata in exceptions;
+                # pass no exception details back to the UI.
+                result = None
+            self._provider_test_signals.finished.emit(token, result, api_key)
+
+        threading.Thread(
+            target=run_test,
+            name="provider-connection-test",
+            daemon=True,
+        ).start()
+        QTimer.singleShot(
+            PROVIDER_TEST_TIMEOUT_MS,
+            lambda: self._provider_test_timed_out(token),
+        )
+
+    def _provider_test_finished(self, token, result, api_key):
+        if token != self._provider_test_token or not self._provider_test_running:
+            return
+
+        self._provider_test_running = False
+        if result is None:
+            message = "Provider test failed unexpectedly. Check the configuration and try again."
+            success = False
+        else:
+            message = str(result.message)
+            success = bool(result.success)
+        if api_key:
+            message = message.replace(api_key, "<redacted>")
+
+        color = "#2e8b57" if success else "#c0392b"
+        self.lbl_provider_test.setStyleSheet(f"color: {color};")
+        self.lbl_provider_test.setText(message)
+        self._update_provider_controls()
+
+    def _provider_test_timed_out(self, token):
+        if token != self._provider_test_token or not self._provider_test_running:
+            return
+
+        self._provider_test_running = False
+        self.lbl_provider_test.setStyleSheet("color: #c0392b;")
+        self.lbl_provider_test.setText(
+            "Provider test timed out. Check your connection and try again."
+        )
+        self._update_provider_controls()
 
     def _notify_change(self, *args):
         self.settings_changed.emit(self.get_settings())
@@ -276,7 +660,8 @@ class SettingsDialog(QDialog):
         self.config['shared']['opacity'] = self.slider_opacity.value() / 100.0
         self.config['shared']['font_size'] = self.spin_font.value()
         self.config['shared']['auto_scroll'] = self.chk_autoscroll.isChecked()
-        self.config['shared']['target_language'] = self.edit_target.text().strip()
+        self.config['shared']['target_language'] = self.edit_target.text().strip() or 'en'
+        self.config['shared']['translation_provider'] = self._selected_provider_mode()
         self.config['shared']['deepl_api_key'] = self.edit_deepl.text().strip()
 
         ign_raw = self.edit_ignored.text()
@@ -292,8 +677,43 @@ class SettingsDialog(QDialog):
              
         # Save Performance Settings
         self.config['shared']['polling_interval'] = self.spin_poll.value()
-             
+
+        self.config['shared']['burst_optimization'] = (
+            self.chk_burst_optimization.isChecked()
+        )
+        self.config['shared']['context_assist'] = self.chk_context_assist.isChecked()
+        self.config['shared']['entity_protection'] = (
+            self.chk_entity_protection.isChecked()
+        )
+
+        for session_id, controls in self._session_hud_controls.items():
+            mode_combo, compact_header, command_cards = controls
+            self.config['sessions'][session_id]['display_mode'] = (
+                mode_combo.currentData() or DISPLAY_MODE_MIRROR
+            )
+            self.config['sessions'][session_id]['compact_header'] = (
+                compact_header.isChecked()
+            )
+            self.config['sessions'][session_id]['command_cards'] = (
+                command_cards.isChecked()
+            )
+
         return self.config
+
+    def closeEvent(self, event):
+        self._cancel_provider_test()
+        super().closeEvent(event)
+
+    def done(self, result):
+        # Save/Cancel hide the dialog without necessarily sending closeEvent.
+        self._cancel_provider_test()
+        super().done(result)
+
+    def accept(self):
+        self._update_provider_controls()
+        if self._provider_validation_error():
+            return
+        super().accept()
 
     def _browse_log_dir(self):
         current = self.edit_log_dir.text()

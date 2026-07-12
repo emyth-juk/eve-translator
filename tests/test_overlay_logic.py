@@ -9,6 +9,7 @@ from PySide6.QtTest import QTest
 
 from src.core.character_info import CharacterInfo
 from src.core.fleet_info import FleetInfo
+from src.core.message import ProcessedMessage, TranslationState
 
 
 class TestOverlayNonUILogic(unittest.TestCase):
@@ -82,6 +83,106 @@ class TestOverlayNonUILogic(unittest.TestCase):
         msg = overlay.chat_history[-1]
         self.assertTrue(msg['is_translated'])
         self.assertEqual(msg['original_text'], "Original text")
+
+    def test_structured_pending_message_is_replaced_in_place(self):
+        overlay = self._make_overlay()
+        overlay.clear_messages()
+        pending = ProcessedMessage(
+            message_id="fleet:1",
+            session_id="fleet",
+            text="bonjour",
+            sender="Pilot",
+            timestamp="08:00:00",
+            state=TranslationState.PENDING,
+            detected_language="fr",
+        )
+        translated = ProcessedMessage(
+            message_id="fleet:1",
+            session_id="fleet",
+            text="hello",
+            sender="Pilot",
+            timestamp="08:00:00",
+            original_text="bonjour",
+            state=TranslationState.TRANSLATED,
+            provider="DeepL",
+            detected_language="fr",
+        )
+
+        overlay.upsert_processed_message(pending)
+        overlay.upsert_processed_message(translated)
+
+        self.assertEqual(len(overlay.chat_history), 1)
+        self.assertEqual(overlay.chat_history[0]['text'], "hello")
+        self.assertEqual(overlay.chat_history[0]['state'], "translated")
+
+    def test_failed_message_html_shows_original_and_warning(self):
+        overlay = self._make_overlay()
+        message = ProcessedMessage(
+            message_id="fleet:2",
+            session_id="fleet",
+            text="bonjour",
+            sender="Pilot",
+            timestamp="08:00:00",
+            state=TranslationState.FAILED,
+            provider="DeepL",
+            detected_language="fr",
+            error="DeepL translation unavailable",
+        )
+
+        overlay.upsert_processed_message(message)
+        rendered = overlay._format_message_html(overlay.chat_history[-1])
+
+        self.assertIn("bonjour", rendered)
+        self.assertIn("DeepL translation unavailable", rendered)
+        self.assertIn("#ffbf69", rendered)
+
+    def test_translation_update_preserves_manual_scroll_position(self):
+        overlay = self._make_overlay()
+        overlay.config['auto_scroll'] = False
+        overlay.show()
+        QApplication.processEvents()
+        overlay.clear_messages()
+
+        for index in range(80):
+            overlay.add_message(
+                f"Message {index} with enough text to make the overlay scroll",
+                "Pilot",
+                "08:00:00",
+                "",
+                False,
+            )
+        pending = ProcessedMessage(
+            message_id="fleet:scroll",
+            session_id="fleet",
+            source_id="source-1",
+            text="bonjour",
+            sender="Pilot",
+            timestamp="08:00:01",
+            state=TranslationState.PENDING,
+        )
+        overlay.upsert_processed_message(pending)
+        self._wait_for_overlay_flush()
+
+        scroll_bar = overlay.text_browser.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum() // 2)
+        before = scroll_bar.value()
+        translated = ProcessedMessage(
+            message_id="fleet:scroll",
+            session_id="fleet",
+            source_id="source-1",
+            text="hello",
+            sender="Pilot",
+            timestamp="08:00:01",
+            original_text="bonjour",
+            state=TranslationState.TRANSLATED,
+            provider="DeepL",
+        )
+
+        overlay.upsert_processed_message(translated)
+        self._wait_for_overlay_flush()
+
+        self.assertGreater(before, 0)
+        self.assertEqual(scroll_bar.value(), before)
 
     def test_add_message_trims_at_100(self):
         overlay = self._make_overlay()

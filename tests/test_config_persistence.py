@@ -52,7 +52,7 @@ class TestConfigPersistence(unittest.TestCase):
         
         app.config_store = ConfigStore(path=self.config_path, legacy_dir=self.test_dir)
 
-        app._save_config()
+        self.assertTrue(app._save_config())
 
         self.assertTrue(self.config_path.exists())
         with open(self.config_path, 'r', encoding='utf-8') as config_file:
@@ -69,6 +69,23 @@ class TestConfigPersistence(unittest.TestCase):
         self.assertNotIn('polling_interval', session_conf)
         self.assertNotIn('font_size', session_conf)
         self.assertNotIn('opacity', saved['sessions']['session1'])
+
+    @patch('src.main.TranslatorManager.__init__', return_value=None)
+    def test_save_failure_is_reported_in_tray(self, mock_init):
+        app = TranslatorManager()
+        app.sessions = {}
+        app.config = {'shared': {}, 'sessions': {}}
+        app.config_store = MagicMock()
+        app.config_store.save.return_value = False
+        app.tray_icon = MagicMock()
+
+        self.assertFalse(app._save_config())
+
+        app.tray_icon.showMessage.assert_called_once()
+        self.assertIn(
+            'may revert',
+            app.tray_icon.showMessage.call_args.args[1],
+        )
 
 if __name__ == '__main__':
     unittest.main()

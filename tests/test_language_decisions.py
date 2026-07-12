@@ -1,0 +1,169 @@
+from unittest.mock import patch
+
+import pytest
+
+from src.core.detector import LanguageDetector
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("EN-US", "en"),
+        ("pt_BR", "pt"),
+        ("zh-Hant-TW", "zh"),
+        ("nb-NO", "no"),
+        ("iw-IL", "he"),
+        ("auto", "auto"),
+        (None, "unknown"),
+    ],
+)
+def test_normalize_language_variants(raw, expected):
+    assert LanguageDetector.normalize_language_code(raw) == expected
+
+
+@pytest.mark.parametrize(
+    ("text", "target", "language"),
+    [
+        ("需要 shield 后勤", "zh-TW", "zh"),
+        ("艦隊は jump の準備", "ja-JP", "ja"),
+        ("함대 shield 준비", "ko-KR", "ko"),
+    ],
+)
+def test_east_asian_message_already_in_target_is_not_translated(text, target, language):
+    detector = LanguageDetector()
+
+    assert detector.should_translate(text, target_lang=target, ignored_langs=set()) == (
+        False,
+        language,
+    )
+
+
+def test_mixed_chinese_command_is_not_suppressed_by_eve_keyword():
+    detector = LanguageDetector()
+
+    assert detector.should_translate(
+        "需要 shield 后勤",
+        target_lang="en-US",
+        ignored_langs={"en"},
+    ) == (True, "zh")
+
+
+def test_mixed_cyrillic_command_is_not_suppressed_by_eve_keyword():
+    with patch("src.core.detector.detect", return_value="ru"):
+        detector = LanguageDetector()
+
+        assert detector.should_translate(
+            "Нужен shield для флота",
+            target_lang="en",
+            ignored_langs={"en"},
+        ) == (True, "ru")
+
+
+def test_force_ignore_keyword_must_match_the_complete_message():
+    with patch("src.core.detector.detect", return_value="fr"):
+        detector = LanguageDetector()
+
+        for message in ("besoin shield maintenant", "Besoin Shield Maintenant"):
+            assert detector.should_translate(
+                message,
+                target_lang="en",
+                ignored_langs={"en"},
+            ) == (True, "fr")
+        assert detector.should_translate(
+            "shield",
+            target_lang="fr",
+            ignored_langs=set(),
+        ) == (False, "ignored_keyword")
+
+
+def test_general_language_variant_matching_target_is_not_translated():
+    with patch("src.core.detector.detect", return_value="pt"):
+        detector = LanguageDetector()
+
+        assert detector.should_translate(
+            "Esta mensagem ja esta em portugues",
+            target_lang="pt-BR",
+            ignored_langs=set(),
+        ) == (False, "pt")
+
+
+def test_ignored_language_variants_are_normalized():
+    with patch("src.core.detector.detect", return_value="en"):
+        detector = LanguageDetector()
+
+        assert detector.should_translate(
+            "This fleet is ready to jump",
+            target_lang="fr",
+            ignored_langs={"en-US"},
+        ) == (False, "en")
+
+
+@pytest.mark.parametrize("text", ["x", "3x", "o7", "111", "++++", "???"])
+def test_short_ascii_and_symbol_messages_are_conservatively_skipped(text):
+    with patch("src.core.detector.detect") as mock_detect:
+        detector = LanguageDetector()
+
+        should_translate, _ = detector.should_translate(
+            text,
+            target_lang="fr",
+            ignored_langs=set(),
+        )
+
+        assert should_translate is False
+        mock_detect.assert_not_called()
+
+
+def test_short_ascii_detection_is_deterministic():
+    assert LanguageDetector().detect_language("3x") == "en"
+    assert LanguageDetector().detect_language("3x") == "en"
+
+
+ENGLISH_FLEET_COMMANDS = (
+    "align",
+    "jump",
+    "do not jump",
+    "hold cloak",
+    "primary is Drake",
+)
+
+
+@pytest.mark.parametrize("message", ENGLISH_FLEET_COMMANDS)
+def test_english_fleet_commands_do_not_make_remote_calls_for_english_target(message):
+    detector = LanguageDetector()
+
+    assert detector.should_translate(
+        message,
+        target_lang="en-US",
+        ignored_langs={"en"},
+    ) == (False, "en")
+
+
+@pytest.mark.parametrize("message", ENGLISH_FLEET_COMMANDS)
+def test_english_fleet_commands_still_translate_for_non_english_target(message):
+    detector = LanguageDetector()
+
+    assert detector.should_translate(
+        message,
+        target_lang="de",
+        ignored_langs={"en"},
+    ) == (True, "en")
+
+
+@pytest.mark.parametrize(
+    ("message", "detected"),
+    [
+        ("alinear con la puerta", "es"),
+        ("align con la puerta", "es"),
+        ("sautez maintenant", "fr"),
+        ("la cible principale est Drake", "fr"),
+    ],
+)
+def test_foreign_fleet_commands_are_not_mistaken_for_english_patterns(message, detected):
+    with patch("src.core.detector.detect", return_value=detected):
+        detector = LanguageDetector()
+
+        assert detector.should_translate(
+            message,
+            target_lang="en",
+            ignored_langs={"en"},
+        ) == (True, detected)

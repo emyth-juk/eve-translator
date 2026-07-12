@@ -40,6 +40,30 @@ commands:
 
 Custom terms override bundled terms.
 
+Regional pairs layer over their base language. For example, `de-DE` first
+loads `zh_de.yml`, then an optional `custom_zh_de-de.yml`; the regional custom
+file overrides matching base terms without losing the rest of the base glossary.
+
+## SDE names versus glossary terms
+
+Official published type names and their CCP-localized translations belong in
+`data/generated/protected_entities.json`, generated from NoirSoldats' converted
+SDE database. Do not duplicate a vanilla source/target name pair in a bundled
+YAML glossary.
+
+Glossaries remain the owner of player language that the SDE cannot express:
+
+- shortened hull stems such as `末日沙场` for the official `末日沙场级`;
+- nicknames such as `Geddon`;
+- abbreviations such as `YST`, `DMS`, `HIC`, and `DIC`;
+- fleet commands, doctrine terms, and community slang.
+
+Cleanup is identity-based, not value-based: remove a bundled term when its exact
+source is already an official localized SDE name. The ID-linked target then
+becomes authoritative; this also corrects stale cross-ID rows such as the old
+`铁壁: Keepstar` mapping (`铁壁` is Fortizar, while `星城` is Keepstar). A value
+such as `Armageddon` does not make `Geddon` or `末日沙场` redundant.
+
 ## Contributing
 
 To add new terms:

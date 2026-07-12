@@ -88,6 +88,22 @@ ships:
         glossary = EVEGlossary('zh', 'en')
         self.assertEqual(glossary.terms["穿梭机"], "Super Shuttle")
 
+    def test_regional_custom_glossary_overrides_base_fallback(self):
+        custom_file = self.glossary_dir / "custom_zh_de-de.yml"
+        with open(custom_file, 'w', encoding='utf-8') as f:
+            f.write("""
+commands:
+  打得不错: Regional Good Fight
+  区域指令: Regional Command
+""")
+
+        glossary = EVEGlossary('zh', 'de-DE')
+
+        self.assertEqual(glossary.target_lang, "de-de")
+        self.assertEqual(glossary.terms["打得不错"], "Regional Good Fight")
+        self.assertEqual(glossary.terms["区域指令"], "Regional Command")
+        self.assertEqual(glossary.terms["末日沙场"], "Armageddon")
+
     def test_language_switch_fallback(self):
         """Test loading a language pair with no bundled file."""
         # zh_fr doesn't exist

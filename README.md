@@ -1,26 +1,32 @@
 # EVE Translator
 
-Real-time overlay translator for EVE Online fleet and local chat. Built for everyday EVE pilots; no technical setup required beyond your translation key.
+Real-time overlay translator for EVE Online fleet and local chat. Built for everyday EVE pilots with guided log and translation-provider setup.
 
-<img src="src/assets/icon.png" width="100" alt="icon">
+<p align="center">
+  <img src="src/assets/eve_translator_banner.png" width="900" alt="EVE Translator">
+</p>
 
 ## Screenshots
 ![Fleet Overlay](docs/screenshots/eve_translator_overlay.png)   
-![Settings](docs/screenshots/eve_translator_settings_1.png)
-![Settings](docs/screenshots/eve_translator_settings_2.png)
 ![Context Menu](docs/screenshots/eve_translator_fleet_context_menu_1.png)
 ![Context Menu](docs/screenshots/eve_translator_local_chat_context_menu_1.png)
 
 ## What It Does
 - Two overlays: one for Fleet, one for Local (toggle either on/off).
-- Pre-translation glossary for EVE slang, ships, and common commands (less machine-translation noise).
-- DeepL Free/Pro support; falls back to Google when no key is set.
+- Combat, Bilingual, and Mirror HUD modes with a compact readiness/provider header.
+- Exact command cards generated from the original line, with explicit FC/scout/starred roles.
+- Immediate originals while translation runs; translated lines always keep the original visible.
+- EVE-aware translation using language-pair glossaries, 46,000+ protected SDE names/aliases, and ID-linked locale mappings for 6,263 published inventory types; player aliases remain glossary-driven.
+- Local exact corrections, safe importable doctrine packs, provider-native burst batching, and opt-in context assist.
+- Explicit DeepL Free/Pro or Google provider selection; cloud translation is off until you choose one.
 - Auto-detects your active character log and updates Local automatically.
-- Click-through friendly windows you can drag, resize, and right-click for quick actions.
+- Always-on-top windows you can drag, resize, and right-click for quick actions.
+- Readiness states show whether Fleet and Local are off, waiting for a log, active, or in error.
 
 ## Requirements
 - Windows PC running EVE Online.
-- DeepL API key (Free or Pro) if you want the best quality. Google fallback works without a key.
+- Choose a provider in Settings. DeepL requires a Free or Pro API key; Google does not require a key.
+- Selecting Google or DeepL sends message text to that cloud provider. Translation remains disabled until you explicitly select one.
 - EVE client chat logging enabled (for Fleet/Local). In EVE: **Settings → Chat → Log Chat to File**.
 
 ### How to get a Free DeepL API Key
@@ -28,20 +34,29 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 2. Choose **DeepL API Free** (it’s separate from the Translator app).
 3. Create an account or sign in.
 4. Once subscribed, open your account dashboard → API plan → copy the **Authentication Key**. Free keys typically end with `:fx`.
-5. In the app, paste that key into **Settings → API Key**.
+5. In the app, select DeepL and paste the key into **Settings → DeepL API Key**.
 6. Keep the key private; it’s tied to your account and monthly quota.
 
 ## Quick Start (Players)
-1) Download: grab the latest `.exe` from the GitHub [Releases Page](https://github.com/emyth-juk/eve-translator/releases).  
-2) Run: double-click `EVETranslator_vX.Y.exe`.  
-3) Set your DeepL key: on first launch, enter it in Settings → API Key.  
-4) Point to your chat logs if needed: Settings → Log Directory (default is usually auto-detected).  
-5) Use it in game: position the overlays, adjust opacity/font size, and right-click for options (Settings, Export Logs, Toggle Sessions).
+1. Download: grab the latest `.exe` from the GitHub [Releases Page](https://github.com/emyth-juk/eve-translator/releases).
+2. Run: double-click `EVETranslator_vX.Y.exe`.
+3. Choose translation: open **Settings → Provider**, select Google or DeepL, and review the cloud-use notice.
+4. For DeepL, enter your API key and use **Test Provider** before saving.
+5. Point to your chat logs if needed: Settings → Log Directory (default is usually auto-detected).
+6. Use it in game: position the overlays, adjust opacity/font size, and right-click for options (Settings, Export Logs, Toggle Sessions).
+7. When positioned, use **Lock overlays** in the tray or **Ctrl+Shift+L** while EVE has focus to pass mouse input through both overlays.
 
 ## First-Time Setup Details
 - Config file location: `%USERPROFILE%\.eve_translator\translator_config.json` (auto-created).  
+- Provider choice: **Disabled** makes no cloud calls; **Google** and **DeepL** send message text to their respective services.
+- First-run provider guidance returns on later launches until you open Settings and save an explicit choice, including Disabled.
+- Provider test: sends only a built-in connection-test phrase, never fleet chat.
+- Context assist is off by default. When enabled with a provider that supports native context, recent lines from only the same channel/log source are also sent to that provider.
 - Colors and UI: set default/translated/highlight colors in Settings; changes are live.  
-- Glossaries: built-in slang/ship terms; user overrides go in `%USERPROFILE%\.eve_translator\glossaries\` (same keys as the bundled YAML files).  
+- Translation Intelligence: manage SDE name protection, burst optimization, context consent, exact local corrections, and one active doctrine pack.
+- Glossaries are selected from the detected source and target language pair. User overrides go in `%USERPROFILE%\.eve_translator\glossaries\`.
+- Corrections are exact, language-pair scoped, and stored locally in `%USERPROFILE%\.eve_translator\translation_memory.sqlite3`.
+- Doctrine packs are data-only ZIPs validated before installation under `%USERPROFILE%\.eve_translator\doctrines\`; they cannot grant FC/scout trust. See `data/doctrines/README.md` for the pack schema.
 - Logs: app logs live in `%USERPROFILE%\.eve_translator\logs\`.
 
 ## Controls & Interactions
@@ -57,15 +72,35 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 - **Right-Click** (release without dragging) to open the menu:
     - **Settings**: Configure API keys, colors, fonts, and opacity.
     - **Toggle Chat**: Switch between Fleet and Local overlays.
-    - **Export Logs**: Save the current session's translations to a file.
+    - **Export Recent History**: Save the overlay's latest 100 message states to a file.
     - **Switch Character/Fleet**: Manually override auto-detection if needed.
+    - **Display Mode**: Switch Combat, Bilingual, and Mirror instantly without retranslating history.
+    - **Speaker Role**: Mark the latest speaker as FC, Scout, Starred, or remove the role.
+    - **Improve Last Translation**: Save an exact local correction for the latest translated line.
+
+### HUD Modes
+- **Combat**: trusted exact-command cards plus messages from explicitly starred FC/scout speakers.
+- **Bilingual**: translation-relevant messages and starred speakers, with translation first and original below.
+- **Mirror**: every parsed chat line; this remains the migration-safe default for existing configurations.
+
+Speaker roles are exact, local mappings. The app never infers authority from a name containing “FC”, and doctrine imports cannot silently trust identities. Command cards are classified from the source text before cloud translation; unstarred commands are labelled **Unverified**.
+
+### System Tray Readiness
+- **Off**: the session is disabled.
+- **Waiting**: enabled and watching for EVE to create an active Fleet or Local log.
+- **Active**: the overlay is following a live chat log.
+- **Error**: the log or session could not be opened; hover the tray action for details.
+- Waiting sessions start automatically when their log appears. Settings is always available from the tray.
+- **Lock overlays** enables true click-through for both overlays. The global shortcut uses Windows `RegisterHotKey`, not a keyboard hook; the tray remains the recovery path if the shortcut is unavailable.
 
 ### Features
 - **Auto-Switching**: Local overlay detects system changes and updates automatically.
-- **Highlighting**: Glossary terms are highlighted; original text is preserved in parentheses for reference.
+- **Protected Content**: EVE links and 46,000+ SDE names/aliases are protected from provider corruption. For 6,263 published inventory types, official names are first resolved by SDE type ID to the selected target locale when available, otherwise to English.
+- **Burst Translation**: DeepL can translate compatible bursts in one provider request; Google remains sequential because its library batch helper is not a true network batch.
 
 ## Troubleshooting
-- No translations? Check your DeepL key and ensure EVE chat logging is on.  
+- No translations? Confirm that Google or DeepL is explicitly selected, run **Test Provider**, and ensure EVE chat logging is on.
+- An amber warning means the original is being shown because the selected provider is unavailable or failed. Disabled mode quietly leaves messages untranslated.
 - Wrong log path? Update it in Settings; the path typically ends with `Documents\EVE\logs\Chatlogs`.  
 - Still seeing a default icon on Windows? Clear icon cache or rename the exe; the embedded icon is correct.  
 - Logs for support: `%USERPROFILE%\.eve_translator\logs\translator.log`.
@@ -74,6 +109,7 @@ Real-time overlay translator for EVE Online fleet and local chat. Built for ever
 - Install: `pip install -r requirements.txt`  
 - Run: `python -m src.main`  
 - Tests: `pytest` (headless on Linux may need `xvfb-run pytest`)  
+- Refresh the protected-name index from a pinned [NoirSoldats EVE SDE Converter](https://github.com/noirsoldats/eve-sde-converter) SQLite release with `python scripts/build_protected_entities.py --help`; see `scripts/README.md`. This project does not reimplement CCP SDE conversion.
 - Build (Windows): `build_exe.bat` produces `dist/EVETranslator_vX.Y.exe`.
 
 ## Changelog & Contributing

@@ -64,10 +64,22 @@ class TestIgnoredPhrases(unittest.TestCase):
         with patch('src.core.detector.get_resource_path', return_value=str(self.config_path)):
             detector = LanguageDetector()
             
-            # 1. Ignored Keyword
-            should, lang = detector.should_translate("Please DoNotTranslateMe thanks", 'en')
+            # 1. Exact ignored keyword
+            should, lang = detector.should_translate(
+                "DoNotTranslateMe", target_lang='fr', ignored_langs=set()
+            )
             self.assertFalse(should)
             self.assertEqual(lang, 'ignored_keyword')
+
+            # A keyword embedded in a foreign sentence must not suppress the line.
+            with patch('src.core.detector.detect', return_value='fr'):
+                detector = LanguageDetector()
+                should, lang = detector.should_translate(
+                    "Merci DoNotTranslateMe maintenant",
+                    target_lang='en',
+                    ignored_langs={'en'},
+                )
+            self.assertEqual((should, lang), (True, 'fr'))
             
             # 2. Ignored Slang (Regex)
             should, lang = detector.should_translate("o/", 'en')
@@ -76,7 +88,9 @@ class TestIgnoredPhrases(unittest.TestCase):
             
             # 3. Normal text
             text = "The quick brown fox jumps over the lazy dog."
-            should, lang = detector.should_translate(text, ignored_langs=set())
+            should, lang = detector.should_translate(
+                text, target_lang='fr', ignored_langs=set()
+            )
             self.assertEqual((should, lang), (True, 'en'))
 
 if __name__ == '__main__':

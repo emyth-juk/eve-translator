@@ -1,5 +1,7 @@
 # Python Standard
 __pycache__/
+.pytest_cache/
+.coverage
 *.py[cod]
 *$py.class
 *.so
@@ -40,7 +42,9 @@ clean_config.py
 # Documentation (Internal)
 *.md
 !README.md
+!scripts/README.md
 !data/glossaries/README.md
+!data/doctrines/README.md
 !CONTRIBUTING.md
 !CHANGELOG.md
 !.github/
