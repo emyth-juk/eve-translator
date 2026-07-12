@@ -5,7 +5,6 @@ from pathlib import Path
 from typing import Dict
 
 from src.core.languages import normalize_locale
-from src.core.lexicon import LexiconTerm, LongestLexiconMatcher
 try:
     from src.utils.paths import get_resource_path
 except ImportError:
@@ -32,12 +31,8 @@ class EVEGlossary:
         self.target_lang = self._normalize_language(target_lang, 'en')
         self.terms: Dict[str, str] = self._load_glossary()
         
-        # Sort terms by length (descending) to ensure longest matches are replaced first.
+        # Preserve the deterministic longest-first view used by validation tools.
         self.sorted_terms = sorted(self.terms.items(), key=lambda x: len(x[0]), reverse=True)
-        self._matcher = LongestLexiconMatcher(
-            LexiconTerm(source=source, target=target)
-            for source, target in self.terms.items()
-        )
         
     @staticmethod
     def _normalize_language(value, default: str) -> str:
@@ -135,11 +130,6 @@ class EVEGlossary:
             elif isinstance(value, str):
                 flattened[key] = value
         return flattened
-
-    def replace_terms(self, text: str) -> str:
-        """Replace terms through the same longest-span engine as translation."""
-
-        return self._matcher.replace(text)
 
     def _get_hardcoded_fallback(self) -> Dict[str, str]:
         """Original hardcoded dictionary for safety."""

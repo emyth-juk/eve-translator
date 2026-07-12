@@ -19,24 +19,12 @@ class TestGlossaryMerged(unittest.TestCase):
     def setUp(self):
         self.glossary = EVEGlossary()
 
-    def test_glossary_replacement_basics(self):
-        """Test basic term replacement."""
-        # Simple replacement
-        text = "有便宜毒蜥卖吗"
-        replaced = self.glossary.replace_terms(text)
-        self.assertIn("Gila", replaced)
-        self.assertNotIn("毒蜥", replaced)
-        
-        # Multiple terms
-        text = "吉他收脑插" 
-        # "收" -> "WTB", "吉他" -> "Jita"
-        replaced = self.glossary.replace_terms(text)
-        self.assertIn("Jita", replaced)
-        self.assertIn("WTB", replaced)
-        
-        # No terms
-        text = "Hello World"
-        self.assertEqual(self.glossary.replace_terms(text), "Hello World")
+    def test_glossary_representative_terms(self):
+        """Test that representative merged glossary entries are present."""
+        self.assertEqual(self.glossary.terms.get("毒蜥"), "Gila")
+        self.assertEqual(self.glossary.terms.get("吉他"), "Jita")
+        self.assertEqual(self.glossary.terms.get("收"), "WTB")
+        self.assertNotIn("Hello World", self.glossary.terms)
 
     def test_glossary_extended_ships(self):
         """Test extended ship list."""
@@ -55,7 +43,7 @@ class TestGlossaryMerged(unittest.TestCase):
         ]
         for term, expected in cases:
             with self.subTest(term=term):
-                self.assertIn(expected, self.glossary.replace_terms(term))
+                self.assertIn(expected, self.glossary.terms.get(term, ""))
 
     def test_glossary_fitting_modules(self):
         """Test fitting modules (New additions)."""
@@ -71,11 +59,7 @@ class TestGlossaryMerged(unittest.TestCase):
         ]
         for term, expected in cases:
             with self.subTest(term=term):
-                try:
-                    replaced = self.glossary.replace_terms(term)
-                    self.assertIn(expected, replaced)
-                except Exception as e:
-                    self.fail(f"Failed to replace '{term}': {e}")
+                self.assertIn(expected, self.glossary.terms.get(term, ""))
 
     def test_glossary_regions(self):
         """Test newly added regions."""
@@ -87,7 +71,7 @@ class TestGlossaryMerged(unittest.TestCase):
         ]
         for term, expected in cases:
             with self.subTest(term=term):
-                self.assertIn(expected, self.glossary.replace_terms(term))
+                self.assertIn(expected, self.glossary.terms.get(term, ""))
 
     def test_glossary_validation(self):
         """Metadata and structural validation of zh_en.yml."""
