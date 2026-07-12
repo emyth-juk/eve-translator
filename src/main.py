@@ -99,6 +99,10 @@ from src.version import __version__
 DIR_SCAN_DEBOUNCE_MS = 500
 WATCHED_DIR_FALLBACK_SECONDS = 60
 WORKER_SHUTDOWN_TIMEOUT_MS = 15_000
+# Discovery normally completes in well under a second. Do not make app exit
+# inherit the much longer cloud/provider worker deadline if filesystem or
+# native window discovery becomes stuck.
+DISCOVERY_SHUTDOWN_TIMEOUT_MS = 2_000
 DISCOVERY_RETRY_BASE_MS = 1_000
 DISCOVERY_RETRY_MAX_MS = 10_000
 DISCOVERY_FAILURE_ERROR_THRESHOLD = 3
@@ -2408,10 +2412,14 @@ class TranslatorManager(QObject):
         if discovery_thread is not None:
             discovery_thread.requestInterruption()
             discovery_thread.quit()
-            if not discovery_thread.wait(WORKER_SHUTDOWN_TIMEOUT_MS):
+            if not discovery_thread.wait(DISCOVERY_SHUTDOWN_TIMEOUT_MS):
                 logger.error(
-                    "Chat discovery did not stop before the shutdown deadline"
+                    "Chat discovery did not stop within %d ms; forcing shutdown",
+                    DISCOVERY_SHUTDOWN_TIMEOUT_MS,
                 )
+                # A blocked directory/native-window call cannot observe the
+                # cooperative stop flag. Termination remains a last resort so
+                # a wedged discovery pass cannot hold the whole app open.
                 discovery_thread.terminate()
                 discovery_thread.wait(1_000)
         self.thread.requestInterruption()

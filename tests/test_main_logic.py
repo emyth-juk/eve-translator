@@ -505,6 +505,8 @@ class TestSessionRuntimeState(unittest.TestCase):
         mgr._scan_characters.assert_not_called()
 
     def test_shutdown_fences_discovery_events_before_stopping_workers(self):
+        from src.main import DISCOVERY_SHUTDOWN_TIMEOUT_MS
+
         mgr = self._make_manager()
         mgr._shutting_down = False
         mgr.scanner_timer = MagicMock()
@@ -534,9 +536,51 @@ class TestSessionRuntimeState(unittest.TestCase):
         mgr.log_dir_watcher.removePath.assert_called_once_with('C:/logs')
         mgr.discovery_worker.request_stop.assert_called_once_with()
         mgr.discovery_thread.quit.assert_called_once_with()
+        mgr.discovery_thread.wait.assert_called_once_with(
+            DISCOVERY_SHUTDOWN_TIMEOUT_MS
+        )
         mgr.thread.quit.assert_called_once_with()
         mgr.translation_thread.quit.assert_called_once_with()
         mgr.app.quit.assert_called_once_with()
+
+    def test_shutdown_forces_discovery_after_its_short_deadline(self):
+        from src.main import (
+            DISCOVERY_SHUTDOWN_TIMEOUT_MS,
+            WORKER_SHUTDOWN_TIMEOUT_MS,
+        )
+
+        mgr = self._make_manager()
+        mgr._shutting_down = False
+        mgr.scanner_timer = MagicMock()
+        mgr.scan_debounce_timer = MagicMock()
+        mgr.discovery_retry_timer = MagicMock()
+        mgr.log_dir_watcher = None
+        mgr.discovery_worker = MagicMock()
+        mgr.discovery_thread = MagicMock()
+        mgr.discovery_thread.wait.side_effect = [False, True]
+        mgr.thread = MagicMock()
+        mgr.thread.wait.return_value = True
+        mgr.translation_scheduler = None
+        mgr.translation_thread = MagicMock()
+        mgr.translation_thread.isRunning.return_value = False
+        mgr.translation_thread.wait.return_value = True
+        mgr.translation_memory = MagicMock()
+        mgr.app = MagicMock()
+
+        mgr.shutdown()
+
+        self.assertLess(
+            DISCOVERY_SHUTDOWN_TIMEOUT_MS,
+            WORKER_SHUTDOWN_TIMEOUT_MS,
+        )
+        self.assertEqual(
+            mgr.discovery_thread.wait.call_args_list,
+            [call(DISCOVERY_SHUTDOWN_TIMEOUT_MS), call(1_000)],
+        )
+        mgr.discovery_worker.request_stop.assert_called_once_with()
+        mgr.discovery_thread.quit.assert_called_once_with()
+        mgr.discovery_thread.terminate.assert_called_once_with()
+        mgr.thread.wait.assert_called_once_with(WORKER_SHUTDOWN_TIMEOUT_MS)
 
     def test_applying_scanner_config_requests_an_immediate_scan(self):
         mgr = self._make_manager()
