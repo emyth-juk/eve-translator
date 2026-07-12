@@ -1,6 +1,8 @@
 import sys
 import time
+from collections import OrderedDict
 from collections.abc import Iterable
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -20,6 +22,17 @@ if sys.platform == 'win32':
     from ctypes import wintypes
 
 logger = logging.getLogger(__name__)
+SYSTEM_CACHE_SIZE = 128
+
+
+@dataclass
+class _SystemScanState:
+    size: int
+    mtime_ns: int
+    offset: int
+    last_system: str | None
+    pending_bytes: bytes = b""
+    pending_text: str = ""
 
 
 class LocalChatDetector:
@@ -30,7 +43,7 @@ class LocalChatDetector:
 
     def __init__(self):
         self._header_cache = UTF16HeaderCache()
-        self._system_cache = {}
+        self._system_cache: OrderedDict[str, _SystemScanState] = OrderedDict()
 
     def _file_cache_key(self, filepath: str):
         try:
@@ -67,28 +80,98 @@ class LocalChatDetector:
         filepath: str,
         cache_key: tuple[str, int, int] | None,
     ) -> Optional[str]:
-        if cache_key in self._system_cache:
-            return self._system_cache[cache_key]
+        if cache_key is None:
+            last_system = None
+            try:
+                with open(
+                    filepath,
+                    'r',
+                    encoding='utf-16-le',
+                    errors='replace',
+                ) as log_file:
+                    for line in log_file:
+                        last_system = self._system_from_line(
+                            line,
+                            last_system,
+                        )
+            except (OSError, UnicodeError):
+                pass
+            return last_system
 
-        last_system = None
+        path, size, mtime_ns = cache_key
+        normalized_path = normalized_log_path(path)
+        state = self._system_cache.get(normalized_path)
+        if (
+            state is not None
+            and state.size == size
+            and state.mtime_ns == mtime_ns
+        ):
+            self._system_cache.move_to_end(normalized_path)
+            return state.last_system
+
+        is_append = (
+            state is not None
+            and size > state.size
+            and state.offset <= size
+        )
+        offset = state.offset if is_append else 0
+        last_system = state.last_system if is_append else None
+        pending_bytes = state.pending_bytes if is_append else b""
+        pending_text = state.pending_text if is_append else ""
         try:
-            with open(filepath, 'r', encoding='utf-16-le', errors='replace') as f:
-                # We can iterate the whole file. EVE logs aren't massive.
-                # If they are huge, we might want to seek to end and read back,
-                # but for simplicity and robustness, forward scan is fine for text files < 50MB.
-                for line in f:
-                    if 'EVE System' in line and 'Channel changed to Local' in line:
-                        parts = line.split('Channel changed to Local')
-                        if len(parts) > 1:
-                            # Extract system name after colon
-                            system_part = parts[1].split(':')
-                            if len(system_part) > 1:
-                                last_system = system_part[1].strip()
+            with open(filepath, 'rb') as log_file:
+                log_file.seek(offset)
+                raw = log_file.read()
         except (OSError, UnicodeError):
-            pass
-        if cache_key is not None:
-            self._system_cache[cache_key] = last_system
+            return last_system
+
+        data = pending_bytes + raw
+        decoded_bytes = data[: len(data) - (len(data) % 2)]
+        next_pending_bytes = data[len(decoded_bytes):]
+        encoding = (
+            'utf-16'
+            if offset == 0
+            and decoded_bytes.startswith((b'\xff\xfe', b'\xfe\xff'))
+            else 'utf-16-le'
+        )
+        decoded = decoded_bytes.decode(encoding, errors='replace')
+        text = pending_text + decoded
+        for line in text.splitlines():
+            last_system = self._system_from_line(line, last_system)
+
+        split = text.splitlines(keepends=True)
+        next_pending_text = (
+            split[-1]
+            if split and not split[-1].endswith(('\r', '\n'))
+            else ''
+        )
+        self._system_cache[normalized_path] = _SystemScanState(
+            size=max(size, offset + len(raw)),
+            mtime_ns=mtime_ns,
+            offset=offset + len(raw),
+            last_system=last_system,
+            pending_bytes=next_pending_bytes,
+            pending_text=next_pending_text,
+        )
+        self._system_cache.move_to_end(normalized_path)
+        while len(self._system_cache) > SYSTEM_CACHE_SIZE:
+            self._system_cache.popitem(last=False)
         return last_system
+
+    @staticmethod
+    def _system_from_line(
+        line: str,
+        current: str | None,
+    ) -> str | None:
+        marker = 'Channel changed to Local'
+        if 'EVE System' not in line or marker not in line:
+            return current
+        _prefix, _separator, suffix = line.partition(marker)
+        _before_colon, colon, system_name = suffix.partition(':')
+        if not colon:
+            return current
+        normalized = system_name.strip()
+        return normalized or current
 
     def is_character_window_open(self, char_name: str) -> bool:
         """

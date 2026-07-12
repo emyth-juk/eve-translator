@@ -104,6 +104,52 @@ class TestLocalChatDetectorExtended(unittest.TestCase):
 
         self.assertEqual(mock_open.call_count, 3)
 
+    def test_extract_system_name_reads_only_append_and_reuses_one_cache_entry(self):
+        path = self._create_local_log("111", "Pilot", system_name="Jita")
+        self.assertEqual(self.detector.extract_system_name(path), "Jita")
+        initial_state = next(iter(self.detector._system_cache.values()))
+        initial_offset = initial_state.offset
+
+        with open(path, 'ab') as log_file:
+            log_file.write(
+                (
+                    "\r\n[ 2025.12.01 10:00:00 ] EVE System > "
+                    "Channel changed to Local : Amarr"
+                ).encode('utf-16-le')
+            )
+
+        actual_open = open
+        seek_offsets = []
+
+        class TrackingReader:
+            def __init__(self, wrapped):
+                self._wrapped = wrapped
+
+            def __enter__(self):
+                self._wrapped.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return self._wrapped.__exit__(*args)
+
+            def seek(self, offset, *args):
+                seek_offsets.append(offset)
+                return self._wrapped.seek(offset, *args)
+
+            def read(self, *args):
+                return self._wrapped.read(*args)
+
+        def tracked_open(*args, **kwargs):
+            return TrackingReader(actual_open(*args, **kwargs))
+
+        with patch("builtins.open", side_effect=tracked_open):
+            self.assertEqual(self.detector.extract_system_name(path), "Amarr")
+
+        self.assertEqual(seek_offsets, [initial_offset])
+        self.assertEqual(len(self.detector._system_cache), 1)
+        updated_state = next(iter(self.detector._system_cache.values()))
+        self.assertGreater(updated_state.offset, initial_offset)
+
     # --- scan_active_characters ---
 
     def test_scan_active_characters(self):
