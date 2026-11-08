@@ -5,15 +5,40 @@ from __future__ import annotations
 import os
 import re
 import stat as stat_module
+import sys
 from collections import OrderedDict
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 
 EVE_FILENAME_CACHE_SIZE = 4_096
+# Legacy bound kept for callers that pass it explicitly. Discovery caches are
+# unbounded and pruned to the folder instead: a Chatlogs folder often holds
+# 20k-100k files, and an LRU bound smaller than that evicts in scan order, so
+# every "warm" pass re-opened nearly every log.
 EVE_HEADER_CACHE_SIZE = 2_048
 EVE_HEADER_READ_BYTES = 16_384
 EVE_LOG_FUTURE_MTIME_SKEW_SECONDS = 2.0
+# Check for shutdown this often inside long per-file loops.
+DISCOVERY_STOP_CHECK_INTERVAL = 128
+
+
+class DiscoveryCancelled(Exception):
+    """Raised inside a discovery pass when shutdown or a newer pass wins."""
+
+
+def check_discovery_stop(
+    should_stop: Callable[[], bool] | None,
+    index: int,
+) -> None:
+    """Raise :class:`DiscoveryCancelled` every few iterations if requested."""
+    if (
+        should_stop is not None
+        and index % DISCOVERY_STOP_CHECK_INTERVAL == 0
+        and should_stop()
+    ):
+        raise DiscoveryCancelled()
 
 _FILENAME_PATTERN = re.compile(
     r"^(?P<channel>.+)_(?P<date>\d{8})_(?P<time>\d{6})"
@@ -25,7 +50,7 @@ _HEADER_PATTERN = re.compile(
 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EVELogFilename:
     channel_name: str
     character_id: str | None
@@ -34,7 +59,7 @@ class EVELogFilename:
     started_time: float
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EVELogHeader:
     channel_id: str = ""
     channel_name: str = ""
@@ -42,7 +67,7 @@ class EVELogHeader:
     started_time: float | None = None
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class EVELogEntry:
     """One immutable file/stat/name record shared by chat detectors."""
 
@@ -108,12 +133,24 @@ def _parse_eve_log_basename(filename: str) -> EVELogFilename | None:
         return None
     date_text = match.group("date")
     time_text = match.group("time")
-    started_time = parse_eve_timestamp(date_text + time_text)
-    if started_time is None:
+    try:
+        # Direct digits parse: strptime via parse_eve_timestamp tried two
+        # failing formats per file, a large share of a 60k-file pass.
+        started_time = datetime(
+            int(date_text[0:4]),
+            int(date_text[4:6]),
+            int(date_text[6:8]),
+            int(time_text[0:2]),
+            int(time_text[2:4]),
+            int(time_text[4:6]),
+            tzinfo=timezone.utc,
+        ).timestamp()
+    except ValueError:
         return None
+    character_id = match.group("character_id")
     return EVELogFilename(
-        channel_name=match.group("channel"),
-        character_id=match.group("character_id"),
+        channel_name=sys.intern(match.group("channel")),
+        character_id=sys.intern(character_id) if character_id else character_id,
         date_text=date_text,
         time_text=time_text,
         started_time=started_time,
@@ -125,8 +162,36 @@ def parse_eve_log_filename(filename: str | os.PathLike[str]) -> EVELogFilename |
     return _parse_eve_log_basename(os.path.basename(os.fspath(filename)))
 
 
+def resolve_chatlogs_dir(path: str | os.PathLike[str]) -> str:
+    """Use the Chatlogs subfolder when the EVE ``logs`` folder was chosen.
+
+    Picking the EVE ``logs`` folder instead of its ``Chatlogs`` subfolder
+    scanned successfully but found nothing, leaving every session Waiting.
+    """
+    text = os.fspath(path)
+    if os.path.basename(os.path.normpath(text)).casefold() == "chatlogs":
+        return text
+    candidate = os.path.join(text, "Chatlogs")
+    return candidate if os.path.isdir(candidate) else text
+
+
+def folder_has_eve_logs(path: str | os.PathLike[str], limit: int = 2000) -> bool:
+    """Whether the folder holds at least one file named like an EVE chat log."""
+    try:
+        with os.scandir(path) as directory:
+            for index, entry in enumerate(directory):
+                if index >= limit:
+                    return True  # a big folder; do not keep scanning on the GUI
+                if parse_eve_log_filename(entry.name) is not None:
+                    return True
+    except OSError:
+        return False
+    return False
+
+
 def scan_eve_log_entries(
     log_dir: str | os.PathLike[str],
+    should_stop: Callable[[], bool] | None = None,
 ) -> tuple[EVELogEntry, ...]:
     """Enumerate a directory once and snapshot every regular file once.
 
@@ -134,11 +199,13 @@ def scan_eve_log_entries(
     file metadata failures propagate so callers can preserve their last-good
     registries and retry instead of mistaking an incomplete scan for logout.
     Files that disappear while the directory is being enumerated are skipped;
-    that is the expected shape of ordinary EVE log rotation.
+    that is the expected shape of ordinary EVE log rotation. ``should_stop``
+    is polled periodically and aborts with :class:`DiscoveryCancelled`.
     """
     entries: list[EVELogEntry] = []
     with os.scandir(log_dir) as directory:
-        for entry in directory:
+        for index, entry in enumerate(directory):
+            check_discovery_stop(should_stop, index)
             try:
                 entry_stat = entry.stat()
             except FileNotFoundError:
@@ -160,13 +227,27 @@ def scan_eve_log_entries(
 
 
 class UTF16HeaderCache:
-    """Read standard EVE headers once per path/size/mtime version."""
+    """Read standard EVE headers once per path/size/mtime version.
 
-    def __init__(self, max_size: int = EVE_HEADER_CACHE_SIZE):
-        self.max_size = max(1, int(max_size))
+    By default the cache is unbounded and callers prune it to the current
+    folder snapshot with :meth:`retain`, so memory follows the folder size
+    instead of evicting entries that the next pass needs again.
+    """
+
+    def __init__(self, max_size: int | None = None):
+        self.max_size = None if max_size is None else max(1, int(max_size))
         self._entries: OrderedDict[
             str, tuple[int, int, EVELogHeader | None]
         ] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._entries)
+
+    def retain(self, paths: Iterable[str | os.PathLike[str]]) -> None:
+        """Drop cached headers for files that are no longer in the folder."""
+        keep = {self._key(path) for path in paths}
+        for key in [key for key in self._entries if key not in keep]:
+            del self._entries[key]
 
     @staticmethod
     def _key(path: str | os.PathLike[str]) -> str:
@@ -226,10 +307,11 @@ class UTF16HeaderCache:
                 if len(values) == 4:
                     break
             if values:
+                # Channel and listener names repeat across thousands of logs.
                 header = EVELogHeader(
-                    channel_id=values.get("Channel ID", "").strip(),
-                    channel_name=values.get("Channel Name", "").strip(),
-                    listener_name=values.get("Listener", "").strip(),
+                    channel_id=sys.intern(values.get("Channel ID", "").strip()),
+                    channel_name=sys.intern(values.get("Channel Name", "").strip()),
+                    listener_name=sys.intern(values.get("Listener", "").strip()),
                     started_time=parse_eve_timestamp(
                         values.get("Session started", "")
                     ),
@@ -239,6 +321,7 @@ class UTF16HeaderCache:
 
         self._entries[key] = (size, mtime_ns, header)
         self._entries.move_to_end(key)
-        while len(self._entries) > self.max_size:
-            self._entries.popitem(last=False)
+        if self.max_size is not None:
+            while len(self._entries) > self.max_size:
+                self._entries.popitem(last=False)
         return header

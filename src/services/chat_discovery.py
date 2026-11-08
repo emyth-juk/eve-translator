@@ -19,10 +19,16 @@ from src.services.channel_detector import AnyChatDetector
 from src.services.fleet_detector import FleetDetector
 from src.services.local_detector import LocalChatDetector
 from src.services.log_discovery import (
+    DiscoveryCancelled,
     EVELogEntry,
+    UTF16HeaderCache,
     parse_eve_log_filename,
     scan_eve_log_entries,
 )
+
+# Prune the shared header cache once it holds this many more entries than the
+# folder (deleted logs); avoids rebuilding a path set on every pass.
+HEADER_CACHE_PRUNE_SLACK = 512
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +146,21 @@ class ChatDiscoveryWorker(QObject):
             entry_scanner if entry_scanner is not None else scan_eve_log_entries
         )
         self._stop_requested = threading.Event()
+        # One header cache for all detectors: Local and Fleet logs were cached
+        # twice (their detector plus Any Chat), each in a too-small LRU.
+        self.header_cache = UTF16HeaderCache()
+        for detector in (
+            self.local_detector,
+            self.channel_detector,
+            self.fleet_detector,
+        ):
+            if isinstance(getattr(detector, '_header_cache', None), UTF16HeaderCache):
+                detector._header_cache = self.header_cache
+            # Long per-file loops poll this so shutdown never waits on them.
+            try:
+                detector.should_stop = self._cancel_requested
+            except AttributeError:
+                pass
 
     def request_stop(self) -> None:
         """Thread-safely prevent new work and cancel between detector passes."""
@@ -155,6 +176,14 @@ class ChatDiscoveryWorker(QObject):
             return True
         thread = QThread.currentThread()
         return bool(thread and thread.isInterruptionRequested())
+
+    def _prune_header_cache(self, entries) -> None:
+        try:
+            paths = [entry.path for entry in entries]
+        except (AttributeError, TypeError):
+            return
+        if len(self.header_cache) > len(paths) + HEADER_CACHE_PRUNE_SLACK:
+            self.header_cache.retain(paths)
 
     def _cancelled_result(
         self,
@@ -205,7 +234,13 @@ class ChatDiscoveryWorker(QObject):
                 return
 
             stage = "snapshot"
-            entries = self.entry_scanner(normalized_log_dir)
+            if self.entry_scanner is scan_eve_log_entries:
+                entries = scan_eve_log_entries(
+                    normalized_log_dir,
+                    self._cancel_requested,
+                )
+            else:
+                entries = self.entry_scanner(normalized_log_dir)
             if self._cancel_requested():
                 self.result_ready.emit(
                     self._cancelled_result(generation, normalized_log_dir)
@@ -265,6 +300,15 @@ class ChatDiscoveryWorker(QObject):
                 character_registry=characters,
                 channel_registry=channels,
                 fleet_registry=fleets,
+            )
+            self._prune_header_cache(entries)
+        except DiscoveryCancelled:
+            result = self._cancelled_result(
+                generation,
+                normalized_log_dir,
+                characters=characters,
+                channels=channels,
+                fleets=fleets,
             )
         except Exception as exc:
             error = ChatDiscoveryError(

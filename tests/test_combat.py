@@ -1,3 +1,5 @@
+import pytest
+
 from src.core.combat import (
     classify_commands,
     command_is_trusted,
@@ -90,3 +92,25 @@ def test_doctrine_custom_command_uses_validated_category_and_label():
     )
     assert command_is_trusted("scout", match.code, match.category) is False
     assert command_is_trusted("scout", "CUSTOM_MOVE", "MOVE") is False
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("全体对齐", [("ALIGN", "")]),
+        ("大家集火毒蜥", [("PRIMARY", "毒蜥")]),
+        ("所有人过门", [("JUMP", "")]),
+        ("everyone align to gate", [("ALIGN", "gate")]),
+        ("fleet warp to 0", [("WARP", "0")]),
+        ("全体跟随 align to gate", [("ANCHOR", ""), ("ALIGN", "gate")]),
+        ("集火毒蜥级 然后转火乌鸦级", [("PRIMARY", "毒蜥级"), ("SWITCH_PRIMARY", "乌鸦级")]),
+        ("align then warp", [("ALIGN", ""), ("WARP", "")]),
+    ],
+)
+def test_fleet_wide_and_chained_calls_are_classified(text, expected):
+    assert [(match.code, match.argument) for match in classify_commands(text)] == expected
+
+
+@pytest.mark.parametrize("text", ["primary dead", "primary is down", "集火死了"])
+def test_target_status_reports_do_not_create_target_cards(text):
+    assert classify_commands(text) == ()

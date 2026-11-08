@@ -1,9 +1,8 @@
 import sys
 import os
+import re
 import logging
 import logging.handlers
-import glob
-import time
 from pathlib import Path
 import copy
 import traceback
@@ -91,7 +90,12 @@ from src.services.chat_discovery import (
     ChatDiscoveryWorker,
     active_character_starts,
 )
-from src.services.log_discovery import log_recency_key, normalized_log_path
+from src.services.log_discovery import (
+    folder_has_eve_logs,
+    log_recency_key,
+    normalized_log_path,
+    resolve_chatlogs_dir,
+)
 from src.gui.settings import SettingsDialog
 from src.gui.compose import ComposeDialog
 from src.version import __version__
@@ -106,11 +110,52 @@ DISCOVERY_SHUTDOWN_TIMEOUT_MS = 2_000
 DISCOVERY_RETRY_BASE_MS = 1_000
 DISCOVERY_RETRY_MAX_MS = 10_000
 DISCOVERY_FAILURE_ERROR_THRESHOLD = 3
+# Windows truncates tray tooltips (NOTIFYICONDATA.szTip) to 127 characters.
+TRAY_TOOLTIP_LIMIT = 127
 SCANNER_CONFIG_KEYS = frozenset({
     'log_dir',
     'fleet_inactive_threshold',
     'fleet_scan_interval',
 })
+# Visual settings that Settings previews live on the overlays.
+PREVIEW_SHARED_KEYS = frozenset({
+    'opacity', 'font_size', 'auto_scroll',
+    'color_default', 'color_translated', 'color_highlight',
+})
+PREVIEW_SESSION_KEYS = frozenset({
+    'x', 'y', 'w', 'h', 'background_color',
+    'display_mode', 'compact_header', 'command_cards',
+})
+# Shared keys changed at runtime outside Settings (overlay speaker menus).
+# Save/Cancel must never write back the snapshot taken when Settings opened.
+RUNTIME_OWNED_SHARED_KEYS = frozenset({'speaker_roles', 'provider_choice_confirmed'})
+
+
+def _changed_settings(before: dict, after: dict) -> tuple[dict, dict]:
+    """Return shared and per-session values the Settings dialog changed."""
+    before_shared = before.get('shared', {}) if isinstance(before, dict) else {}
+    after_shared = after.get('shared', {}) if isinstance(after, dict) else {}
+    missing = object()
+    shared_changes = {
+        key: value
+        for key, value in after_shared.items()
+        if before_shared.get(key, missing) != value
+    }
+    session_changes = {}
+    before_sessions = before.get('sessions', {}) if isinstance(before, dict) else {}
+    after_sessions = after.get('sessions', {}) if isinstance(after, dict) else {}
+    for session_id, after_session in after_sessions.items():
+        if not isinstance(after_session, dict):
+            continue
+        before_session = before_sessions.get(session_id, {})
+        changes = {
+            key: value
+            for key, value in after_session.items()
+            if before_session.get(key, missing) != value
+        }
+        if changes:
+            session_changes[session_id] = changes
+    return shared_changes, session_changes
 
 
 class SessionRuntimeState(str, Enum):
@@ -129,6 +174,7 @@ class TranslatorManager(QObject):
     """
 
     worker_config_changed = Signal(int, dict)
+    session_display_modes_changed = Signal(dict)
     compose_translation_requested = Signal(int, str, str, str)
     provider_usage_requested = Signal()
     chat_discovery_requested = Signal(int, str, int)
@@ -266,6 +312,8 @@ class TranslatorManager(QObject):
         # the queued signal so provider state is only mutated by its owner thread.
         self.worker.update_config(copy.deepcopy(self.config['shared']))
         self.translation_scheduler.update_config(copy.deepcopy(self.config['shared']))
+        self._published_display_modes = self._session_display_modes()
+        self.worker.set_session_display_modes(dict(self._published_display_modes))
         self.worker.moveToThread(self.thread)
         self.translation_scheduler.moveToThread(self.translation_thread)
         self.translation_thread.started.connect(
@@ -275,6 +323,9 @@ class TranslatorManager(QObject):
             self._entity_index_initialized
         )
         self.worker_config_changed.connect(self.worker.apply_queued_config)
+        self.session_display_modes_changed.connect(
+            self.worker.set_session_display_modes
+        )
         self.worker_config_changed.connect(
             self.translation_scheduler.apply_queued_config
         )
@@ -496,6 +547,13 @@ class TranslatorManager(QObject):
             == normalized_log_path(result_log_dir)
         )
         if getattr(result, 'succeeded', False) and same_directory:
+            if (
+                getattr(self, 'log_dir_watcher', None) is not None
+                and not getattr(self, '_log_dir_watch_active', False)
+            ):
+                # The folder came back after being removed/unreadable; without
+                # this the watch stayed off and new logs waited for the timer.
+                self._configure_log_directory_watcher()
             self._discovery_failure_count = 0
             self._discovery_retry_signature = None
             self._clear_discovery_session_errors()
@@ -508,6 +566,9 @@ class TranslatorManager(QObject):
             self._scan_fleets(new_registry=dict(result.fleet_registry))
             if getattr(self, '_sessions_initialized', True):
                 self._recover_waiting_sessions()
+            menu = getattr(self, 'any_source_menu', None)
+            if menu is not None and menu.isVisible():
+                self._populate_any_source_menu()
         elif getattr(result, 'error', None) is not None:
             self._discovery_failure_count = min(
                 getattr(self, '_discovery_failure_count', 0) + 1,
@@ -586,6 +647,17 @@ class TranslatorManager(QObject):
         if error_sessions is None:
             error_sessions = set()
             self._discovery_error_sessions = error_sessions
+        if not error_sessions and not getattr(self, '_discovery_error_notified', False):
+            # Waiting/Error sessions have no overlay; say it once per outage.
+            self._discovery_error_notified = True
+            tray_icon = getattr(self, 'tray_icon', None)
+            if tray_icon is not None:
+                tray_icon.showMessage(
+                    "Chat log discovery failed",
+                    detail,
+                    QSystemTrayIcon.MessageIcon.Warning,
+                    10000,
+                )
         for session_id in SESSION_IDS:
             enabled = (
                 self.config.get('sessions', {})
@@ -607,6 +679,7 @@ class TranslatorManager(QObject):
             getattr(self, '_discovery_error_sessions', set())
         )
         self._discovery_error_sessions = set()
+        self._discovery_error_notified = False
         for session_id in error_sessions:
             enabled = (
                 self.config.get('sessions', {})
@@ -708,7 +781,16 @@ class TranslatorManager(QObject):
             while True:
                 selected_dir = QFileDialog.getExistingDirectory(None, "Select EVE Chatlogs Folder", os.path.expanduser("~/Documents"))
                 if selected_dir:
-                    current_path = selected_dir
+                    current_path = resolve_chatlogs_dir(selected_dir)
+                    if not folder_has_eve_logs(current_path):
+                        QMessageBox.warning(
+                            None,
+                            "No EVE chat logs found",
+                            "This folder has no EVE chat logs yet. If you just "
+                            "installed EVE, enable 'Log Chat to File' in the EVE "
+                            "chat settings; the translator will pick the logs up "
+                            "as soon as EVE writes them.",
+                        )
                     break
                 else:
                     # Cancelled?
@@ -744,6 +826,7 @@ class TranslatorManager(QObject):
                     'unsupported_schema_version',
                     None,
                 )
+                unreadable = getattr(config_store, 'unreadable_config_path', None)
                 if isinstance(newer_schema, int) and not isinstance(
                     newer_schema,
                     bool,
@@ -752,6 +835,13 @@ class TranslatorManager(QObject):
                     detail = (
                         f"This settings file uses newer schema {newer_schema}. "
                         "EVE Translator 1.4 will not overwrite it."
+                    )
+                elif isinstance(unreadable, Path):
+                    title = "Settings are read-only"
+                    detail = (
+                        f"{unreadable.name} could not be read at startup, so it "
+                        "will not be overwritten. Restart after closing other "
+                        "programs that use it."
                     )
                 else:
                     title = "EVE Translator settings were not saved"
@@ -800,6 +890,8 @@ class TranslatorManager(QObject):
             self.tray_icon.setIcon(QIcon(pixmap))
         
         self.tray_menu = QMenu()
+        # Session items carry the full error text as their tooltip.
+        self.tray_menu.setToolTipsVisible(True)
 
         self.session_actions = {}
         for spec in SESSION_SPECS:
@@ -893,8 +985,10 @@ class TranslatorManager(QObject):
                     f"{failed_chord} is already in use by another application."
                 )
                 details.append(f"{feature}: {error}")
+                action.setText(f"{action.text()} (shortcut unavailable)")
                 action.setToolTip(
-                    f"{error} Use this tray action instead."
+                    f"{error} Use this tray action instead, or choose another "
+                    "shortcut in Settings."
                 )
                 logger.warning(
                     "%s global shortcut unavailable "
@@ -922,6 +1016,9 @@ class TranslatorManager(QObject):
         menu = getattr(self, 'any_source_menu', None)
         if menu is None:
             return
+        if not self._any_session_enabled():
+            # Idle scans are paused while every session is off; refresh now.
+            self._periodic_scan(force=True)
         menu.clear()
 
         selected = getattr(self, 'selected_channel_id', None)
@@ -977,6 +1074,26 @@ class TranslatorManager(QObject):
 
     def _show_provider_setup_notice(self):
         config_store = getattr(self, 'config_store', None)
+        recovered = getattr(config_store, 'recovered_corrupt_path', None)
+        unreadable = getattr(config_store, 'unreadable_config_path', None)
+        if isinstance(unreadable, Path):
+            self.tray_icon.showMessage(
+                "Settings file could not be read",
+                f"{unreadable.name} is locked or access was denied. Defaults "
+                "are running and changes will not be saved until restart.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                15000,
+            )
+            return
+        if isinstance(recovered, Path):
+            self.tray_icon.showMessage(
+                "Settings file was damaged",
+                f"It was kept as {recovered.name} and defaults were loaded. "
+                "Fix the JSON or re-enter your settings.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                15000,
+            )
+            return
         newer_schema = getattr(config_store, 'unsupported_schema_version', None)
         if isinstance(newer_schema, int) and not isinstance(newer_schema, bool):
             self.tray_icon.showMessage(
@@ -1019,7 +1136,7 @@ class TranslatorManager(QObject):
     def _compose_provider_label(self, status: dict | None = None) -> str:
         if not isinstance(status, dict):
             status = getattr(self, '_provider_status_snapshot', {})
-        primary = str(status.get('name') or 'configured cloud provider')
+        primary = str(status.get('name') or 'configured cloud')
         fallback = status.get('fallback')
         if isinstance(fallback, dict) and fallback.get('enabled'):
             return f"{primary} provider with consented {fallback.get('name')} fallback"
@@ -1034,29 +1151,88 @@ class TranslatorManager(QObject):
             dialog.set_provider_label(
                 self._compose_provider_label(self._provider_status_snapshot)
             )
+            if hasattr(dialog, 'set_translation_available'):
+                dialog.set_translation_available(
+                    self._provider_status_snapshot.get('mode', 'disabled') != 'disabled',
+                    self._compose_provider_label(self._provider_status_snapshot),
+                )
+        # The scheduler also emits when an outage pauses or resumes the
+        # provider, so refresh the HUD headers and tray, not only Compose.
+        for session_id in list(getattr(self, 'sessions', {})):
+            self._update_overlay_status(session_id)
+        if getattr(self, 'tray_icon', None) is not None:
+            self._update_tray_menu()
 
     @Slot()
     def open_compose_dialog(self) -> None:
         # As with the lock shortcut, defer native hotkey actions while another
         # modal or popup owns input.
-        if QApplication.activeModalWidget() or QApplication.activePopupWidget():
+        if self._raise_blocking_dialog():
             return
         dialog = getattr(self, 'compose_dialog', None)
         if dialog is None:
             dialog = ComposeDialog(
                 source_language='auto',
-                target_language=self.config.get('shared', {}).get(
-                    'target_language', 'en'
-                ),
+                target_language=self._compose_default_target(),
                 provider_label=self._compose_provider_label(),
             )
             dialog.translation_requested.connect(
                 self.compose_translation_requested.emit
             )
+            dialog.translation_requested.connect(self._remember_compose_target)
+            dialog.settings_requested.connect(self.open_settings_dialog)
             self.compose_dialog = dialog
         else:
             dialog.set_provider_label(self._compose_provider_label())
+        dialog.set_translation_available(
+            self.config.get('shared', {}).get('translation_provider', 'disabled')
+            != 'disabled',
+            self._compose_provider_label(),
+        )
         dialog.present()
+
+    def _compose_default_target(self) -> str:
+        """Outbound language: the fleet's language, not the pilot's own.
+
+        Defaulting to the reading language translated English into English.
+        Prefer the dominant foreign language of recent chat, then the last
+        outbound choice, then the pilot's language.
+        """
+        own = str(self.config.get('shared', {}).get('target_language') or 'en')
+        own_base = own.split('-', 1)[0].lower()
+        counts: dict[str, int] = {}
+        for session in getattr(self, 'sessions', {}).values():
+            overlay = getattr(session, 'overlay', None) if session else None
+            for message in list(getattr(overlay, 'chat_history', ()))[-100:]:
+                if not isinstance(message, dict) or not message.get('translation_relevant'):
+                    continue
+                language = str(message.get('detected_language') or '').lower()
+                if not language or language in {'unknown', 'auto'}:
+                    continue
+                if language.split('-', 1)[0] == own_base:
+                    continue
+                counts[language] = counts.get(language, 0) + 1
+        if counts:
+            language, count = max(counts.items(), key=lambda item: item[1])
+            if count >= 3:
+                return language
+        remembered = str(self.config.get('shared', {}).get('compose_target_language') or '')
+        return remembered or own
+
+    @Slot(int, str, str, str)
+    def _remember_compose_target(
+        self,
+        _request_id: int,
+        _text: str,
+        _source: str,
+        target: str,
+    ) -> None:
+        shared = self.config.setdefault('shared', {})
+        if target and shared.get('compose_target_language') != target:
+            shared['compose_target_language'] = target
+            # Keep overlay copies in sync; they write shared keys back.
+            self._apply_config_update()
+            self._save_config()
 
     @Slot(int, str)
     def _finish_compose_translation(self, request_id: int, text: str) -> None:
@@ -1126,7 +1302,7 @@ class TranslatorManager(QObject):
             return False
 
         if not log_path:
-            logger.info(f"[{session_id}] No log file found - waiting for an active chat log")
+            logger.debug("[%s] No log file found - waiting for an active chat log", session_id)
             self.sessions[session_id] = None
             self._broadcast_session_states()
             return False
@@ -1162,7 +1338,7 @@ class TranslatorManager(QObject):
             if session is not None:
                 self._disconnect_session_signals(session)
                 try:
-                    session.stop()
+                    self._dispose_session(session)
                 except Exception:
                     logger.debug("[%s] Error cleaning up failed session", session_id, exc_info=True)
             self.sessions[session_id] = None
@@ -1180,11 +1356,39 @@ class TranslatorManager(QObject):
         self._broadcast_channel_list()
         return True
 
+    def _raise_blocking_dialog(self) -> bool:
+        """Return whether a modal/popup owns input, surfacing Settings if so.
+
+        Hotkeys are ignored while a modal dialog is open; raising Settings
+        shows the pilot why instead of silently doing nothing.
+        """
+        blocker = QApplication.activeModalWidget() or QApplication.activePopupWidget()
+        if blocker is None:
+            return False
+        dialog = getattr(self, 'settings_dialog', None)
+        if dialog is not None and blocker is dialog:
+            dialog.showNormal()
+            dialog.raise_()
+            dialog.activateWindow()
+        return True
+
     def open_settings_dialog(self):
-        """Open the global settings dialog."""
+        """Open the global settings dialog, or raise it if already open."""
+        existing = getattr(self, 'settings_dialog', None)
+        if existing is not None:
+            # The tray menu and notification clicks stay live while the modal
+            # dialog runs; a second dialog would clobber the first on save.
+            existing.showNormal()
+            existing.raise_()
+            existing.activateWindow()
+            return
+        dlg = None
         try:
-            # Backup current config for restore on Cancel
+            # Snapshot for Cancel; only dialog-owned keys are restored from it.
             original_config = copy.deepcopy(self.config)
+            original_confirmed = bool(
+                original_config.get('shared', {}).get('provider_choice_confirmed')
+            )
 
             dlg = SettingsDialog(
                 self.config,
@@ -1192,16 +1396,27 @@ class TranslatorManager(QObject):
                 translation_service=getattr(self, 'translation_service', None),
             )
             self.settings_dialog = dlg
+            # The dialog's own normalized starting values. Comparing against
+            # them on Save applies only what the pilot actually changed.
+            start_settings = dlg.get_settings()
+            dialog_start = copy.deepcopy(
+                start_settings if isinstance(start_settings, dict) else self.config
+            )
             dlg.provider_usage_requested.connect(
                 self.provider_usage_requested.emit
             )
-            
+
             # Connect live preview
             dlg.settings_changed.connect(self.preview_settings)
 
             if dlg.exec():
-                # Saved: Final update (redundant if previewed, but safe)
                 new_config = dlg.get_settings()
+                shared_changes, session_changes = _changed_settings(
+                    dialog_start,
+                    new_config,
+                )
+                for key in RUNTIME_OWNED_SHARED_KEYS:
+                    shared_changes.pop(key, None)
                 pending_doctrine = getattr(dlg, 'pending_doctrine_source', None)
                 if isinstance(pending_doctrine, (str, os.PathLike)) and str(
                     pending_doctrine
@@ -1210,33 +1425,41 @@ class TranslatorManager(QObject):
                         installed = self._install_or_reuse_doctrine_pack(
                             pending_doctrine
                         )
-                        new_config['shared']['active_doctrine_pack'] = str(
+                        shared_changes['active_doctrine_pack'] = str(
                             installed.source_path
                         )
                     except Exception as exc:
                         logger.warning("Doctrine pack was not installed: %s", exc)
-                        new_config['shared']['active_doctrine_pack'] = (
-                            original_config.get('shared', {}).get(
-                                'active_doctrine_pack', ''
-                            )
-                        )
+                        shared_changes.pop('active_doctrine_pack', None)
                         self.tray_icon.showMessage(
                             "Doctrine pack was not installed",
                             str(exc),
                             QSystemTrayIcon.MessageIcon.Warning,
                             10000,
                         )
-                self.config.update(new_config)
-                self.config['shared']['provider_choice_confirmed'] = True
-                
+                shared = self.config.setdefault('shared', {})
+                for key, value in shared_changes.items():
+                    shared[key] = copy.deepcopy(value)
+                sessions = self.config.setdefault('sessions', {})
+                for session_id, changes in session_changes.items():
+                    sessions.setdefault(session_id, {}).update(
+                        copy.deepcopy(changes)
+                    )
+                shared['provider_choice_confirmed'] = True
+
                 logger.info(
                     "[Settings] New Shared Config: %s",
                     sanitize_config_for_log(self.config['shared']),
                 )
-                
-                # Apply changes to worker (Shared)
-                self._queue_worker_config()
-                
+
+                # Visual-only edits were previewed already and do not need the
+                # worker/provider pipeline (which would drop its caches).
+                if (
+                    not original_confirmed
+                    or any(key not in PREVIEW_SHARED_KEYS for key in shared_changes)
+                ):
+                    self._queue_worker_config()
+
                 # Apply changes to running sessions
                 self._apply_config_update()
                 if (
@@ -1244,32 +1467,92 @@ class TranslatorManager(QObject):
                     != self._scanner_config_signature(self.config)
                 ):
                     self._apply_scanner_config()
+                if {'global_hotkey', 'compose_hotkey'} & set(shared_changes):
+                    self._reregister_hotkeys(original_config.get('shared', {}))
 
                 self._save_config()
             else:
-                # Cancelled: Restore original config
-                logger.info("Settings cancelled. Restoring original config.")
-                preview_config = self.config
-                self.config = original_config
-                # Re-apply original config to revert any previews
-                self._queue_worker_config()
+                logger.info("Settings cancelled. Restoring previewed settings.")
+                self._restore_settings_snapshot(original_config)
                 self._apply_config_update()
-                if (
-                    self._scanner_config_signature(preview_config)
-                    != self._scanner_config_signature(self.config)
-                ):
-                    self._apply_scanner_config()
                 # Timers keep running while the modal dialog is open and may
                 # persist preview state. Write the restored config back so a
                 # cancelled cloud-provider choice cannot return after restart.
                 self._save_config()
 
-            self.settings_dialog = None
-
         except Exception as e:
-            self.settings_dialog = None
             logger.error(f"Error opening settings: {e}")
             traceback.print_exc()
+        finally:
+            self.settings_dialog = None
+            if dlg is not None and hasattr(dlg, 'deleteLater'):
+                dlg.deleteLater()
+
+    def _reregister_hotkeys(self, previous_shared: dict) -> None:
+        """Apply changed global shortcuts from Settings without a restart."""
+        shared = self.config.get('shared', {})
+        hotkeys = (
+            ('hotkey', 'global_hotkey', 'Ctrl+Shift+L', self.toggle_overlay_lock,
+             LOCK_HOTKEY_ID, 'lock_overlays_action', 'Lock overlays', 'Overlay lock'),
+            ('compose_hotkey', 'compose_hotkey', 'Ctrl+Shift+T', self.open_compose_dialog,
+             COMPOSE_HOTKEY_ID, 'compose_action', 'Compose translation',
+             'Compose translation'),
+        )
+        failures = []
+        for (attr, key, default, callback, hotkey_id,
+             action_attr, action_label, feature) in hotkeys:
+            chord = shared.get(key) or default
+            if chord == (previous_shared.get(key) or default):
+                continue
+            old = getattr(self, attr, None)
+            if old is not None:
+                old.unregister()
+            hotkey = WindowsGlobalHotkey(
+                self.app,
+                callback,
+                chord=chord,
+                hotkey_id=hotkey_id,
+            )
+            registered = hotkey.register()
+            setattr(self, attr, hotkey)
+            action = getattr(self, action_attr, None)
+            if action is not None:
+                suffix = "" if registered else " (shortcut unavailable)"
+                action.setText(f"{action_label} — {chord}{suffix}")
+                action.setToolTip(
+                    "" if registered else f"{hotkey.error} Use this tray action instead."
+                )
+            if not registered:
+                failures.append(f"{feature}: {hotkey.error}")
+        if failures and getattr(self, 'tray_icon', None) is not None:
+            self.tray_icon.showMessage(
+                "Global shortcut unavailable",
+                "\n".join(failures) + "\nThe tray actions remain available.",
+                QSystemTrayIcon.MessageIcon.Warning,
+                12000,
+            )
+
+    def _restore_settings_snapshot(self, original_config: dict) -> None:
+        """Undo Settings preview without reverting runtime-owned state.
+
+        Discovery and the tray keep changing selected sources, ``enabled``
+        flags and speaker roles while the dialog is open; those survive.
+        """
+        original_shared = original_config.get('shared', {})
+        shared = self.config.setdefault('shared', {})
+        for key in set(original_shared) | set(shared):
+            if key in RUNTIME_OWNED_SHARED_KEYS:
+                continue
+            if key in original_shared:
+                shared[key] = copy.deepcopy(original_shared[key])
+            else:
+                shared.pop(key, None)
+        sessions = self.config.setdefault('sessions', {})
+        for session_id, original_session in original_config.get('sessions', {}).items():
+            session = sessions.setdefault(session_id, {})
+            for key in PREVIEW_SESSION_KEYS:
+                if key in original_session:
+                    session[key] = copy.deepcopy(original_session[key])
 
     @staticmethod
     def _install_or_reuse_doctrine_pack(source):
@@ -1294,14 +1577,8 @@ class TranslatorManager(QObject):
     @Slot(dict)
     def preview_settings(self, new_config):
         """Preview visual settings without activating or persisting cloud choices."""
-        preview_shared_keys = {
-            'opacity', 'font_size', 'auto_scroll',
-            'color_default', 'color_translated', 'color_highlight',
-        }
-        preview_session_keys = {
-            'x', 'y', 'w', 'h', 'background_color',
-            'display_mode', 'compact_header', 'command_cards',
-        }
+        preview_shared_keys = PREVIEW_SHARED_KEYS
+        preview_session_keys = PREVIEW_SESSION_KEYS
 
         incoming_shared = new_config.get('shared', {})
         current_shared = self.config.setdefault('shared', {})
@@ -1319,15 +1596,42 @@ class TranslatorManager(QObject):
 
         self._apply_config_update()
 
+    def _session_display_modes(self) -> dict:
+        return {
+            session_id: str(session_config.get('display_mode') or 'mirror')
+            for session_id, session_config in self.config.get('sessions', {}).items()
+            if isinstance(session_config, dict)
+        }
+
+    def _publish_session_display_modes(self) -> None:
+        """Tell the analysis worker which overlays only show combat calls."""
+        if getattr(self, 'worker', None) is None:
+            return
+        modes = self._session_display_modes()
+        if modes == getattr(self, '_published_display_modes', None):
+            return
+        self._published_display_modes = modes
+        try:
+            self.session_display_modes_changed.emit(dict(modes))
+        except RuntimeError:
+            # Lightweight test managers without QObject initialization.
+            pass
+
     def _apply_config_update(self):
         """Propagate config changes to all active sessions."""
         for session_id, session in self.sessions.items():
             if session:
                 # Re-build session config (merges shared + specific)
                 new_session_config = self._build_session_config(session_id)
-                logger.info(f"[{session_id}] Applying Config Update. Font: {new_session_config.get('font_size')}, Opacity: {new_session_config.get('opacity')}")
+                logger.debug(
+                    "[%s] Applying config update (font %s, opacity %s)",
+                    session_id,
+                    new_session_config.get('font_size'),
+                    new_session_config.get('opacity'),
+                )
                 session.update_config(new_session_config)
                 self._update_overlay_status(session_id)
+        self._publish_session_display_modes()
 
     def _queue_worker_config(self):
         """Send an isolated config snapshot to the worker's owning thread."""
@@ -1366,6 +1670,22 @@ class TranslatorManager(QObject):
             except RuntimeError:
                 pass
 
+    @staticmethod
+    def _dispose_session(session) -> None:
+        """Stop a session and release its Qt objects.
+
+        Sessions are parented to the manager, so dropping the Python reference
+        kept every stopped session and its hidden overlay window alive.
+        """
+        overlay = getattr(session, 'overlay', None)
+        try:
+            session.stop()
+        finally:
+            if overlay is not None and hasattr(overlay, 'deleteLater'):
+                overlay.deleteLater()
+            if hasattr(session, 'deleteLater'):
+                session.deleteLater()
+
     def stop_session(self, session_id):
         session = self.sessions.get(session_id)
         if session:
@@ -1373,7 +1693,7 @@ class TranslatorManager(QObject):
             # clearing the manager's last reference to this session.
             self._capture_session_config(session_id, session)
             self._disconnect_session_signals(session)
-            session.stop()
+            self._dispose_session(session)
 
         self.sessions[session_id] = None
         self.config['sessions'][session_id]['enabled'] = False
@@ -1385,9 +1705,11 @@ class TranslatorManager(QObject):
         # ChatSession object, but clicking it must still disable the session.
         if self.config['sessions'][session_id].get('enabled', False):
             self.stop_session(session_id)
-        else:
-            self.start_session(session_id)
-        
+        elif not self.start_session(session_id):
+            # Waiting for a log: fetch fresh discovery results right away
+            # (idle scans are paused while every session was off).
+            self._periodic_scan()
+
         # Save config immediately so it persists
         self._save_config()
 
@@ -1410,7 +1732,7 @@ class TranslatorManager(QObject):
     def toggle_overlay_lock(self) -> None:
         # Native callbacks are deferred by the hotkey service. Avoid changing
         # top-level flags under an open modal dialog or popup.
-        if QApplication.activeModalWidget() or QApplication.activePopupWidget():
+        if self._raise_blocking_dialog():
             return
         self.set_overlay_locked(not self.overlay_locked)
 
@@ -1445,6 +1767,8 @@ class TranslatorManager(QObject):
         for key in session_keys:
             if key in updated_config:
                 self.config['sessions'][session_id][key] = updated_config[key]
+        if 'display_mode' in updated_config:
+            self._publish_session_display_modes()
 
         if shared_changed:
             # Provider and translation state belongs to worker threads; do not
@@ -1457,19 +1781,33 @@ class TranslatorManager(QObject):
         # Save to disk
         self._save_config()
 
+    def _active_doctrine_scope(self) -> str:
+        """Scope of the active doctrine pack, parsed once per file version."""
+        doctrine_path = self.config['shared'].get('active_doctrine_pack', '')
+        if not doctrine_path:
+            return ''
+        try:
+            stat = os.stat(doctrine_path)
+            key = (doctrine_path, stat.st_size, stat.st_mtime_ns)
+        except OSError:
+            return ''
+        cached = getattr(self, '_doctrine_scope_cache', None)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            from src.core.doctrine import load_doctrine_pack
+            scope = load_doctrine_pack(doctrine_path).scope
+        except Exception:
+            scope = ''
+        self._doctrine_scope_cache = (key, scope)
+        return scope
+
     @Slot(str, dict)
     def _handle_correction_submitted(self, session_id: str, payload: dict) -> None:
         if not isinstance(payload, dict):
             return
         try:
-            doctrine_scope = ''
-            doctrine_path = self.config['shared'].get('active_doctrine_pack', '')
-            if doctrine_path:
-                try:
-                    from src.core.doctrine import load_doctrine_pack
-                    doctrine_scope = load_doctrine_pack(doctrine_path).scope
-                except Exception:
-                    doctrine_scope = ''
+            doctrine_scope = self._active_doctrine_scope()
             self.translation_memory.remember(
                 payload.get('source_text', ''),
                 payload.get('translated_text', ''),
@@ -1648,6 +1986,20 @@ class TranslatorManager(QObject):
             interaction_locked=bool(getattr(self, 'overlay_locked', False)),
         ))
 
+    @staticmethod
+    def _percent_label(usage) -> str:
+        used = usage.get('used') if isinstance(usage, dict) else None
+        limit = usage.get('limit') if isinstance(usage, dict) else None
+        if (
+            isinstance(used, int)
+            and not isinstance(used, bool)
+            and isinstance(limit, int)
+            and not isinstance(limit, bool)
+            and limit > 0
+        ):
+            return f"{used / limit:.0%}"
+        return ""
+
     def _update_tray_menu(self):
         state_labels = {
             SessionRuntimeState.DISABLED: 'Off',
@@ -1660,68 +2012,36 @@ class TranslatorManager(QObject):
             .get('translation_provider', 'disabled')
         )
         provider_labels = {
-            'disabled': 'Translation: Off',
-            'google': 'Translation: Google',
-            'deepl': 'Translation: DeepL',
+            'disabled': 'Translation off',
+            'google': 'Google',
+            'deepl': 'DeepL',
         }
         deepl_api_key = self.config.get('shared', {}).get('deepl_api_key', '')
         if (
             provider_mode == 'deepl'
             and not (isinstance(deepl_api_key, str) and deepl_api_key.strip())
         ):
-            provider_labels['deepl'] = 'Translation: DeepL (key required)'
-        tooltip_parts = [
-            provider_labels.get(provider_mode, 'Translation: configuration error')
-        ]
+            provider_labels['deepl'] = 'DeepL (key required)'
+        provider_text = provider_labels.get(provider_mode, 'Translation: configuration error')
         service = getattr(self, 'translation_service', None)
         get_usage = getattr(service, 'get_provider_usage', None)
         if callable(get_usage):
             usage = get_usage(refresh=False)
             if provider_mode == 'deepl':
-                used = usage.get('used') if isinstance(usage, dict) else None
-                limit = usage.get('limit') if isinstance(usage, dict) else None
-                if (
-                    isinstance(used, int)
-                    and not isinstance(used, bool)
-                    and isinstance(limit, int)
-                    and not isinstance(limit, bool)
-                    and limit > 0
-                ):
-                    tooltip_parts.append(
-                        f"DeepL quota: {used:,}/{limit:,} ({used / limit:.0%})"
-                    )
+                percent = self._percent_label(usage)
+                if percent:
+                    provider_text += f" {percent}"
             elif provider_mode == 'google':
-                estimated = (
-                    usage.get('estimated_characters')
-                    if isinstance(usage, dict)
-                    else None
-                )
-                if isinstance(estimated, int) and not isinstance(estimated, bool):
-                    tooltip_parts.append(
-                        f"Google local estimate: {estimated:,} characters"
-                    )
                 fallback = usage.get('fallback') if isinstance(usage, dict) else None
-                if (
-                    isinstance(fallback, dict)
-                    and fallback.get('provider') == 'deepl'
-                ):
-                    used = fallback.get('used')
-                    limit = fallback.get('limit')
-                    if (
-                        isinstance(used, int)
-                        and not isinstance(used, bool)
-                        and isinstance(limit, int)
-                        and not isinstance(limit, bool)
-                        and limit > 0
-                    ):
-                        tooltip_parts.append(
-                            f"DeepL fallback quota: {used:,}/{limit:,} "
-                            f"({used / limit:.0%})"
-                        )
-        tooltip_parts.append(
-            f"Overlays: {'Locked' if getattr(self, 'overlay_locked', False) else 'Interactive'}"
-        )
+                if isinstance(fallback, dict) and fallback.get('provider') == 'deepl':
+                    percent = self._percent_label(fallback)
+                    if percent:
+                        provider_text += f" (DeepL fallback {percent})"
+        if getattr(self, 'overlay_locked', False):
+            provider_text += " · locked"
 
+        session_parts = []
+        errors = []
         for spec in SESSION_SPECS:
             session_id = spec.session_id
             label = spec.label
@@ -1733,10 +2053,9 @@ class TranslatorManager(QObject):
             )
             state_label = state_labels[state]
             error = getattr(self, '_session_runtime_errors', {}).get(session_id)
-            tooltip_line = f"{label}: {state_label}"
-            if error:
-                tooltip_line = f"{tooltip_line} - {error}"
-            tooltip_parts.append(tooltip_line)
+            session_parts.append(f"{spec.status_label}: {state_label}")
+            if error and error not in errors:
+                errors.append(error)
 
             action = getattr(self, 'session_actions', {}).get(session_id)
             if action is None:
@@ -1746,9 +2065,21 @@ class TranslatorManager(QObject):
                 action.setText(f"{label} - {state_label}")
                 action.setToolTip(error or f"{label}: {state_label}")
 
+        # Windows shows at most 127 characters of a tray tooltip; keep the
+        # session states and the cause of a problem inside that budget. The
+        # full error text is on the menu items (tooltips are enabled there).
+        lines = [f"EVE Translator · {provider_text}", ", ".join(session_parts)]
+        if errors:
+            cause = errors[0]
+            reason = re.search(r"\(([^()]*)\)", cause)
+            lines.append("⚠ " + (reason.group(1) if reason else cause))
+        tooltip = "\n".join(lines)
+        if len(tooltip) > TRAY_TOOLTIP_LIMIT:
+            tooltip = tooltip[: TRAY_TOOLTIP_LIMIT - 1].rstrip() + "…"
+
         tray_icon = getattr(self, 'tray_icon', None)
         if tray_icon is not None:
-            tray_icon.setToolTip("EVE Translator\n" + "\n".join(tooltip_parts))
+            tray_icon.setToolTip(tooltip)
         lock_action = getattr(self, 'lock_overlays_action', None)
         if lock_action is not None:
             lock_action.setChecked(bool(getattr(self, 'overlay_locked', False)))
@@ -1806,22 +2137,11 @@ class TranslatorManager(QObject):
                 self.config['sessions']['fleet']['fleet_id'] = most_recent.fleet_id
                 return most_recent.log_path
 
-        # Fallback for startup before the detector registry is populated. Never
-        # claim an old, inactive fleet log is Active.
-        pattern = os.path.join(log_dir, "Fleet_*.txt")
-        files = glob.glob(pattern)
-        threshold = self.config['shared'].get('fleet_inactive_threshold', 1800)
-        now = time.time()
-        active_files = []
-        for filepath in files:
-            try:
-                if now - os.path.getmtime(filepath) < threshold:
-                    active_files.append(filepath)
-            except OSError:
-                continue
-        if not active_files:
-            return None
-        return max(active_files, key=os.path.getmtime)
+        # Wait for discovery instead of globbing the folder here. The registry
+        # is authoritative (activity threshold, future-date guard, selected
+        # fleet), and this lookup runs on the GUI thread on every discovery
+        # pass while Fleet is enabled without an active fleet.
+        return None
 
     def _find_latest_local_log(self):
         """
@@ -1837,13 +2157,13 @@ class TranslatorManager(QObject):
         # Local logs remain selectable metadata, but must not make readiness Active.
         selected_character = None
         if self.selected_character_id:
-            logger.info(f"[LOCAL] Searching log for selected CharID: {self.selected_character_id}")
+            logger.debug("[LOCAL] Searching log for selected CharID: %s", self.selected_character_id)
             selected_character = self.character_registry.get(
                 self.selected_character_id
             )
             if selected_character is not None:
                 if not selected_character.is_active:
-                    logger.info(
+                    logger.debug(
                         "[LOCAL] Selected character %s is inactive; checking for another active character",
                         selected_character.character_name,
                     )
@@ -1977,9 +2297,19 @@ class TranslatorManager(QObject):
 
         self._broadcast_channel_list()
 
-    def _periodic_scan(self):
+    def _any_session_enabled(self) -> bool:
+        return any(
+            isinstance(session_config, dict) and session_config.get('enabled', False)
+            for session_config in self.config.get('sessions', {}).values()
+        )
+
+    def _periodic_scan(self, *, force: bool = False):
         """Request event-driven discovery, with a synchronous test fallback."""
         if getattr(self, '_shutting_down', False):
+            return
+        if not force and not self._any_session_enabled():
+            # Nothing to follow. Scans resume when a session is enabled or the
+            # Any Chat source menu is opened.
             return
         if self._request_chat_discovery():
             return
@@ -2038,6 +2368,15 @@ class TranslatorManager(QObject):
                     logger.info(f"[FLEET] Detected change in fleet log: {fleet_info.listener_name}")
                     # Fleet log updated, session will automatically pick up new lines
 
+                # The live session must tail the selected fleet's log. It can
+                # differ after a source change or a restart with a saved fleet.
+                fleet_session = self.sessions.get('fleet')
+                if fleet_session and (
+                    normalized_log_path(getattr(fleet_session, 'log_path', ''))
+                    != normalized_log_path(fleet_info.log_path)
+                ):
+                    fleet_to_switch = self.selected_fleet_id
+
                 # BACK-TO-BACK FLEET CHECK:
                 # If the same character starts a NEW fleet, switch to it even if the old log is technically still "active" (within 30m).
                 if auto_switch_enabled:
@@ -2052,7 +2391,7 @@ class TranslatorManager(QObject):
 
             else:
                 # Selected fleet is no longer active
-                logger.warning(f"[FLEET] Selected fleet log is no longer active")
+                logger.debug("[FLEET] Selected fleet log is no longer active")
 
                 if auto_switch_enabled and new_registry:
                     # Auto-switch to most recent active fleet
@@ -2064,7 +2403,7 @@ class TranslatorManager(QObject):
                         fleet_to_switch = most_recent.fleet_id
                 else:
                     # Auto-switch disabled or no fleets available
-                    logger.info(
+                    logger.debug(
                         "[FLEET] Current fleet inactive; waiting for a replacement log"
                     )
                     if self.sessions.get('fleet'):
@@ -2305,7 +2644,7 @@ class TranslatorManager(QObject):
             if session:
                 self._capture_session_config('any', session)
                 self._disconnect_session_signals(session)
-                session.stop()
+                self._dispose_session(session)
                 self.sessions['any'] = None
             self._set_session_runtime_state('any', SessionRuntimeState.WAITING)
 
@@ -2405,7 +2744,7 @@ class TranslatorManager(QObject):
                 self._disconnect_session_signals(session)
 
                 # Stop the session (cleanup resources)
-                session.stop()
+                self._dispose_session(session)
 
                 # DON'T call stop_session() - it sets enabled=False
                 # We want to preserve user's preference for next startup
@@ -2419,23 +2758,16 @@ class TranslatorManager(QObject):
             discovery_thread.requestInterruption()
             discovery_thread.quit()
             if not discovery_thread.wait(DISCOVERY_SHUTDOWN_TIMEOUT_MS):
-                logger.error(
-                    "Chat discovery did not stop within %d ms; forcing shutdown",
-                    DISCOVERY_SHUTDOWN_TIMEOUT_MS,
-                )
-                # A blocked directory/native-window call cannot observe the
-                # cooperative stop flag. Termination remains a last resort so
-                # a wedged discovery pass cannot hold the whole app open.
-                discovery_thread.terminate()
-                discovery_thread.wait(1_000)
+                # Discovery loops poll the stop flag, so this means a blocked
+                # filesystem call. QThread.terminate() on a thread running
+                # Python crashes the process at exit; leave it to exit instead.
+                self._abandon_thread("Chat discovery", DISCOVERY_SHUTDOWN_TIMEOUT_MS)
         self.thread.requestInterruption()
         self.thread.quit()
         if not self.thread.wait(WORKER_SHUTDOWN_TIMEOUT_MS):
-            logger.error("Translation worker did not stop before the shutdown deadline")
             # Provider work is bounded, so reaching this branch means an
             # unexpected third-party or parser deadlock during process exit.
-            self.thread.terminate()
-            self.thread.wait(1_000)
+            self._abandon_thread("Translation worker", WORKER_SHUTDOWN_TIMEOUT_MS)
         scheduler = getattr(self, 'translation_scheduler', None)
         translation_thread = getattr(self, 'translation_thread', None)
         if translation_thread is not None:
@@ -2453,14 +2785,29 @@ class TranslatorManager(QObject):
             translation_thread.requestInterruption()
             translation_thread.quit()
             if not translation_thread.wait(WORKER_SHUTDOWN_TIMEOUT_MS):
-                logger.error("Translation scheduler did not stop before the shutdown deadline")
-                translation_thread.terminate()
-                translation_thread.wait(1_000)
+                self._abandon_thread(
+                    "Translation scheduler",
+                    WORKER_SHUTDOWN_TIMEOUT_MS,
+                )
         memory = getattr(self, 'translation_memory', None)
         close_memory = getattr(memory, 'close', None)
         if callable(close_memory):
             close_memory()
         self.app.quit()
+
+    def _abandon_thread(self, name: str, timeout_ms: int) -> None:
+        """Record a worker that missed its stop deadline.
+
+        Settings were already saved. ``run_application`` then ends the process
+        with ``os._exit`` so neither Qt (destroying a running QThread aborts)
+        nor a forced terminate can crash the exit.
+        """
+        logger.error(
+            "%s did not stop within %d ms; exiting without waiting for it",
+            name,
+            timeout_ms,
+        )
+        self._threads_still_running = True
 
     def run(self):
         sys.exit(self.app.exec())
@@ -2488,11 +2835,13 @@ def run_application(
         )
 
     manager = None
+    exit_code = 0
     try:
         manager = manager_factory()
         if getattr(manager, 'startup_cancelled', False) is True:
             return 0
-        return int(manager.app.exec())
+        exit_code = int(manager.app.exec())
+        return exit_code
     finally:
         if manager is not None and not getattr(
             manager,
@@ -2501,6 +2850,15 @@ def run_application(
         ):
             manager.shutdown()
         instance_guard.release()
+        if (
+            manager is not None
+            and getattr(manager, '_threads_still_running', False) is True
+        ):
+            # A worker missed its stop deadline. Interpreter teardown would
+            # destroy its running QThread (a fatal Qt error), so end the
+            # process directly after flushing logs; the OS reaps the thread.
+            logging.shutdown()
+            os._exit(exit_code)
 
 if __name__ == "__main__":
     raise SystemExit(run_application())

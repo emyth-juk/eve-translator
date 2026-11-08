@@ -53,6 +53,79 @@ EVE_ITEM_SUFFIX_PATTERN = re.compile(
     r'(?:\s+x?\s*\d+\w*)?$',
     re.IGNORECASE,
 )
+ASCII_WORD_PATTERN = re.compile(r"[A-Za-z]+(?:'[A-Za-z]+)?")
+TITLE_WORD_PATTERN = re.compile(r"[A-Z][a-z0-9'\-]*|[A-Z]{1,4}")
+# Share of recognised English/EVE words above which ASCII chat is treated as
+# English without statistical detection. langdetect reports near-certain
+# results such as "GATE RED" -> German or "need dps" -> Afrikaans.
+ENGLISH_WORD_SHARE_THRESHOLD = 0.5
+# Common English chat words plus EVE fleet vocabulary. This is evidence for
+# English, not an exhaustive dictionary: lines with too few recognised words
+# still go to statistical detection, so "vamos al gate" remains Spanish. Words
+# that are just as common in German, Dutch or Romance languages (a, am, an,
+# in, me, no, on, so, was, will, ...) are deliberately left out.
+COMMON_ENGLISH_CHAT_WORDS = frozenset("""
+about above after again against ago all almost alone along already always and another any
+anyone anything anyway are around as ask at away back bad be because been before behind being
+best better between big bit both bring but by call came can cannot cant careful check close
+coming could couldnt day did didnt does doesnt doing done dont down each early easy either
+else end enough even ever every everyone everything far few find fine first for forget found
+free from front full fun get gets getting give go goes going gone good got great guess guy guys
+had half hang happen happy hard has hasnt have havent having hear heard hello help her here hes
+hey hi him his hit hold home hope how hows id ill im into is isnt it its ive just keep kill
+killed know last late later least leave left less let lets like little long look looking lost
+lot lots love luck made make many may maybe mean might mine more most move much must my need
+needs never new next nice night none nope not nothing now of off oh ok okay old once one only
+onto open or other our out over own past people pick place play please point pretty probably
+put quick quickly quite rather ready really right round run said same saw say see seen send set
+she should show side since slow small some someone something soon sorry still stop stuff such
+sure take taking talk tell than thank thanks that thats the their them then there theres these
+they theyre thing things think this those though thought through time to today together tonight
+too took top try trying turn two under until up us use used very wait want wanted wasnt watch
+way we well went were what whats when where which while who why wish with without wont work
+would wouldnt wrong yeah yep yes yet you youll your youre yours
+afaik btw gl gz grats hf idk imo kk lmao lol np nvm ofc omg omw pls plz rofl tbh thx ty wtf ya
+yup
+""".split())
+EVE_FLEET_WORDS = frozenset("""
+afk align aligned aligning alliance alpha ammo anchor anchored anomaly armor armour assault
+battleship bc beacon belt blob blue blues boosh boost booster bounce bounced bridge bubble
+bubbles burn cap capital caps capsule carrier cargo celestial cepter ceptor cloak cloaked
+cloaky cloaking comms contract corp cyno damage dead dictor dock docked docking dps drag dread
+dreadnought drone drones dscan engage enemy escalation explo fax fight fighter fighters fit
+fitting fleet flycatcher frig frigate gang gate gatecamp gates grid hac heavy heavies hic hole
+holes hostile hostiles hull hunter incoming inty intel jam jammed jump jumped jumping kick kite
+local lock locked logi loot lowsec missile missiles mwd neut neutral neuts nullsec orbit ore
+overheat pod podded pos pilot pilots ping pings pointed primary prop pvp ratting red reds
+regroup rep repair reps roam roll rolled route safe scout scram scrammed secondary sec ship
+ships shield site sites skill spike spy squad station stealth structure sub subcap super supers
+tackle tackled tank target targets tidi titan titans tower travel undock undocked warp warping
+web webbed webs wing wormhole wreck
+go gogo green greens kekw mic pap paps srp sus trap voice
+abyssal afterburner amarr angel artillery autocannon autocannons blaster blasters blood
+caldari capacitor charge charges control cruise disruptor ecm energy extender extenders faction
+federation federal gallente guristas implant implants issue jammer large laser lasers launcher
+light medium minmatar module modules navy neutralizer nosferatu painter plate plates railgun
+railguns rapid republic rocket rockets sansha scrambler sensor sensors serpentis stasis
+torpedo torpedoes tracking turret webifier
+""".split())
+ENGLISH_CHAT_WORDS = COMMON_ENGLISH_CHAT_WORDS | EVE_FLEET_WORDS
+REPEATED_LETTER_PATTERN = re.compile(r"(.)\1{2,}")
+REPEATED_SYLLABLE_PATTERN = re.compile(r"(.{1,3}?)\1+")
+
+
+def _is_known_english_chat_word(word: str) -> bool:
+    """Match chat spellings such as ``GREEEN`` or ``GOGOGO`` to the vocabulary."""
+    normalized = word.casefold().replace("'", "")
+    candidates = {
+        normalized,
+        REPEATED_LETTER_PATTERN.sub(r"\1\1", normalized),
+        REPEATED_LETTER_PATTERN.sub(r"\1", normalized),
+    }
+    syllable = REPEATED_SYLLABLE_PATTERN.fullmatch(normalized)
+    if syllable:
+        candidates.add(syllable.group(1))
+    return any(candidate in ENGLISH_CHAT_WORDS for candidate in candidates)
 class LanguageDetector:
     """
     Detects the language of a message.
@@ -171,6 +244,41 @@ class LanguageDetector:
             return False
         alnum_count = sum(char.isalnum() for char in text)
         return alnum_count <= SHORT_ASCII_ALNUM_LIMIT
+
+    @staticmethod
+    def _ascii_word_tokens(text: str) -> list[str]:
+        """Return alphabetic word tokens, ignoring codes such as ``4-HWWF``."""
+        tokens = []
+        for raw_token in text.split():
+            # System names, counts, and coordinates contain digits. They carry
+            # no language evidence and confuse statistical detection.
+            if any(character.isdigit() for character in raw_token):
+                continue
+            tokens.extend(ASCII_WORD_PATTERN.findall(raw_token))
+        return tokens
+
+    @classmethod
+    def _ascii_english_evidence(cls, text: str) -> str | None:
+        """Classify plain-ASCII chat before langdetect can mislabel it.
+
+        Returns ``'en'`` for recognisable English/EVE chat and title-cased
+        names, ``'short_text'`` when only codes remain, or ``None`` when
+        statistical detection should decide.
+        """
+        if not text.isascii():
+            return None
+        words = cls._ascii_word_tokens(text)
+        if not words:
+            return 'short_text'
+        known = sum(1 for word in words if _is_known_english_chat_word(word))
+        if known / len(words) >= ENGLISH_WORD_SHARE_THRESHOLD:
+            return 'en'
+        # A lone title-cased word is almost always a name: a system
+        # ("Otsasai"), pilot or corp. Title-cased multi-word lines can be
+        # foreign prose ("Hola Mundo") and stay with statistical detection.
+        if len(words) == 1 and TITLE_WORD_PATTERN.fullmatch(words[0]):
+            return 'en'
+        return None
 
     @staticmethod
     def _looks_like_eve_only_phrase(text: str) -> bool:
@@ -343,6 +451,10 @@ class LanguageDetector:
         if self._is_short_ascii_message(stripped):
             return 'en'
 
+        if self._ascii_english_evidence(stripped) is not None:
+            # Codes-only lines also default to English, matching short ASCII.
+            return 'en'
+
         detected = 'unknown'
         try:
             detected = self.normalize_language_code(detect(stripped))
@@ -453,6 +565,9 @@ class LanguageDetector:
         if self._is_short_ascii_message(s_text) or not any(
             char.isalpha() for char in s_text
         ):
+            return False, 'short_text'
+        if self._ascii_english_evidence(s_text) == 'short_text':
+            # Only system names, counts, or other codes ("4-HWWF", "15W-GC*").
             return False, 'short_text'
 
         # 4. General statistical detection for messages without strong script evidence.

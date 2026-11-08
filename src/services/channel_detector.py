@@ -15,6 +15,7 @@ from src.services.log_discovery import (
     EVELogHeader,
     EVE_LOG_FUTURE_MTIME_SKEW_SECONDS,
     UTF16HeaderCache,
+    check_discovery_stop,
     log_recency_key,
     parse_eve_log_filename,
     parse_eve_timestamp,
@@ -69,6 +70,8 @@ class AnyChatDetector:
 
     def __init__(self):
         self._header_cache = UTF16HeaderCache()
+        # Optional shutdown probe installed by the discovery worker.
+        self.should_stop = None
 
     @staticmethod
     def parse_filename(filename: str) -> tuple[str, str, float] | None:
@@ -210,8 +213,13 @@ class AnyChatDetector:
         )
         selected: dict[str, _SelectedCandidate] = {}
         uncached: list[_LogCandidate] = []
-        snapshot = entries if entries is not None else scan_eve_log_entries(log_dir)
-        for entry in snapshot:
+        snapshot = (
+            entries
+            if entries is not None
+            else scan_eve_log_entries(log_dir, self.should_stop)
+        )
+        for index, entry in enumerate(snapshot):
+            check_discovery_stop(self.should_stop, index)
             parsed = entry.filename
             if parsed is None or parsed.character_id is None:
                 continue
@@ -250,7 +258,8 @@ class AnyChatDetector:
 
         # Cold/new files still require their authoritative header. Never infer
         # identity from the display name embedded in the filename.
-        for log in uncached:
+        for index, log in enumerate(uncached):
+            check_discovery_stop(self.should_stop, index)
             self._select_candidate(
                 selected,
                 log,

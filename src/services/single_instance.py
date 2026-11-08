@@ -7,6 +7,7 @@ import os
 from ctypes import wintypes
 from typing import Callable
 
+ERROR_ACCESS_DENIED = 5
 ERROR_ALREADY_EXISTS = 183
 INSTANCE_MUTEX_NAME = r"Local\EVEFleetChatTranslator.SingleInstance"
 
@@ -62,6 +63,12 @@ class SingleInstanceGuard:
             handle = create_mutex(None, False, self.name)
             error_code = int(self._last_error_getter() or 0)
             if not handle:
+                if error_code == ERROR_ACCESS_DENIED:
+                    # The mutex exists but was created by an elevated copy
+                    # (administrator) whose security does not grant us access.
+                    self.already_running = True
+                    self.error = "EVE Translator is already running."
+                    return False
                 self.error = (
                     "Windows could not create the single-instance guard"
                     f" (error {error_code})."

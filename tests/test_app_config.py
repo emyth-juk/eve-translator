@@ -286,7 +286,7 @@ class TestConfigStore(unittest.TestCase):
         self.assertEqual(config['shared']['font_size'], 36)
         self.assertFalse(config['shared']['auto_scroll'])
         self.assertEqual(config['shared']['target_language'], 'en')
-        self.assertEqual(config['shared']['polling_interval'], 1.0)
+        self.assertEqual(config['shared']['polling_interval'], 0.5)
         self.assertEqual(config['shared']['fleet_scan_interval'], 5)
         self.assertEqual(config['sessions']['fleet']['w'], 300)
         self.assertEqual(config['sessions']['fleet']['h'], 120)

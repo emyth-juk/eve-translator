@@ -6,6 +6,11 @@ from PySide6.QtCore import QObject, QCoreApplication, QFileSystemWatcher, Qt, QT
 
 logger = logging.getLogger(__name__)
 LOG_WATCH_DEBOUNCE_MS = 100
+GEOMETRY_KEYS = ('x', 'y', 'w', 'h')
+
+
+def _geometry_of(config: dict) -> tuple:
+    return tuple(config.get(key) for key in GEOMETRY_KEYS)
 
 class ChatSession(QObject):
     """
@@ -46,6 +51,10 @@ class ChatSession(QObject):
         self.source_id = uuid.uuid4().hex
         self.log_path = Path(log_path)
         self.config = overlay_config
+        # The overlay owns its live geometry. The manager's copy can lag
+        # behind a resize, so only apply pushed geometry that actually changed
+        # on the manager side (for example "Reset position").
+        self._last_pushed_geometry = _geometry_of(overlay_config)
 
         # Components
         # Import inside to avoid potential top-level circular issues if any
@@ -209,7 +218,7 @@ class ChatSession(QObject):
         logger.info(f"[{self.session_id}] Chat log switch complete")
 
     def _configured_poll_interval_ms(self):
-        interval = self.config.get('polling_interval', 1.0)
+        interval = self.config.get('polling_interval', 0.5)
         return max(100, int(interval * 1000))
 
     def _poll_interval_ms(self):
@@ -281,7 +290,7 @@ class ChatSession(QObject):
                 )
             except OSError:
                 file_age_ms = -1.0
-            logger.info(
+            logger.debug(
                 "[%s] Read %s new chat line(s) via %s (file age %.0f ms)",
                 self.session_id,
                 len(new_lines),
@@ -312,8 +321,15 @@ class ChatSession(QObject):
     def update_config(self, new_config: dict):
         """Update session configuration from Manager."""
         old_interval = self.config.get('polling_interval', 1.0)
+        new_config = dict(new_config)
+        pushed_geometry = _geometry_of(new_config)
+        if pushed_geometry == self._last_pushed_geometry:
+            for key in GEOMETRY_KEYS:
+                new_config.pop(key, None)
+        else:
+            self._last_pushed_geometry = pushed_geometry
         self.config.update(new_config)
-        
+
         if self.overlay:
             # Overlay config is just the session config
             self.overlay.config.update(new_config)
@@ -327,6 +343,9 @@ class ChatSession(QObject):
 
     def _handle_config_update(self, new_config):
         self.config.update(new_config)
+        # The manager now holds this live geometry; a later push of the same
+        # values is not a deliberate change.
+        self._last_pushed_geometry = _geometry_of(self.config)
         self.config_changed.emit(self.session_id, self.config)
 
     def _handle_session_toggle(self, target_session_id):

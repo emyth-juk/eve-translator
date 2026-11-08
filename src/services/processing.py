@@ -3,17 +3,42 @@ import itertools
 import logging
 import re
 import threading
+import time
 from collections import defaultdict, deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from PySide6.QtCore import QObject, QThread, QTimer, Signal, Slot, Qt
 
-from src.app_config import TRANSLATION_PROVIDER_DISABLED, resolve_translation_provider
+from src.app_config import (
+    DISPLAY_MODE_COMBAT,
+    TRANSLATION_PROVIDER_DISABLED,
+    resolve_translation_provider,
+)
 from src.core.combat import classify_commands, speaker_role
 from src.core.languages import normalize_locale
 from src.core.message import ProcessedMessage, TranslationState
 
 logger = logging.getLogger(__name__)
+
+# A chat translation that arrives this long after the line is no longer useful
+# in a fight. Older queued jobs are resolved without calling the provider, so
+# a slow or failing provider cannot build a backlog that lasts minutes.
+MAX_TRANSLATION_JOB_AGE_SECONDS = 30.0
+STALE_TRANSLATION_ERROR = "Not translated: line is over 30 s old"
+# Config keys whose change invalidates the rolling per-channel context.
+CONTEXT_CONFIG_KEYS = frozenset({
+    'target_language', 'translation_provider', 'provider_fallback_enabled',
+    'deepl_api_key', 'context_assist', 'context_messages',
+    'active_doctrine_pack',
+})
+
+
+def provider_failure_text(provider_label: str, translator_service) -> str:
+    """Build the per-line failure text, with the provider's reason if known."""
+    reason = getattr(translator_service, 'last_failure_reason', '')
+    if isinstance(reason, str) and reason.strip():
+        return f"{provider_label}: {reason.strip()}"
+    return f"{provider_label} translation unavailable"
 
 
 class ConfigUpdatePending(RuntimeError):
@@ -91,6 +116,8 @@ class TranslationJob:
     speaker_role: str = ""
     config_generation: int = 0
     revision: int = 1
+    # Monotonic time the line was analysed; preserved by dataclasses.replace.
+    queued_at: float = field(default_factory=time.monotonic)
 
 
 def restore_with_highlight(text, tokens):
@@ -128,6 +155,17 @@ class LogProcessingWorker(QObject):
         self._config_gate = ConfigGenerationGate()
         self._deferred_batches = deque()
         self.doctrine_pack = None
+        # session_id -> overlay display mode, published by the GUI thread.
+        self._session_display_modes: dict[str, str] = {}
+
+    @Slot(dict)
+    def set_session_display_modes(self, modes) -> None:
+        """Learn which overlays only show combat calls (no provider gate)."""
+        self._session_display_modes = (
+            {str(key): str(value) for key, value in modes.items()}
+            if isinstance(modes, dict)
+            else {}
+        )
 
     def request_config_update(self) -> int:
         """Atomically stop authorizing new provider calls.
@@ -254,6 +292,31 @@ class LogProcessingWorker(QObject):
                     state=TranslationState.ORIGINAL,
                     detected_language=detected_lang,
                     translation_relevant=False,
+                    speaker_role=role,
+                    commands=commands,
+                    lookup_text=tokenized.cleaned,
+                )
+            )
+            return
+
+        if (
+            self._session_display_modes.get(session_id) == DISPLAY_MODE_COMBAT
+            and not commands
+            and not role
+        ):
+            # Combat mode hides this line (no command, no FC/scout/starred
+            # speaker); translating it would only spend provider quota.
+            self.signals.message_ready.emit(
+                ProcessedMessage(
+                    message_id=message_id,
+                    session_id=session_id,
+                    text=final_original,
+                    sender=msg.sender,
+                    timestamp=timestamp_str,
+                    source_id=source_id,
+                    state=TranslationState.ORIGINAL,
+                    detected_language=detected_lang,
+                    translation_relevant=True,
                     speaker_role=role,
                     commands=commands,
                     lookup_text=tokenized.cleaned,
@@ -415,7 +478,10 @@ class LogProcessingWorker(QObject):
             if provider_label.casefold() in {"disabled", "none"}:
                 error = "Translation is disabled"
             else:
-                error = f"{provider_label} translation unavailable"
+                error = provider_failure_text(
+                    provider_label,
+                    self.translator_service,
+                )
 
         self.signals.message_ready.emit(
             ProcessedMessage(
@@ -482,6 +548,7 @@ class TranslationScheduler(QObject):
         self._usage_refresh_lock = threading.Lock()
         self._usage_refresh_in_flight = False
         self._stopping = False
+        self._last_status_signature = None
         set_fallback_authorizer = getattr(
             translator_service,
             'set_fallback_authorizer',
@@ -641,10 +708,17 @@ class TranslationScheduler(QObject):
             self.compose_translation_ready.emit(request_id, translated)
             return
         provider_label = str(provider or "Translation provider").strip()
+        reason = getattr(self.translator_service, 'last_failure_reason', '')
+        detail = (
+            f" ({reason.strip()})"
+            if isinstance(reason, str) and reason.strip()
+            else ""
+        )
         self.compose_translation_failed.emit(
             request_id,
-            f"{provider_label} could not translate this message.",
+            f"{provider_label} could not translate this message{detail}.",
         )
+        self._emit_provider_status_if_changed()
 
     @Slot(dict)
     def update_config(self, config):
@@ -683,6 +757,7 @@ class TranslationScheduler(QObject):
 
     def _apply_config(self, config) -> None:
         entity_protection_was_enabled = self.config.get('entity_protection', True)
+        previous_config = self.config
         self.config = config.copy() if isinstance(config, dict) else {}
         self.translator_service.set_config(self.config)
         entity_protection_enabled = self.config.get('entity_protection', True)
@@ -717,7 +792,13 @@ class TranslationScheduler(QObject):
         if callable(set_doctrine):
             set_doctrine(doctrine)
         self._doctrine_path = doctrine_path
-        self._context.clear()
+        # Speaker-role or HUD edits also re-apply config; keep the rolling
+        # context unless something that shapes the translation changed.
+        if any(
+            previous_config.get(key) != self.config.get(key)
+            for key in CONTEXT_CONFIG_KEYS
+        ):
+            self._context.clear()
 
     def _emit_provider_status(self) -> None:
         get_provider_status = getattr(
@@ -727,9 +808,12 @@ class TranslationScheduler(QObject):
         )
         if callable(get_provider_status):
             status = get_provider_status()
-            self.provider_status_ready.emit(
-                status if isinstance(status, dict) else {}
+            status = status if isinstance(status, dict) else {}
+            self._last_status_signature = (
+                status.get('available'),
+                status.get('reason'),
             )
+            self.provider_status_ready.emit(status)
 
     @Slot(object)
     def queue_job(self, job) -> None:
@@ -816,12 +900,49 @@ class TranslationScheduler(QObject):
         while len(history) > limit:
             history.popleft()
 
+    def _emit_stale_jobs(self, jobs: list[TranslationJob]) -> None:
+        for job in jobs:
+            self.message_ready.emit(ProcessedMessage(
+                message_id=job.message_id,
+                session_id=job.session_id,
+                source_id=job.source_id,
+                text=job.final_original,
+                original_text='',
+                sender=job.sender,
+                timestamp=job.timestamp,
+                state=TranslationState.FAILED,
+                provider='',
+                detected_language=job.detected_language,
+                error=STALE_TRANSLATION_ERROR,
+                translation_relevant=True,
+                speaker_role=job.speaker_role,
+                commands=job.commands,
+                revision=job.revision + 1,
+                lookup_text=job.source_text,
+            ))
+
     def _translate_jobs(self, jobs: list[TranslationJob]) -> None:
         if self._stopping or not jobs:
             return
         if self._config_update_pending():
             self._deferred_jobs.extend(jobs)
             return
+        now = time.monotonic()
+        fresh: list[TranslationJob] = []
+        stale: list[TranslationJob] = []
+        for job in jobs:
+            age = now - job.queued_at
+            (stale if age > MAX_TRANSLATION_JOB_AGE_SECONDS else fresh).append(job)
+        if stale:
+            logger.info(
+                "Skipping %d queued translation(s) older than %.0f s",
+                len(stale),
+                MAX_TRANSLATION_JOB_AGE_SECONDS,
+            )
+            self._emit_stale_jobs(stale)
+            jobs = fresh
+            if not jobs:
+                return
         context = self._context_for(jobs[0])
         messages = [job.source_text for job in jobs]
         try:
@@ -874,7 +995,11 @@ class TranslationScheduler(QObject):
             final_text = restore_with_highlight(translated_text, job.tokens)
             state = TranslationState.TRANSLATED if success else TranslationState.FAILED
             provider_label = str(provider or 'Translation provider').strip()
-            error = '' if success else f"{provider_label} translation unavailable"
+            error = (
+                ''
+                if success
+                else provider_failure_text(provider_label, self.translator_service)
+            )
             self.message_ready.emit(ProcessedMessage(
                 message_id=job.message_id,
                 session_id=job.session_id,
@@ -895,6 +1020,24 @@ class TranslationScheduler(QObject):
             ))
             if success:
                 self._remember_context(job)
+        self._emit_provider_status_if_changed()
+
+    def _emit_provider_status_if_changed(self) -> None:
+        """Publish availability flips (outage paused / recovered) to the HUD."""
+        get_provider_status = getattr(
+            self.translator_service,
+            'get_provider_status',
+            None,
+        )
+        if not callable(get_provider_status):
+            return
+        status = get_provider_status()
+        if not isinstance(status, dict):
+            return
+        signature = (status.get('available'), status.get('reason'))
+        if signature != getattr(self, '_last_status_signature', None):
+            self._last_status_signature = signature
+            self.provider_status_ready.emit(status)
 
     @Slot()
     def stop(self) -> None:

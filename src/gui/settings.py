@@ -4,11 +4,13 @@ import re
 import threading
 import sqlite3
 from pathlib import Path
+from types import SimpleNamespace
 
-from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QSlider, QSpinBox, QCheckBox, QPushButton,
                                QColorDialog, QFormLayout, QGroupBox, QWidget, QTabWidget,
-                               QFileDialog, QLineEdit, QComboBox, QMessageBox)
+                               QFileDialog, QLineEdit, QComboBox, QMessageBox,
+                               QScrollArea, QFrame, QDialogButtonBox)
 from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor
 from src.app_config import (
@@ -21,12 +23,24 @@ from src.app_config import (
     normalize_translation_provider_config,
 )
 from src.services.translator import TranslationService
-from src.core.session_specs import SESSION_SPECS
+from src.core.session_specs import SESSION_SPECS, get_session_spec
 from src.version import __version__
 
 
 PROVIDER_TEST_TIMEOUT_MS = 15_000
 LANGUAGE_CODE_PATTERN = re.compile(r"^[A-Za-z]{2,3}(?:[-_][A-Za-z]{2,4})?$")
+# Preferred dialog size; it is capped to the screen's available area and the
+# tab contents scroll, so Save/Cancel stay reachable on 1366x768 laptops.
+SETTINGS_PREFERRED_SIZE = (560, 760)
+SETTINGS_SCREEN_MARGIN = 48
+# Language names accepted in "Ignored Langs" and mapped to detector codes.
+LANGUAGE_NAME_CODES = {
+    'english': 'en', 'german': 'de', 'deutsch': 'de', 'french': 'fr',
+    'spanish': 'es', 'portuguese': 'pt', 'russian': 'ru', 'ukrainian': 'uk',
+    'polish': 'pl', 'italian': 'it', 'dutch': 'nl', 'swedish': 'sv',
+    'norwegian': 'no', 'danish': 'da', 'finnish': 'fi', 'czech': 'cs',
+    'turkish': 'tr', 'chinese': 'zh', 'japanese': 'ja', 'korean': 'ko',
+}
 
 
 class ProviderTestSignals(QObject):
@@ -40,11 +54,19 @@ class SettingsDialog(QDialog):
 
     def __init__(self, full_config, parent=None, translation_service=None):
         super().__init__(parent)
-        self.setWindowTitle(f"Global Settings - v{__version__}")
-        self.resize(520, 700)
+        self.setWindowTitle(f"EVE Translator Settings - v{__version__}")
+        # Overlays are always on top; without this they can cover the dialog.
+        self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
         # Deep copy config to allow reversion/modification
         self.config = copy.deepcopy(full_config)
         normalize_translation_provider_config(self.config.setdefault('shared', {}))
+        saved_shared = self.config['shared']
+        # Provider state the running service uses until Save.
+        self.config_snapshot_provider = (
+            saved_shared.get('translation_provider', TRANSLATION_PROVIDER_DISABLED),
+            saved_shared.get('provider_fallback_enabled') is True,
+            self._config_text(saved_shared.get('deepl_api_key', '')),
+        )
         self._translation_service = translation_service
         self.pending_doctrine_source = None
         self._pending_doctrine_pack = None
@@ -56,37 +78,58 @@ class SettingsDialog(QDialog):
         self.btn_save.clicked.connect(self.accept)
         
         self.main_layout = QVBoxLayout(self)
-        
+
         self.tabs = QTabWidget()
         self.main_layout.addWidget(self.tabs)
-        
+
         # 1. Shared (General) Tab
         self.tab_shared = QWidget()
         self._init_shared_tab()
-        self.tabs.addTab(self.tab_shared, "General")
-        
+        self._add_scrollable_tab(self.tab_shared, "General")
+
         # Session tabs share one descriptor-backed order and label source.
         for spec in SESSION_SPECS:
             tab = QWidget()
             setattr(self, f"tab_{spec.session_id}", tab)
             self._init_session_tab(tab, spec.session_id)
-            self.tabs.addTab(tab, spec.settings_label)
+            self._add_scrollable_tab(tab, spec.settings_label)
 
         # 5. EVE-aware translation controls stay out of the dense General tab.
         self.tab_intelligence = QWidget()
         self._init_intelligence_tab()
-        self.tabs.addTab(self.tab_intelligence, "Translation Intelligence")
-        
-        # Buttons
-        btn_box = QHBoxLayout()
+        self._add_scrollable_tab(self.tab_intelligence, "Translation Intelligence")
+
+        # Buttons: Save is the default, so Enter in a field saves instead of
+        # pressing the first auto-default button ("Browse...").
         btn_cancel = QPushButton("Cancel")
         btn_cancel.clicked.connect(self.reject)
-        
-        # Optional: Reset Layouts button?
-        
-        btn_box.addWidget(self.btn_save)
-        btn_box.addWidget(btn_cancel)
-        self.main_layout.addLayout(btn_box)
+        button_box = QDialogButtonBox()
+        button_box.addButton(self.btn_save, QDialogButtonBox.ButtonRole.AcceptRole)
+        button_box.addButton(btn_cancel, QDialogButtonBox.ButtonRole.RejectRole)
+        self.main_layout.addWidget(button_box)
+        for button in self.findChildren(QPushButton):
+            button.setAutoDefault(False)
+            button.setDefault(False)
+        self.btn_save.setAutoDefault(True)
+        self.btn_save.setDefault(True)
+        self._fit_to_screen()
+
+    def _add_scrollable_tab(self, page, label):
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        scroll.setWidget(page)
+        self.tabs.addTab(scroll, label)
+
+    def _fit_to_screen(self):
+        width, height = SETTINGS_PREFERRED_SIZE
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            available = screen.availableGeometry()
+            width = min(width, available.width() - SETTINGS_SCREEN_MARGIN)
+            height = min(height, available.height() - SETTINGS_SCREEN_MARGIN)
+        self.resize(max(width, 360), max(height, 320))
 
     def _init_shared_tab(self):
         layout = QVBoxLayout(self.tab_shared)
@@ -117,9 +160,13 @@ class SettingsDialog(QDialog):
         # Opacity
         self.slider_opacity = QSlider(Qt.Orientation.Horizontal)
         self.slider_opacity.setRange(20, 100)
-        self.slider_opacity.setValue(int(self.config['shared'].get('opacity', 0.8) * 100))
+        # round(): int(0.29 * 100) is 28, which lost 1% on every open+Save.
+        self.slider_opacity.setValue(round(self.config['shared'].get('opacity', 0.8) * 100))
         self.slider_opacity.valueChanged.connect(self._notify_change)
-        form.addRow("Opacity:", self.slider_opacity)
+        self.slider_opacity.setToolTip(
+            "Background transparency. Overlay text always stays fully opaque."
+        )
+        form.addRow("Background opacity:", self.slider_opacity)
         
         # Font Size
         self.spin_font = QSpinBox()
@@ -146,7 +193,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(grp_colors)
         
         # Behavior / Translation
-        grp_beh = QGroupBox("Translation & Behavior")
+        grp_beh = QGroupBox("Translation and Behavior")
         form_beh = QFormLayout(grp_beh)
         
         self.chk_autoscroll = QCheckBox("Auto-scroll")
@@ -262,21 +309,46 @@ class SettingsDialog(QDialog):
         self.spin_poll = QDoubleSpinBox()
         self.spin_poll.setRange(0.1, 10.0)
         self.spin_poll.setSingleStep(0.1)
-        self.spin_poll.setValue(float(self.config['shared'].get('polling_interval', 1.0)))
+        self.spin_poll.setValue(float(self.config['shared'].get('polling_interval', 0.5)))
         self.spin_poll.setSuffix(" sec")
         self.spin_poll.valueChanged.connect(self._notify_change)
         
         lbl_hint = QLabel(
-            "Lower values reduce worst-case HUD delay; 1.0s is balanced. "
+            "Lower values reduce worst-case HUD delay; 0.5 s is the default. "
             "File watching may deliver lines sooner."
         )
         lbl_hint.setStyleSheet("color: gray; font-style: italic;")
+        lbl_hint.setWordWrap(True)
         
         form_perf.addRow("Log Poll Interval:", self.spin_poll)
         form_perf.addRow("", lbl_hint)
-        
+
         layout.addWidget(grp_perf)
-        
+
+        grp_keys = QGroupBox("Global Shortcuts")
+        form_keys = QFormLayout(grp_keys)
+        self.edit_lock_hotkey = self._make_line_edit(
+            self._config_text(self.config['shared'].get('global_hotkey'), 'Ctrl+Shift+L')
+            or 'Ctrl+Shift+L'
+        )
+        self.edit_compose_hotkey = self._make_line_edit(
+            self._config_text(self.config['shared'].get('compose_hotkey'), 'Ctrl+Shift+T')
+            or 'Ctrl+Shift+T'
+        )
+        form_keys.addRow("Lock overlays:", self.edit_lock_hotkey)
+        form_keys.addRow("Compose translation:", self.edit_compose_hotkey)
+        lbl_keys = QLabel(
+            "Type a modifier plus a letter, digit or F1-F24, for example "
+            "Ctrl+Shift+L. Windows reserves the shortcut for this app while it runs."
+        )
+        lbl_keys.setWordWrap(True)
+        lbl_keys.setStyleSheet("color: gray; font-style: italic;")
+        form_keys.addRow("", lbl_keys)
+        for edit in (self.edit_lock_hotkey, self.edit_compose_hotkey, self.edit_ignored):
+            edit.textChanged.connect(lambda _text: self._update_provider_controls())
+        layout.addWidget(grp_keys)
+        self._update_provider_controls()
+
         layout.addStretch()
 
     def _init_session_tab(self, tab_widget, session_id):
@@ -300,14 +372,14 @@ class SettingsDialog(QDialog):
         compact_header.stateChanged.connect(self._notify_change)
         form_hud.addRow(compact_header)
 
-        command_cards = QCheckBox("Render exact command cards")
+        command_cards = QCheckBox("Show command cards")
         command_cards.setChecked(session_cfg.get('command_cards', True))
         command_cards.stateChanged.connect(self._notify_change)
         form_hud.addRow(command_cards)
 
         hint = QLabel(
             "Star speakers or mark FC/scout roles from an unlocked overlay. "
-            "Only explicit FC roles create verified execution cards."
+            "Only speakers marked FC make a command card FC VERIFIED."
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: gray; font-style: italic;")
@@ -348,7 +420,12 @@ class SettingsDialog(QDialog):
             self.spin_fleet_interval.setValue(self.config['shared'].get('fleet_scan_interval', 10))
             self.spin_fleet_interval.setSuffix(" sec")
             self.spin_fleet_interval.valueChanged.connect(self._notify_change)
-            form_fleet.addRow("Scan Interval:", self.spin_fleet_interval)
+            self.spin_fleet_interval.setToolTip(
+                "How often chat logs are rescanned when Windows folder "
+                "notifications are unavailable. With notifications, new logs are "
+                "found immediately and a full rescan runs at least every 60 s."
+            )
+            form_fleet.addRow("Fallback scan interval:", self.spin_fleet_interval)
 
             # Backfill History Lines
             self.spin_fleet_history = QSpinBox()
@@ -400,7 +477,13 @@ class SettingsDialog(QDialog):
         btn_reset = QPushButton("Reset Position to Default")
         btn_reset.clicked.connect(lambda: self._reset_position(session_id))
         layout.addWidget(btn_reset)
-        
+        lbl_reset = QLabel("")
+        lbl_reset.setWordWrap(True)
+        layout.addWidget(lbl_reset)
+        if not hasattr(self, '_reset_labels'):
+            self._reset_labels = {}
+        self._reset_labels[session_id] = lbl_reset
+
         layout.addStretch()
 
     def _init_intelligence_tab(self):
@@ -709,7 +792,67 @@ class SettingsDialog(QDialog):
             if provider_mode == TRANSLATION_PROVIDER_GOOGLE:
                 return "A DeepL API key is required for Google fallback."
             return "A DeepL API key is required before saving DeepL."
+        return self._shortcut_validation_error() or self._ignored_languages_error()
+
+    @staticmethod
+    def _normalized_chord(text: str) -> str:
+        parts = [part.strip() for part in str(text or '').split('+') if part.strip()]
+        return '+'.join(
+            part.upper() if len(part) <= 3 and part[:1].lower() == 'f' and part[1:].isdigit()
+            else (part.upper() if len(part) == 1 else part.capitalize())
+            for part in parts
+        )
+
+    def _shortcut_validation_error(self):
+        if not hasattr(self, 'edit_compose_hotkey'):
+            return ""
+        from src.services.hotkeys import parse_hotkey
+
+        chords = {}
+        for label, edit in (
+            ("Lock overlays", self.edit_lock_hotkey),
+            ("Compose translation", self.edit_compose_hotkey),
+        ):
+            try:
+                chords[label] = parse_hotkey(edit.text())
+            except ValueError as exc:
+                return f"{label} shortcut: {exc}."
+        if len(set(chords.values())) < len(chords):
+            return "The two global shortcuts must be different."
         return ""
+
+    def _ignored_languages_error(self):
+        if not hasattr(self, 'edit_ignored'):
+            return ""
+        _codes, unknown = self._parse_ignored_languages(self.edit_ignored.text())
+        if unknown:
+            return (
+                f"Unknown ignored language: {', '.join(unknown)}. Use codes such "
+                "as en, de or zh."
+            )
+        return ""
+
+    @staticmethod
+    def _parse_ignored_languages(text: str) -> tuple[list[str], list[str]]:
+        """Return (ISO codes, unrecognised entries) for the ignored-languages box.
+
+        Names such as "English" or "German" were accepted and saved but never
+        matched a detected language, so those lines still went to the cloud.
+        """
+        codes: list[str] = []
+        unknown: list[str] = []
+        for raw in str(text or '').split(','):
+            entry = raw.strip()
+            if not entry:
+                continue
+            code = LANGUAGE_NAME_CODES.get(entry.casefold())
+            if code is None and LANGUAGE_CODE_PATTERN.fullmatch(entry):
+                code = entry.lower().replace('_', '-')
+            if code is None:
+                unknown.append(entry)
+            elif code not in codes:
+                codes.append(code)
+        return codes, unknown
 
     def _show_provider_usage_idle(self):
         provider_mode = self._selected_provider_mode()
@@ -733,6 +876,19 @@ class SettingsDialog(QDialog):
     def _request_provider_usage(self):
         if self._selected_provider_mode() == TRANSLATION_PROVIDER_DISABLED:
             self._show_provider_usage_idle()
+            return
+        saved = self.config_snapshot_provider
+        if (
+            self._selected_provider_mode() != saved[0]
+            or self.chk_provider_fallback.isChecked() != saved[1]
+            or self.edit_deepl.text().strip() != saved[2]
+        ):
+            # Usage comes from the running service, which still uses the
+            # saved provider and key; its answer would describe the wrong one.
+            self.lbl_provider_usage.setStyleSheet("color: gray;")
+            self.lbl_provider_usage.setText(
+                "Save first to check usage for the new provider or key."
+            )
             return
         self.lbl_provider_usage.setStyleSheet("color: gray;")
         self.lbl_provider_usage.setText("Refreshing provider usage...")
@@ -885,17 +1041,39 @@ class SettingsDialog(QDialog):
         self.lbl_provider_test.setStyleSheet("color: gray;")
         self.lbl_provider_test.setText("Testing...")
 
+        # A consented fallback is tested too: its key may be the one that fails.
+        tests = [(provider_mode, provider_api_key)]
+        if self.chk_provider_fallback.isChecked():
+            if provider_mode == TRANSLATION_PROVIDER_GOOGLE:
+                tests.append((TRANSLATION_PROVIDER_DEEPL, api_key))
+            elif provider_mode == TRANSLATION_PROVIDER_DEEPL:
+                tests.append((TRANSLATION_PROVIDER_GOOGLE, ""))
+
         def run_test():
-            try:
-                result = self._translation_service.test_provider(
-                    provider_mode,
-                    provider_api_key,
-                    target_lang,
-                )
-            except Exception:
-                # Provider libraries may include request metadata in exceptions;
-                # pass no exception details back to the UI.
+            results = []
+            for mode, key in tests:
+                try:
+                    results.append(self._translation_service.test_provider(
+                        mode,
+                        key,
+                        target_lang,
+                    ))
+                except Exception:
+                    # Provider libraries may include request metadata in
+                    # exceptions; pass no exception details back to the UI.
+                    results.append(None)
+            if len(results) == 1:
+                result = results[0]
+            elif any(item is None for item in results):
                 result = None
+            else:
+                primary, fallback = results
+                result = SimpleNamespace(
+                    success=bool(primary.success and fallback.success),
+                    message=(
+                        f"{primary.message} Fallback: {fallback.message}"
+                    ),
+                )
             self._provider_test_signals.finished.emit(token, result, api_key)
 
         threading.Thread(
@@ -960,14 +1138,18 @@ class SettingsDialog(QDialog):
             self._notify_change()
 
     def _reset_position(self, session_id):
-        # Set specific negative coords to trigger default placement logic
-        self.config['sessions'][session_id]['x'] = -1
-        self.config['sessions'][session_id]['y'] = -1
-        self.config['sessions'][session_id]['w'] = 600
-        self.config['sessions'][session_id]['h'] = 400
-        # Feedback? 
-        lbl = QLabel("Position reset pending save.")
-        self.sender().parent().layout().addWidget(lbl) # Hacky feedback
+        # Negative coordinates trigger the overlay's default placement.
+        spec = get_session_spec(session_id)
+        session = self.config['sessions'][session_id]
+        session['x'] = -1
+        session['y'] = -1
+        session['w'] = spec.default_width if spec is not None else 600
+        session['h'] = spec.default_height if spec is not None else 400
+        label = getattr(self, '_reset_labels', {}).get(session_id)
+        if label is not None:
+            label.setText("Moved to the default position. Cancel undoes it.")
+        # Preview immediately so an off-screen overlay comes back into view.
+        self._notify_change()
 
     def get_settings(self):
         # Collect values from widgets that aren't auto-updated
@@ -984,8 +1166,14 @@ class SettingsDialog(QDialog):
         )
         self.config['shared']['deepl_api_key'] = self.edit_deepl.text().strip()
 
-        ign_raw = self.edit_ignored.text()
-        self.config['shared']['ignored_languages'] = [x.strip() for x in ign_raw.split(',') if x.strip()]
+        ignored_codes, _unknown = self._parse_ignored_languages(self.edit_ignored.text())
+        self.config['shared']['ignored_languages'] = ignored_codes
+        self.config['shared']['global_hotkey'] = (
+            self._normalized_chord(self.edit_lock_hotkey.text()) or 'Ctrl+Shift+L'
+        )
+        self.config['shared']['compose_hotkey'] = (
+            self._normalized_chord(self.edit_compose_hotkey.text()) or 'Ctrl+Shift+T'
+        )
 
         self.config['shared']['log_dir'] = self.edit_log_dir.text()
 
@@ -1042,6 +1230,17 @@ class SettingsDialog(QDialog):
             
         d = QFileDialog.getExistingDirectory(self, "Select EVE Chatlogs Folder", current)
         if d:
+            from src.services.log_discovery import folder_has_eve_logs, resolve_chatlogs_dir
+
+            d = resolve_chatlogs_dir(d)
+            if not folder_has_eve_logs(d):
+                QMessageBox.warning(
+                    self,
+                    "No EVE chat logs found",
+                    "This folder has no EVE chat logs yet. Choose "
+                    "Documents\\EVE\\logs\\Chatlogs, and make sure 'Log Chat to "
+                    "File' is enabled in the EVE chat settings.",
+                )
             self.edit_log_dir.setText(d)
             self.config['shared']['log_dir'] = d
             self._notify_change()

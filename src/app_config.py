@@ -3,6 +3,7 @@ import json
 import logging
 import math
 import os
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -43,7 +44,7 @@ SHARED_CONFIG_KEYS = frozenset({
     'speaker_roles', 'global_hotkey', 'compose_hotkey',
     'entity_protection', 'entity_index_path', 'burst_optimization',
     'burst_batch_size', 'context_assist', 'context_messages',
-    'active_doctrine_pack',
+    'active_doctrine_pack', 'compose_target_language',
 })
 
 
@@ -305,7 +306,7 @@ def normalize_config(config: dict) -> dict:
         shared.get('fleet_history_lines'), 5, 0, 50, integer=True
     )
     shared['polling_interval'] = _bounded_number(
-        shared.get('polling_interval'), 1.0, 0.1, 10.0
+        shared.get('polling_interval'), 0.5, 0.1, 10.0
     )
     speaker_roles = shared.get('speaker_roles', {})
     if not isinstance(speaker_roles, dict):
@@ -321,6 +322,10 @@ def normalize_config(config: dict) -> dict:
         shared.get('compose_hotkey'), 'Ctrl+Shift+T'
     ).strip()
     shared['compose_hotkey'] = compose_hotkey or 'Ctrl+Shift+T'
+    compose_target = _config_text(shared.get('compose_target_language'), '').strip()
+    shared['compose_target_language'] = (
+        normalize_locale(compose_target) if compose_target else ''
+    )
     shared['entity_protection'] = _config_bool(
         shared.get('entity_protection'), True
     )
@@ -429,10 +434,11 @@ def get_default_config(legacy_overlay: Mapping[str, Any] | None = None) -> dict:
             'fleet_auto_switch': True,
             'fleet_scan_interval': 10,
             'fleet_history_lines': 5,
-            'polling_interval': 1.0,
+            'polling_interval': 0.5,
             'speaker_roles': {},
             'global_hotkey': 'Ctrl+Shift+L',
             'compose_hotkey': 'Ctrl+Shift+T',
+            'compose_target_language': '',
             'entity_protection': True,
             'entity_index_path': '',
             'burst_optimization': True,
@@ -493,6 +499,12 @@ class ConfigStore:
         self.migrated_from_implicit_google = False
         self.unsupported_schema_version: int | None = None
         self.unsupported_config_path: Path | None = None
+        # The primary file existed but was not valid JSON. It is preserved
+        # under this name so defaults never silently replace the pilot's key.
+        self.recovered_corrupt_path: Path | None = None
+        # The primary file exists but could not be read (locked/denied).
+        # Saving is blocked so the unread file cannot be overwritten.
+        self.unreadable_config_path: Path | None = None
 
     @property
     def path(self) -> Path:
@@ -505,6 +517,8 @@ class ConfigStore:
     def load(self) -> dict:
         self.unsupported_schema_version = None
         self.unsupported_config_path = None
+        self.recovered_corrupt_path = None
+        self.unreadable_config_path = None
         legacy_overlay = self._read_json(
             self.legacy_dir / LEGACY_OVERLAY_CONFIG_FILE_NAME
         )
@@ -520,12 +534,15 @@ class ConfigStore:
         primary_is_current = False
 
         for candidate in self._load_candidates():
-            loaded = self._read_json(candidate)
-            if not loaded:
-                continue
             candidate_is_primary = (
                 candidate.resolve(strict=False) == self.path.resolve(strict=False)
             )
+            if candidate_is_primary:
+                loaded = self._read_primary(candidate)
+            else:
+                loaded = self._read_json(candidate)
+            if not loaded:
+                continue
             candidate_version = _document_schema_version(loaded)
             if candidate_version > CONFIG_SCHEMA_VERSION:
                 if candidate_is_primary:
@@ -589,6 +606,12 @@ class ConfigStore:
                 self.unsupported_config_path or self.path,
             )
             return False
+        if self.unreadable_config_path is not None:
+            logger.error(
+                "Refusing to overwrite unreadable config at %s",
+                self.unreadable_config_path,
+            )
+            return False
         to_save = copy.deepcopy(config)
         remove_shared_keys_from_sessions(to_save)
         normalize_config(to_save)
@@ -631,12 +654,47 @@ class ConfigStore:
             return {}
 
         try:
-            with open(path, 'r', encoding='utf-8') as config_file:
+            # utf-8-sig: editors and PowerShell 5.1 often save a UTF-8 BOM.
+            with open(path, 'r', encoding='utf-8-sig') as config_file:
                 loaded = json.load(config_file)
                 return loaded if isinstance(loaded, dict) else {}
         except (OSError, json.JSONDecodeError, ValueError) as exc:
             logger.error("Error loading config from %s: %s", path, exc)
             return {}
+
+    def _read_primary(self, path: Path) -> dict:
+        """Read the main config, preserving it if it cannot be used."""
+        if not path.exists():
+            return {}
+        try:
+            with open(path, 'r', encoding='utf-8-sig') as config_file:
+                loaded = json.load(config_file)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+            logger.error("Config %s is not valid JSON: %s", path, exc)
+            self._preserve_corrupt_config(path)
+            return {}
+        except OSError as exc:
+            logger.error("Config %s could not be read: %s", path, exc)
+            self.unreadable_config_path = path
+            return {}
+        if not isinstance(loaded, dict):
+            logger.error("Config %s does not contain a JSON object", path)
+            self._preserve_corrupt_config(path)
+            return {}
+        return loaded
+
+    def _preserve_corrupt_config(self, path: Path) -> None:
+        stamp = datetime.now().strftime('%Y%m%d-%H%M%S')
+        backup = path.with_name(f"{path.name}.corrupt-{stamp}")
+        try:
+            os.replace(path, backup)
+        except OSError as exc:
+            logger.error("Could not preserve unreadable config %s: %s", path, exc)
+            # Without a backup, never overwrite the only copy.
+            self.unreadable_config_path = path
+            return
+        logger.warning("Preserved unreadable config as %s", backup)
+        self.recovered_corrupt_path = backup
 
     @staticmethod
     def _merge_config(config: dict, loaded: dict) -> None:

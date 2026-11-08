@@ -123,3 +123,28 @@ commands:
 if __name__ == '__main__':
     import unittest.mock
     unittest.main()
+
+
+class TestNumericGlossaryKeys(unittest.TestCase):
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.patcher = patch('pathlib.Path.home', return_value=Path(self.test_dir))
+        self.patcher.start()
+        self.glossary_dir = Path(self.test_dir) / ".eve_translator" / "glossaries"
+        self.glossary_dir.mkdir(parents=True, exist_ok=True)
+
+    def tearDown(self):
+        self.patcher.stop()
+        shutil.rmtree(self.test_dir)
+
+    def test_unquoted_numeric_slang_keys_load_as_text(self):
+        (self.glossary_dir / "custom_zh_en.yml").write_text(
+            "slang:\n  88: Bye\n  666: Awesome\n  null: Nothing\n",
+            encoding="utf-8",
+        )
+
+        glossary = EVEGlossary('zh', 'en')
+
+        self.assertEqual(glossary.terms["88"], "Bye")
+        self.assertEqual(glossary.terms["666"], "Awesome")
+        self.assertTrue(all(isinstance(key, str) for key in glossary.terms))

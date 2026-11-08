@@ -1,19 +1,28 @@
-import json
-import os
+import ctypes
 import datetime
 import re
 import html
+import sys
 from collections import deque
 from dataclasses import dataclass, replace
 from urllib.parse import quote, unquote
 
-from PySide6.QtWidgets import (QMainWindow, QLabel, QVBoxLayout, QWidget, QApplication, 
+from PySide6.QtWidgets import (QMainWindow, QLabel, QVBoxLayout, QWidget, QApplication,
                                QTextBrowser, QFrame, QMenu, QFileDialog, QMessageBox,
-                               QSizeGrip, QInputDialog)
-from PySide6.QtCore import Qt, QTimer, Slot, Signal, QPoint, QRect, QEvent, QUrl
-from PySide6.QtGui import QColor, QPalette, QFont, QCursor, QMouseEvent, QAction, QTextCursor
+                               QSizeGrip, QInputDialog, QSizePolicy)
+from PySide6.QtCore import Qt, QTimer, Signal, QRect, QEvent, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QCursor,
+    QFont,
+    QFontMetrics,
+    QMouseEvent,
+    QTextCursor,
+)
 
-from src.gui.settings import SettingsDialog
+from src.core.languages import normalize_language_code
+
 from src.core.message import ProcessedMessage, TranslationState
 from src.app_config import (
     DISPLAY_MODE_BILINGUAL,
@@ -28,6 +37,62 @@ from src.version import __version__
 
 MAX_VISIBLE_MESSAGES = 100
 UI_FLUSH_INTERVAL_MS = 50
+# Border width (logical pixels) that resizes the frameless window.
+RESIZE_MARGIN_PX = 6
+# Persist size/position shortly after the last move or resize event.
+GEOMETRY_SAVE_DELAY_MS = 400
+
+WM_NCHITTEST = 0x0084
+HTLEFT = 10
+HTRIGHT = 11
+HTTOP = 12
+HTTOPLEFT = 13
+HTTOPRIGHT = 14
+HTBOTTOM = 15
+HTBOTTOMLEFT = 16
+HTBOTTOMRIGHT = 17
+
+
+MIN_VISIBLE_ON_SCREEN_PX = 48
+
+
+def _rgba(color, alpha: float, fallback: str = '#101820') -> str:
+    """CSS rgba() for a named/hex colour with the given 0..1 alpha."""
+    qcolor = QColor(str(color or ''))
+    if not qcolor.isValid():
+        qcolor = QColor(fallback)
+    alpha_byte = max(0, min(255, round(float(alpha) * 255)))
+    return f"rgba({qcolor.red()}, {qcolor.green()}, {qcolor.blue()}, {alpha_byte})"
+
+
+def native_resize_hit_test(x, y, left, top, right, bottom, margin):
+    """Return the Win32 ``HT*`` resize code for a border point, else ``None``.
+
+    Coordinates are native screen pixels, as delivered with ``WM_NCHITTEST``.
+    """
+    if not (left <= x < right and top <= y < bottom):
+        return None
+    on_left = x < left + margin
+    on_right = x >= right - margin
+    on_top = y < top + margin
+    on_bottom = y >= bottom - margin
+    if on_top and on_left:
+        return HTTOPLEFT
+    if on_top and on_right:
+        return HTTOPRIGHT
+    if on_bottom and on_left:
+        return HTBOTTOMLEFT
+    if on_bottom and on_right:
+        return HTBOTTOMRIGHT
+    if on_left:
+        return HTLEFT
+    if on_right:
+        return HTRIGHT
+    if on_top:
+        return HTTOP
+    if on_bottom:
+        return HTBOTTOM
+    return None
 
 
 @dataclass(frozen=True)
@@ -79,17 +144,28 @@ class OverlayWindow(QMainWindow):
             else session_id.capitalize()
         )
         self.setWindowTitle(f"EVE Translator v{__version__} - {session_label}")
-        
-        # Opacity
-        self.setWindowOpacity(0.8)
+
+        # The opacity setting applies to the background only; text stays
+        # fully opaque so it remains readable over a busy game scene.
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
 
         # Mouse Tracking for resize cursor
         self.setMouseTracking(True)
         
         # Interaction State
-        self.resize_margin = 10
+        self.resize_margin = RESIZE_MARGIN_PX
         self.min_width = 120
         self.min_height = 80
+        self.is_moving = False
+        self.has_moved = False
+        self._move_button = None
+        self.drag_start_pos = None
+        # Native resizes and grip drags only produce resize events. Save the
+        # final geometry so later config pushes cannot restore the old size.
+        self._geometry_save_timer = QTimer(self)
+        self._geometry_save_timer.setSingleShot(True)
+        self._geometry_save_timer.setInterval(GEOMETRY_SAVE_DELAY_MS)
+        self._geometry_save_timer.timeout.connect(self.save_config)
 
         # Resize Handle (Visual Grip)
         self.grip = QSizeGrip(self)
@@ -105,6 +181,15 @@ class OverlayWindow(QMainWindow):
         self.status_header.setFixedHeight(26)
         self.status_header.setTextFormat(Qt.TextFormat.RichText)
         self.status_header.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
+        # Clip long status text instead of letting it force the window wider.
+        self.status_header.setSizePolicy(
+            QSizePolicy.Policy.Ignored,
+            QSizePolicy.Policy.Fixed,
+        )
+        self.status_header.setMinimumWidth(0)
+        # The header is the natural drag handle for a frameless window.
+        self.status_header.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.status_header.installEventFilter(self)
         self.central_layout.addWidget(self.status_header)
 
         # Text Browser Setup (Replaces ScrollArea + Widgets)
@@ -188,12 +273,12 @@ class OverlayWindow(QMainWindow):
         eve_time = datetime.datetime.now(datetime.timezone.utc).strftime("%H:%M:%S")
         
         if session_id == 'local':
-            char_name = self.config.get('character_name', 'Unknown Character')
-            system_name = self.config.get('system_name', 'Unknown System')
+            char_name = html.escape(str(self.config.get('character_name') or 'Unknown Character'))
+            system_name = html.escape(str(self.config.get('system_name') or 'Unknown System'))
             welcome_text = f"Listening to Local Chat for <b>{char_name}</b> in <b>{system_name}</b>."
         elif session_id == 'any':
-            channel_name = self.config.get('channel_name') or 'an arbitrary chat'
-            listener = self.config.get('listener_name', '')
+            channel_name = html.escape(str(self.config.get('channel_name') or 'an arbitrary chat'))
+            listener = html.escape(str(self.config.get('listener_name') or ''))
             suffix = f" for <b>{listener}</b>" if listener else ''
             welcome_text = f"Listening to <b>{channel_name}</b>{suffix}."
         else:
@@ -205,49 +290,94 @@ class OverlayWindow(QMainWindow):
         """Update knowledge of which sessions are enabled."""
         self.all_session_states = states
 
+    def _default_position(self, screen_geo: QRect, w: int, h: int) -> tuple[int, int]:
+        # Stagger sessions so default overlays do not cover each other.
+        offset = (
+            self.session_spec.position_offset
+            if self.session_spec is not None
+            else 150
+        )
+        x = screen_geo.x() + screen_geo.width() - w - 50 - offset
+        y = screen_geo.y() + screen_geo.height() - h - 100 - offset
+        return max(screen_geo.x(), x), max(screen_geo.y(), y)
+
+    @staticmethod
+    def _is_reachable(rect: QRect) -> bool:
+        """Whether enough of the window is on a connected screen to grab it."""
+        for screen in QApplication.screens():
+            visible = screen.availableGeometry().intersected(rect)
+            if (
+                visible.width() >= MIN_VISIBLE_ON_SCREEN_PX
+                and visible.height() >= min(MIN_VISIBLE_ON_SCREEN_PX, rect.height())
+            ):
+                return True
+        return False
+
+    def _font_pt(self, scale: float, minimum: int = 7) -> int:
+        """Size secondary text relative to the configured overlay font."""
+        try:
+            base = int(self.config.get('font_size', 10))
+        except (TypeError, ValueError):
+            base = 10
+        return max(minimum, round(base * scale))
+
     def apply_config(self):
         screen_geo = QApplication.primaryScreen().availableGeometry()
         needs_refresh = False
-        
+
         # Apply Geometry
         x = self.config.get('x', -1)
         y = self.config.get('y', -1)
         w = self.config.get('w', 600)
         h = self.config.get('h', 400)
-        
+
         if x == -1 or y == -1:
-            # Stagger default positions if multiple?
-            offset = (
-                self.session_spec.position_offset
-                if self.session_spec is not None
-                else 150
-            )
-            x = screen_geo.width() - w - 50 - offset
-            y = screen_geo.height() - h - 100 - offset
-            
+            x, y = self._default_position(screen_geo, w, h)
+        elif not self._is_reachable(QRect(x, y, w, h)):
+            # Saved on a monitor that is no longer connected. A frameless
+            # tool window has no taskbar entry, so it would be unreachable.
+            x, y = self._default_position(screen_geo, w, h)
+
         new_geometry = QRect(x, y, w, h)
         if self.geometry() != new_geometry:
-            self.setGeometry(new_geometry)
-        
-        # Apply visual settings
-        opacity = self.config.get('opacity', 0.8)
-        if abs(self.windowOpacity() - opacity) > 0.001:
-            self.setWindowOpacity(opacity)
-        
+            self._applying_config = True
+            try:
+                self.setGeometry(new_geometry)
+            finally:
+                self._applying_config = False
+
+        # Opacity is background-only (see WA_TranslucentBackground).
+        try:
+            opacity = max(0.2, min(1.0, float(self.config.get('opacity', 0.8))))
+        except (TypeError, ValueError):
+            opacity = 0.8
+        if abs(self.windowOpacity() - 1.0) > 0.001:
+            self.setWindowOpacity(1.0)
+
         bg_color = self.config.get('background_color', 'black')
+        background = _rgba(bg_color, opacity)
+        header_pt = self._font_pt(0.85, minimum=8)
         # Add subtle border to visualize edges
-        stylesheet = f"background-color: {bg_color}; border: 1px solid #444;"
-        if self._style_state.get('stylesheet') != stylesheet:
+        stylesheet = (
+            f"QTextBrowser {{ background-color: {background}; "
+            f"border: 1px solid rgba(68, 68, 68, 200); }}"
+        )
+        if self._style_state.get('stylesheet') != (stylesheet, header_pt):
             self.text_browser.setStyleSheet(stylesheet)
-            self.central_container.setStyleSheet(f"background-color: {bg_color};")
+            self.central_container.setStyleSheet("background-color: transparent;")
             self.status_header.setStyleSheet(
                 "QLabel {"
-                f"background-color: {bg_color}; color: #d8dde8; "
-                "border: 1px solid #444; border-bottom: 0; "
-                "padding: 0 6px; font-size: 10px; font-weight: 600;"
+                f"background-color: {background}; color: #d8dde8; "
+                "border: 1px solid rgba(68, 68, 68, 200); border-bottom: 0; "
+                f"padding: 0 6px; font-size: {header_pt}pt; font-weight: 600;"
                 "}"
             )
-        
+            header_font = QFont(self.status_header.font())
+            header_font.setPointSize(header_pt)
+            self.status_header.setFixedHeight(
+                max(26, QFontMetrics(header_font).height() + 10)
+            )
+
         # Apply Font
         font_size = self.config.get('font_size', 10)
         if self._style_state.get('font_size') != font_size:
@@ -274,7 +404,7 @@ class OverlayWindow(QMainWindow):
             needs_refresh = True
 
         self._style_state = {
-            'stylesheet': stylesheet,
+            'stylesheet': (stylesheet, header_pt),
             'font_size': font_size,
             'colors': color_state,
             'display_mode': display_mode,
@@ -322,8 +452,12 @@ class OverlayWindow(QMainWindow):
         )
         flags = self.windowFlags()
         flags = flags | mask if locked else flags & ~mask
-        self.setWindowFlags(flags)
-        self.setGeometry(geometry)
+        self._applying_config = True
+        try:
+            self.setWindowFlags(flags)
+            self.setGeometry(geometry)
+        finally:
+            self._applying_config = False
         self.interaction_locked = locked
         self.grip.setVisible(not locked)
         self.overlay_status = replace(self.overlay_status, interaction_locked=locked)
@@ -336,11 +470,22 @@ class OverlayWindow(QMainWindow):
         health_color = '#67d391' if status.provider_available else '#ff8c69'
         lock = '&#128274;' if status.interaction_locked else '&#128275;'
         context = f" &middot; {html.escape(status.context)}" if status.context else ''
+        problem = ''
+        if not status.provider_available and status.detail:
+            # Show the provider problem once here instead of on every line;
+            # the locked (click-through) HUD cannot show a tooltip.
+            short = status.detail.split(';', 1)[0].rstrip('.')
+            if len(short) > 40:
+                short = short[:39].rstrip() + '…'
+            problem = (
+                f" <span style='color:{health_color};'>&#9888; "
+                f"{html.escape(short)}</span>"
+            )
         label = (
             f"{html.escape(status.channel.upper())} &middot; "
             f"{html.escape(status.state)}{context} &middot; "
             f"{html.escape(status.display_mode.title())} &middot; {lock} "
-            f"<span style='color:{health_color};'>&#9679;</span>"
+            f"<span style='color:{health_color};'>&#9679;</span>{problem}"
         )
         self.status_header.setText(label)
         detail = status.detail or f"Translation provider: {status.provider}"
@@ -355,15 +500,17 @@ class OverlayWindow(QMainWindow):
         self.config['h'] = geo.height()
 
     def save_config(self):
+        self._geometry_save_timer.stop()
         self._update_config_from_geometry()
         # Emit signal to notify manager
         self.config_updated.emit(self.config)
 
     def get_current_config(self):
-        self._update_config_from_geometry() 
+        self._update_config_from_geometry()
         return self.config
 
     def closeEvent(self, event):
+        self._geometry_save_timer.stop()
         self.save_config()
         super().closeEvent(event)
 
@@ -372,20 +519,70 @@ class OverlayWindow(QMainWindow):
         # Refresh UI when shown to catch up on any messages missed while hidden
         self.refresh_ui()
 
+    def _schedule_geometry_save(self):
+        if self.isVisible() and not getattr(self, '_applying_config', False):
+            self._geometry_save_timer.start()
+
     def resizeEvent(self, event):
         rect = self.rect()
         # Position grip at bottom right
         self.grip.move(rect.right() - self.grip.width(), rect.bottom() - self.grip.height())
-        # Since we use native resize, we might want to update config occasionally or just on close
         self._update_config_from_geometry()
+        self._schedule_geometry_save()
         super().resizeEvent(event)
 
     def moveEvent(self, event):
         self._update_config_from_geometry()
+        self._schedule_geometry_save()
         super().moveEvent(event)
 
+    def nativeEvent(self, event_type, message):
+        """Give the frameless window real Windows resize borders.
+
+        Answering ``WM_NCHITTEST`` with an ``HT*`` border code lets Windows
+        show the resize cursor and run the resize loop on every edge, with
+        correct DPI handling, regardless of which child widget is underneath.
+        """
+        if sys.platform == 'win32' and not self.interaction_locked:
+            try:
+                raw_type = (
+                    event_type.data()
+                    if hasattr(event_type, 'data')
+                    else bytes(event_type)
+                )
+                if raw_type == b'windows_generic_MSG':
+                    from ctypes import wintypes
+
+                    msg = wintypes.MSG.from_address(int(message))
+                    if msg.message == WM_NCHITTEST:
+                        rect = wintypes.RECT()
+                        if ctypes.windll.user32.GetWindowRect(
+                            msg.hWnd,
+                            ctypes.byref(rect),
+                        ):
+                            x = ctypes.c_short(msg.lParam & 0xFFFF).value
+                            y = ctypes.c_short((msg.lParam >> 16) & 0xFFFF).value
+                            margin = max(
+                                1,
+                                round(self.resize_margin * self.devicePixelRatioF()),
+                            )
+                            hit = native_resize_hit_test(
+                                x, y,
+                                rect.left, rect.top, rect.right, rect.bottom,
+                                margin,
+                            )
+                            if hit is not None:
+                                return True, hit
+            except Exception:
+                pass
+        return super().nativeEvent(event_type, message)
+
     def check_edge(self, pos):
-        """Returns Qt.Edge identifier (combined for corners) or None"""
+        """Returns Qt.Edge identifier (combined for corners) or None.
+
+        ``pos`` must be in this window's coordinates; child widget events are
+        mapped with :meth:`mapFromGlobal` first.
+        """
         r = self.rect()
         m = self.resize_margin
         
@@ -404,70 +601,78 @@ class OverlayWindow(QMainWindow):
         if on_right: return Qt.Edge.RightEdge
         return None
 
+    def _edge_at_global(self, global_pos):
+        """Resize edge under a global point, in this window's coordinates."""
+        return self.check_edge(self.mapFromGlobal(global_pos))
+
     def eventFilter(self, source, event):
-        if event.type() == QEvent.Type.MouseButtonPress:
-            if isinstance(event, QMouseEvent):
-                if event.button() == Qt.MouseButton.LeftButton:
-                    # Check for resize
-                    local_pos = event.position().toPoint()
-                    edge = self.check_edge(local_pos)
-                    if edge:
-                        self.windowHandle().startSystemResize(edge)
-                        return True
-                
-                # Right Click: Manual Move (to preserve Context Menu on Release)
-                if event.button() == Qt.MouseButton.RightButton:
-                    self.is_moving = True
-                    self.drag_start_pos = event.globalPosition().toPoint()
-                    self.has_moved = False
-                    return True # Consume
-
-        elif event.type() == QEvent.Type.MouseMove:
-            if isinstance(event, QMouseEvent):
-                # Handle Cursor Shape
-                local_pos = event.position().toPoint()
-                edge = self.check_edge(local_pos)
-                
+        event_type = event.type()
+        if event_type == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
+            global_pos = event.globalPosition().toPoint()
+            if event.button() == Qt.MouseButton.LeftButton:
+                # Fallback for platforms without the native WM_NCHITTEST path.
+                # Child events arrive in child coordinates, so map globally.
+                edge = self._edge_at_global(global_pos)
                 if edge:
-                    if edge == (Qt.Edge.TopEdge | Qt.Edge.LeftEdge) or edge == (Qt.Edge.BottomEdge | Qt.Edge.RightEdge):
-                        self.setCursor(Qt.CursorShape.SizeFDiagCursor)
-                    elif edge == (Qt.Edge.TopEdge | Qt.Edge.RightEdge) or edge == (Qt.Edge.BottomEdge | Qt.Edge.LeftEdge):
-                        self.setCursor(Qt.CursorShape.SizeBDiagCursor)
-                    elif edge == Qt.Edge.TopEdge or edge == Qt.Edge.BottomEdge:
-                        self.setCursor(Qt.CursorShape.SizeVerCursor)
-                    elif edge == Qt.Edge.LeftEdge or edge == Qt.Edge.RightEdge:
-                        self.setCursor(Qt.CursorShape.SizeHorCursor)
-                    return True # Consume event to keep cursor
+                    handle = self.windowHandle()
+                    if handle is not None:
+                        handle.startSystemResize(edge)
+                    return True
+                if source is self.status_header:
+                    self._begin_move(global_pos, Qt.MouseButton.LeftButton)
+                    return True
+            # Right Click: Manual Move (to preserve Context Menu on Release)
+            if event.button() == Qt.MouseButton.RightButton:
+                self._begin_move(global_pos, Qt.MouseButton.RightButton)
+                return True
+
+        elif event_type == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
+            global_pos = event.globalPosition().toPoint()
+            if self.is_moving:
+                diff = global_pos - self.drag_start_pos
+                if diff.manhattanLength() > 5:
+                    self.has_moved = True
+                    self.move(self.pos() + diff)
+                    self.drag_start_pos = global_pos
+                return True
+
+            edge = self._edge_at_global(global_pos)
+            if edge:
+                diagonal_f = (Qt.Edge.TopEdge | Qt.Edge.LeftEdge, Qt.Edge.BottomEdge | Qt.Edge.RightEdge)
+                diagonal_b = (Qt.Edge.TopEdge | Qt.Edge.RightEdge, Qt.Edge.BottomEdge | Qt.Edge.LeftEdge)
+                if edge in diagonal_f:
+                    self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+                elif edge in diagonal_b:
+                    self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+                elif edge in (Qt.Edge.TopEdge, Qt.Edge.BottomEdge):
+                    self.setCursor(Qt.CursorShape.SizeVerCursor)
                 else:
-                    self.unsetCursor()
+                    self.setCursor(Qt.CursorShape.SizeHorCursor)
+                return True
+            self.unsetCursor()
 
-                # Handle Manual Move
-                if getattr(self, 'is_moving', False):
-                     global_pos = event.globalPosition().toPoint()
-                     diff = global_pos - self.drag_start_pos
-                     if diff.manhattanLength() > 5:
-                          self.has_moved = True
-                          self.move(self.pos() + diff)
-                          self.drag_start_pos = global_pos
-                     return True
-
-        elif event.type() == QEvent.Type.MouseButtonRelease:
-             if event.button() == Qt.MouseButton.RightButton:
-                  if getattr(self, 'is_moving', False):
-                       self.is_moving = False
-                       if not self.has_moved:
-                            self.show_context_menu()
-                       else:
-                            self.save_config()
-                       return True
+        elif event_type == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
+            if self.is_moving and event.button() == self._move_button:
+                self.is_moving = False
+                if self.has_moved:
+                    self.save_config()
+                elif event.button() == Qt.MouseButton.RightButton:
+                    self.show_context_menu()
+                return True
 
         return super().eventFilter(source, event)
+
+    def _begin_move(self, global_pos, button):
+        self.is_moving = True
+        self.has_moved = False
+        self._move_button = button
+        self.drag_start_pos = global_pos
 
     def show_context_menu(self):
         menu = QMenu(self)
         
         # Session Management Submenu
-        menu_session = menu.addMenu("Select Target Chat")
+        menu_session = menu.addMenu("Overlays")
         
         for spec in SESSION_SPECS:
             action = QAction(spec.label, self, checkable=True)
@@ -530,10 +735,14 @@ class OverlayWindow(QMainWindow):
 
                 for fleet_info in sorted_fleets:
                     # Format time ID
-                    dt = datetime.datetime.fromtimestamp(fleet_info.created_time)
+                    # EVE time, like chat timestamps and the Any Chat picker.
+                    dt = datetime.datetime.fromtimestamp(
+                        fleet_info.created_time,
+                        datetime.timezone.utc,
+                    )
                     time_str = dt.strftime("%H:%M")
-                    
-                    label = f"Fleet - {fleet_info.listener_name} [{time_str}]"
+
+                    label = f"Fleet - {fleet_info.listener_name} [{time_str} EVE]"
                     is_inactive = " [Inactive]" if not fleet_info.is_active else ""
                     label += is_inactive
 
@@ -726,18 +935,10 @@ class OverlayWindow(QMainWindow):
         self.request_settings.emit()
 
     def preview_settings(self, new_config):
-        # Apply incoming settings temporarily
-        old_opacity = self.config.get('opacity', 0.8)
+        # Apply incoming settings temporarily through the normal path, which
+        # handles background-only opacity and font-relative sizes.
         self.config.update(new_config)
-        
-        # Apply visual changes immediately
-        new_opacity = self.config.get('opacity', 0.8)
-        if new_opacity != old_opacity:
-            self.setWindowOpacity(new_opacity)
-
-        # Only refresh UI if visual properties changed that affect content
-        # For now, we just refresh since Font/Color might have changed.
-        # But we avoided the spam from text inputs.
+        self.apply_config()
         self.refresh_ui()
 
     def export_chat(self):
@@ -907,8 +1108,34 @@ class OverlayWindow(QMainWindow):
             return starred or trusted_command
         return True
 
+    @staticmethod
+    def _message_anchor(message_id) -> str:
+        return f"msg-{quote(str(message_id), safe='')}" if message_id else ""
+
     def _format_message_html(self, msg_data):
         """Helper to format a single message dict into HTML string."""
+        inner = self._format_message_inner(msg_data)
+        if inner is None:
+            return self._format_message_card_html(msg_data)
+        inner_html, margin = inner
+        return f"<div style='margin-bottom: {margin}px;'>{inner_html}</div>"
+
+    def _format_message_card_html(self, msg_data):
+        """Command-card rendering (one or more blocks per message)."""
+        return self._format_message_parts(msg_data, cards=True)
+
+    def _format_message_inner(self, msg_data):
+        """Return ``(inline_html, margin_px)`` for a one-block message.
+
+        Command cards span several blocks and return ``None``; they are
+        rendered by :meth:`_format_message_card_html`.
+        """
+        commands = tuple(msg_data.get('commands') or ())
+        if commands and self.config.get('command_cards', True):
+            return None
+        return self._format_message_parts(msg_data, cards=False)
+
+    def _format_message_parts(self, msg_data, *, cards):
         col_def = self.config.get('color_default', '#e0e0e0')
         col_trans = self.config.get('color_translated', '#00ffff')
         col_high = self.config.get('color_highlight', 'yellow')
@@ -918,8 +1145,10 @@ class OverlayWindow(QMainWindow):
         sender = html.escape(sender_raw)
         sender_link = quote(sender_raw, safe='')
         role = self._role_for(msg_data)
+        small_pt = self._font_pt(0.8)
         role_badge = (
-            f" <span style='color:#ffd166;font-size:9px;'>[{html.escape(role.upper())}]</span>"
+            f" <span style='color:#ffd166;font-size:{small_pt}pt;'>"
+            f"[{html.escape(role.upper())}]</span>"
             if role else ''
         )
         sender_html = (
@@ -939,7 +1168,7 @@ class OverlayWindow(QMainWindow):
         )
 
         commands = tuple(msg_data.get('commands') or ())
-        if commands and self.config.get('command_cards', True):
+        if cards:
             return self._format_command_cards(
                 msg_data,
                 commands,
@@ -953,16 +1182,32 @@ class OverlayWindow(QMainWindow):
                 col_high,
             )
 
+        # A named anchor lets a later translation update find this block.
+        anchor = self._message_anchor(msg_data.get('message_id'))
+        stamp = (
+            f"<a name='{anchor}'>[{timestamp}]</a>" if anchor else f"[{timestamp}]"
+        )
+
         if state == TranslationState.PENDING.value:
-            return (f"<div style='margin-bottom: 2px;'>"
-                    f"<span style='color: {col_def};'>[{timestamp}] {sender_html} &gt; {text}</span> "
-                    f"<span style='color: #b8b8b8;'><i>translating&#8230;</i></span></div>")
+            return (
+                f"<span style='color: {col_def};'>{stamp} {sender_html} &gt; {text}</span> "
+                f"<span style='color: #b8b8b8;'><i>translating&#8230;</i></span>",
+                2,
+            )
 
         if state == TranslationState.FAILED.value:
-            error = html.escape(msg_data.get('error') or 'Translation unavailable')
-            return (f"<div style='margin-bottom: 2px;'>"
-                    f"<span style='color: {col_def};'>[{timestamp}] {sender_html} &gt; {text}</span> "
-                    f"<span style='color: #ffbf69;'>&#9888; {error}</span></div>")
+            # Compact marker; the reason is in the tooltip and, for provider
+            # outages, once in the status header instead of on every line.
+            error = html.escape(
+                msg_data.get('error') or 'Translation unavailable',
+                quote=True,
+            )
+            return (
+                f"<span style='color: {col_def};'>{stamp} {sender_html} &gt; {text}</span> "
+                f"<span style='color: #ffbf69;' title=\"{error}\">"
+                f"&#9888; not translated</span>",
+                2,
+            )
 
         if state == TranslationState.TRANSLATED.value:
             original = msg_data['original_text']
@@ -971,22 +1216,25 @@ class OverlayWindow(QMainWindow):
                 original = original.replace("color: yellow", f"color: {col_high}")
             else:
                 original = ""
-                
+
             message_id = quote(str(msg_data.get('message_id') or ''), safe='')
             correction_link = (
                 f" <a href='correct:{message_id}' style='color:#9ca3af;text-decoration:none;'"
                 f" title='Save an exact local correction'>&#9998;</a>"
                 if msg_data.get('message_id') else ''
             )
-            return (f"<div style='margin-bottom: 3px;'>"
-                    f"<span style='color: {col_def};'>[{timestamp}] {sender_html} &gt; </span>"
-                    f"<span style='color: {col_trans};'>{text}</span>{correction_link}<br>"
-                    f"<span style='color: #9ca3af;font-size:9px;margin-left:8px;'>"
-                    f"&#8618; {original}</span></div>")
-        else:
-            return (f"<div style='margin-bottom: 2px;'>"
-                    f"<span style='color: {col_def};'>[{timestamp}] {sender_html} &gt; </span>"
-                    f"<span style='color: {col_def};'>{text}</span></div>")
+            return (
+                f"<span style='color: {col_def};'>{stamp} {sender_html} &gt; </span>"
+                f"<span style='color: {col_trans};'>{text}</span>{correction_link}<br>"
+                f"<span style='color: #9ca3af;font-size:{small_pt}pt;margin-left:8px;'>"
+                f"&#8618; {original}</span>",
+                3,
+            )
+        return (
+            f"<span style='color: {col_def};'>{stamp} {sender_html} &gt; </span>"
+            f"<span style='color: {col_def};'>{text}</span>",
+            2,
+        )
 
     @staticmethod
     def _command_field(command, name: str, default=''):
@@ -1010,6 +1258,14 @@ class OverlayWindow(QMainWindow):
         cards = []
         original = str(msg_data.get('original_text') or msg_data.get('text') or '')
         original = original.replace("color: yellow", f"color: {col_high}")
+        small_pt = self._font_pt(0.8)
+        label_pt = self._font_pt(1.05, minimum=9)
+        translated_pt = self._font_pt(0.85)
+        # The card already states the command; repeating an original that is
+        # in the reader's own language only takes space.
+        detected = normalize_language_code(msg_data.get('detected_language'), '')
+        target = normalize_language_code(self.config.get('target_language', 'en'), 'en')
+        show_original = not (detected and detected == target)
         for command in commands[:3]:
             code = str(self._command_field(command, 'code')).upper()
             category = str(self._command_field(command, 'category', 'COMMAND')).upper()
@@ -1027,31 +1283,42 @@ class OverlayWindow(QMainWindow):
             )
             trust_color = '#f4c95d' if trusted else '#9ca3af'
             argument_html = (
-                f" <span style='color:#ffffff;font-size:14px;'>{html.escape(argument)}</span>"
+                f" <span style='color:#ffffff;font-size:{label_pt}pt;'>{html.escape(argument)}</span>"
                 if argument else ''
             )
             state_note = ''
             if state == TranslationState.PENDING.value:
                 state_note = " <span style='color:#b8b8b8;'><i>translating&#8230;</i></span>"
             elif state == TranslationState.FAILED.value:
-                error = html.escape(msg_data.get('error') or 'Translation unavailable')
-                state_note = f" <span style='color:#ffbf69;'>&#9888; {error}</span>"
+                error = html.escape(
+                    msg_data.get('error') or 'Translation unavailable',
+                    quote=True,
+                )
+                state_note = (
+                    f" <span style='color:#ffbf69;' title=\"{error}\">"
+                    "&#9888; not translated</span>"
+                )
             translated_line = ''
             if state == TranslationState.TRANSLATED.value:
                 translated_line = (
-                    f"<div style='color:{col_trans};font-size:11px;margin-top:2px;'>"
+                    f"<div style='color:{col_trans};font-size:{translated_pt}pt;margin-top:2px;'>"
                     f"{text}</div>"
                 )
+            original_line = (
+                f"<div style='color:#9ca3af;font-size:{small_pt}pt;'>&#8618; {original}</div>"
+                if show_original or translated_line
+                else ''
+            )
             cards.append(
                 f"<div style='border-left:4px solid {border};background:#111827;"
                 "padding:5px 7px;margin:3px 1px;'>"
-                f"<div><span style='color:{trust_color};font-size:9px;font-weight:700;'>"
+                f"<div><span style='color:{trust_color};font-size:{small_pt}pt;font-weight:700;'>"
                 f"{html.escape(category)} &middot; {trust_label}</span> "
-                f"<span style='color:#f9fafb;font-size:14px;font-weight:700;'>"
+                f"<span style='color:#f9fafb;font-size:{label_pt}pt;font-weight:700;'>"
                 f"{html.escape(display_label)}</span>{argument_html}{state_note}</div>"
-                f"<div style='color:{col_def};font-size:9px;'>[{timestamp}] {sender_html}</div>"
+                f"<div style='color:{col_def};font-size:{small_pt}pt;'>[{timestamp}] {sender_html}</div>"
                 f"{translated_line}"
-                f"<div style='color:#9ca3af;font-size:9px;'>&#8618; {original}</div>"
+                f"{original_line}"
                 "</div>"
             )
         return ''.join(cards)
@@ -1141,12 +1408,77 @@ class OverlayWindow(QMainWindow):
         ):
             return
         self.chat_history[existing_index] = msg_data
-        if self.isVisible():
+        if not self.isVisible():
             self._needs_full_refresh = True
-            if not self._flush_timer.isActive():
-                self._flush_timer.start()
+            return
+        was_visible = self._message_visible(existing)
+        now_visible = self._message_visible(msg_data)
+        if not was_visible and not now_visible:
+            # Hidden in this display mode (e.g. Combat): nothing to redraw.
+            return
+        if was_visible and now_visible and self._replace_message_in_place(existing, msg_data):
+            return
+        self._needs_full_refresh = True
+        if not self._flush_timer.isActive():
+            self._flush_timer.start()
+
+    def _replace_message_in_place(self, existing: dict, msg_data: dict) -> bool:
+        """Redraw one already-rendered message without rebuilding the view.
+
+        A translation update otherwise re-rendered all (up to 100) messages
+        via ``setHtml`` (~10-15 ms per overlay), and could move the reader's
+        scroll position. Returns ``False`` when a full refresh is required.
+        """
+        if self._needs_full_refresh:
+            return False
+        message_id = msg_data.get('message_id')
+        # Not flushed yet: the pending render will use the new state.
+        for index, pending in enumerate(self._pending_messages):
+            if pending.get('message_id') == message_id:
+                self._pending_messages[index] = msg_data
+                return True
+        old_inner = self._format_message_inner(existing)
+        new_inner = self._format_message_inner(msg_data)
+        if old_inner is None or new_inner is None:
+            return False  # command cards span several blocks
+        block = self._find_message_block(message_id)
+        if block is None:
+            return False
+        scroll_bar = self.text_browser.verticalScrollBar()
+        at_bottom = scroll_bar.value() >= scroll_bar.maximum() - 2
+        scroll_value = scroll_bar.value()
+        cursor = QTextCursor(block)
+        cursor.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+        cursor.movePosition(
+            QTextCursor.MoveOperation.EndOfBlock,
+            QTextCursor.MoveMode.KeepAnchor,
+        )
+        cursor.insertHtml(new_inner[0])
+        if self.config.get('auto_scroll', True) and at_bottom:
+            scroll_bar.setValue(scroll_bar.maximum())
         else:
-            self._needs_full_refresh = True
+            scroll_bar.setValue(min(scroll_value, scroll_bar.maximum()))
+        return True
+
+    def _find_message_block(self, message_id):
+        """Find the rendered block of a message, searching from the newest."""
+        anchor = self._message_anchor(message_id)
+        if not anchor:
+            return None
+        block = self.text_browser.document().lastBlock()
+        checked = 0
+        while block.isValid() and checked <= MAX_VISIBLE_MESSAGES + 10:
+            fragments = block.begin()
+            # The anchor sits on the timestamp at the start of the block.
+            for _ in range(3):
+                if fragments.atEnd():
+                    break
+                if anchor in fragments.fragment().charFormat().anchorNames():
+                    return block
+                fragments += 1
+            block = block.previous()
+            checked += 1
+        return None
 
     def update_status(self, status):
         if isinstance(status, OverlayStatus):

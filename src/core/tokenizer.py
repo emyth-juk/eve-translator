@@ -130,11 +130,11 @@ class EVELinkTokenizer:
                         # End of link.
                         break
                     else:
-                        # High byte unicode > 0x9F? 
-                        # Usually EVE links are weird. Let's assume yes? 
-                        # Spec regex `[^\x00-\x1F\x20-\x7E\x80-\x9F\u00A0-\uFFFF]` is empty set? 
-                        # No, spec said `[^\x20-\x7E\u00A0-\uFFFF]`.
-                        # Let's assume anything non-printable is part of link.
+                        # Non-ASCII letters and digits are message text
+                        # (Chinese, Cyrillic, ...), not link payload; consuming
+                        # them hid "\x1a\u5168\u4F53\u8DDF\u968F" from detection and translation.
+                        if message[i].isalnum():
+                            break
                         i += 1
                 
                 end = i

@@ -49,6 +49,9 @@ COMMON_LANGUAGES = (
 )
 
 
+LANGUAGE_NAME_CODES = {name.lower(): code for name, code in COMMON_LANGUAGES}
+
+
 def _normalized_language_code(combo: QComboBox, *, allow_auto: bool) -> str:
     """Return the selected item data or an editable ISO-style value."""
     item_data = combo.currentData()
@@ -63,7 +66,8 @@ def _normalized_language_code(combo: QComboBox, *, allow_auto: bool) -> str:
     value = combo.currentText().strip().lower().replace("_", "-")
     if allow_auto and value in {"", "auto", "detect", "detect automatically"}:
         return "auto"
-    return value
+    # Typing a language name ("Russian") is natural; map it to its code.
+    return LANGUAGE_NAME_CODES.get(value, value)
 
 
 class ComposeDialog(QDialog):
@@ -76,6 +80,7 @@ class ComposeDialog(QDialog):
     """
 
     translation_requested = Signal(int, str, str, str)
+    settings_requested = Signal()
 
     def __init__(
         self,
@@ -86,18 +91,20 @@ class ComposeDialog(QDialog):
         provider_label: str = "configured cloud provider",
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle(f"Outbound Fleet Translation - v{__version__}")
+        self.setWindowTitle(f"Compose Translation - v{__version__}")
         self.setMinimumSize(540, 480)
         self.resize(640, 590)
 
         self._request_counter = 0
+        self._translation_available = True
+        self._validation_hint_shown = False
         self._active_request_id: int | None = None
         self._active_request_stale = False
         self._last_completed_request_id: int | None = None
 
         layout = QVBoxLayout(self)
 
-        heading = QLabel("Compose for fleet chat", self)
+        heading = QLabel("Compose a translation for fleet chat", self)
         heading.setStyleSheet("font-size: 16px; font-weight: bold;")
         layout.addWidget(heading)
 
@@ -117,7 +124,7 @@ class ComposeDialog(QDialog):
         language_row.addWidget(source_label)
         language_row.addWidget(self.source_language_combo, 1)
 
-        target_label = QLabel("&To:", self)
+        target_label = QLabel("T&o:", self)
         self.target_language_combo = self._make_language_combo(include_auto=False)
         self.target_language_combo.setObjectName("composeTargetLanguage")
         target_label.setBuddy(self.target_language_combo)
@@ -136,12 +143,22 @@ class ComposeDialog(QDialog):
         layout.addWidget(self.source_text_edit, 2)
 
         action_row = QHBoxLayout()
+        self.settings_button = QPushButton("Open &Settings", self)
+        self.settings_button.setObjectName("composeSettingsButton")
+        self.settings_button.setVisible(False)
+        self.settings_button.clicked.connect(self.settings_requested)
+        action_row.addWidget(self.settings_button)
+        self.cancel_button = QPushButton("Ca&ncel", self)
+        self.cancel_button.setObjectName("composeCancelButton")
+        self.cancel_button.setEnabled(False)
+        self.cancel_button.clicked.connect(self.cancel_translation)
         self.translate_button = QPushButton("&Translate", self)
         self.translate_button.setObjectName("composeTranslateButton")
         self.translate_button.setDefault(True)
         self.translate_button.setEnabled(False)
         self.translate_button.clicked.connect(self.request_translation)
         action_row.addStretch()
+        action_row.addWidget(self.cancel_button)
         action_row.addWidget(self.translate_button)
         layout.addLayout(action_row)
 
@@ -152,7 +169,7 @@ class ComposeDialog(QDialog):
         self.status_label.setAccessibleName("Translation status")
         layout.addWidget(self.status_label)
 
-        output_label = QLabel("Translated &message:", self)
+        output_label = QLabel("T&ranslated message:", self)
         self.output_text_edit = QTextEdit(self)
         self.output_text_edit.setObjectName("composeOutputText")
         self.output_text_edit.setAcceptRichText(False)
@@ -169,6 +186,11 @@ class ComposeDialog(QDialog):
         self.copy_button.setEnabled(False)
         self.copy_button.clicked.connect(self.copy_translation)
         footer_row.addWidget(self.copy_button)
+        self.copy_close_button = QPushButton("Cop&y && close", self)
+        self.copy_close_button.setObjectName("composeCopyCloseButton")
+        self.copy_close_button.setEnabled(False)
+        self.copy_close_button.clicked.connect(self.copy_and_close)
+        footer_row.addWidget(self.copy_close_button)
         footer_row.addStretch()
         self.close_button = QPushButton("C&lose", self)
         self.close_button.clicked.connect(self.reject)
@@ -247,6 +269,20 @@ class ComposeDialog(QDialog):
             "to EVE; copying and pasting are always manual."
         )
 
+    def set_translation_available(self, available: bool, provider_label: str = "") -> None:
+        """Show whether a provider is configured; Disabled cannot translate."""
+        self._translation_available = bool(available)
+        self.settings_button.setVisible(not self._translation_available)
+        if self._translation_available:
+            if provider_label:
+                self.set_provider_label(provider_label)
+        else:
+            self.notice_label.setText(
+                "Translation is turned off. Choose Google or DeepL in Settings to "
+                "translate outbound messages. Nothing is posted to EVE."
+            )
+        self._refresh_request_action()
+
     def source_language(self) -> str:
         return _normalized_language_code(self.source_language_combo, allow_auto=True)
 
@@ -263,6 +299,8 @@ class ComposeDialog(QDialog):
         self.raise_()
         self.activateWindow()
         self.source_text_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        # Typing the next call replaces the previous one instead of appending.
+        self.source_text_edit.selectAll()
 
     @Slot()
     def request_translation(self) -> int | None:
@@ -318,6 +356,7 @@ class ComposeDialog(QDialog):
         self._last_completed_request_id = request_id
         self.output_text_edit.setPlainText(result)
         self.copy_button.setEnabled(True)
+        self.copy_close_button.setEnabled(True)
         self.status_label.setStyleSheet("color: #2e7d32;")
         self.status_label.setText("Translation ready - review it, then copy it manually.")
         self.translate_button.setText("&Translate")
@@ -352,6 +391,26 @@ class ComposeDialog(QDialog):
         return True
 
     @Slot()
+    def copy_and_close(self) -> bool:
+        """Copy the translation and get out of the way of the game."""
+        if not self.copy_translation():
+            return False
+        self.close()
+        return True
+
+    @Slot()
+    def cancel_translation(self) -> None:
+        """Stop waiting for a slow provider; its late result is ignored."""
+        if self._active_request_id is None:
+            return
+        self._active_request_id = None
+        self._active_request_stale = False
+        self.status_label.setStyleSheet("color: #777;")
+        self.status_label.setText("Translation cancelled.")
+        self.translate_button.setText("&Translate")
+        self._refresh_request_action()
+
+    @Slot()
     def _request_input_changed(self) -> None:
         # Editing any request field makes an in-flight response stale. Keep the
         # request marker until its callback arrives so edits cannot be used to
@@ -363,6 +422,7 @@ class ComposeDialog(QDialog):
         if request_was_active or result_was_visible:
             self.output_text_edit.clear()
             self.copy_button.setEnabled(False)
+            self.copy_close_button.setEnabled(False)
             self.status_label.setStyleSheet("color: #777;")
             self.status_label.setText(
                 "Message changed - waiting for the current translation to finish."
@@ -385,8 +445,27 @@ class ComposeDialog(QDialog):
             text_present
             and source_valid
             and target_valid
+            and self._translation_available
             and self._active_request_id is None
         )
+        self.cancel_button.setEnabled(self._active_request_id is not None)
+        # Say why Translate is disabled instead of leaving "Ready" on screen.
+        hint = ""
+        if self._active_request_id is None:
+            if not self._translation_available:
+                hint = "Translation is turned off. Use Open Settings to choose a provider."
+            elif not source_valid:
+                hint = "Enter a valid source language code or name, such as ru, Russian or pt-BR."
+            elif not target_valid:
+                hint = "Enter a valid target language code or name, such as ru, Russian or pt-BR."
+        if hint:
+            self.status_label.setStyleSheet("color: #b45309;")
+            self.status_label.setText(hint)
+            self._validation_hint_shown = True
+        elif getattr(self, '_validation_hint_shown', False):
+            self._validation_hint_shown = False
+            self.status_label.setStyleSheet("")
+            self.status_label.setText("Ready")
 
     def _set_error(self, message: str) -> None:
         self.status_label.setStyleSheet("color: #c0392b;")
@@ -397,6 +476,7 @@ class ComposeDialog(QDialog):
         self._active_request_stale = False
         self.output_text_edit.clear()
         self.copy_button.setEnabled(False)
+        self.copy_close_button.setEnabled(False)
         self.status_label.setStyleSheet("color: #777;")
         self.status_label.setText(
             "Previous translation discarded - translate the updated message when ready."
@@ -409,9 +489,9 @@ class ComposeDialog(QDialog):
             self._active_request_stale = True
 
     def reject(self) -> None:
-        self._invalidate_pending_request()
+        # Keep an in-flight request: reopening with the same text shows its
+        # result. Editing the text still marks it stale.
         super().reject()
 
     def closeEvent(self, event: QCloseEvent) -> None:
-        self._invalidate_pending_request()
         super().closeEvent(event)

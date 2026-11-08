@@ -128,7 +128,17 @@ class EVEGlossary:
             if isinstance(value, dict):
                 flattened.update(self._flatten_dict(value))
             elif isinstance(value, str):
-                flattened[key] = value
+                # YAML parses unquoted numeric slang such as ``88: Bye`` as an
+                # int key. Terms are matched as text, so normalize scalars and
+                # skip keys that cannot be a source phrase.
+                if isinstance(key, str):
+                    term = key
+                elif isinstance(key, (int, float)) and not isinstance(key, bool):
+                    term = str(key)
+                else:
+                    continue
+                if term.strip():
+                    flattened[term] = value
         return flattened
 
     def _get_hardcoded_fallback(self) -> Dict[str, str]:

@@ -45,12 +45,25 @@ def test_guard_reports_mutex_creation_failure():
     kernel32.CreateMutexW.return_value = 0
     guard = SingleInstanceGuard(
         kernel32=kernel32,
-        last_error_getter=lambda: 5,
+        last_error_getter=lambda: 8,
     )
 
     assert guard.acquire() is False
     assert guard.already_running is False
-    assert "error 5" in guard.error
+    assert "error 8" in guard.error
+
+
+def test_access_denied_mutex_means_an_elevated_copy_is_running():
+    kernel32 = MagicMock()
+    kernel32.CreateMutexW.return_value = 0
+    guard = SingleInstanceGuard(
+        kernel32=kernel32,
+        last_error_getter=lambda: 5,
+    )
+
+    assert guard.acquire() is False
+    assert guard.already_running is True
+    assert "already running" in guard.error
 
 
 def test_non_windows_source_run_is_a_noop_without_injected_kernel():

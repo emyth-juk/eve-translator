@@ -7,6 +7,7 @@ from src.services.log_discovery import (
     EVELogEntry,
     EVE_LOG_FUTURE_MTIME_SKEW_SECONDS,
     UTF16HeaderCache,
+    check_discovery_stop,
     log_recency_key,
     scan_eve_log_entries,
 )
@@ -23,6 +24,8 @@ class FleetDetector:
 
     def __init__(self):
         self._header_cache = UTF16HeaderCache()
+        # Optional shutdown probe installed by the discovery worker.
+        self.should_stop = None
 
     def scan_active_fleets(
         self,
@@ -44,8 +47,13 @@ class FleetDetector:
         """
         result = {}
         current_time = time.time()
-        snapshot = entries if entries is not None else scan_eve_log_entries(log_dir)
-        for entry in snapshot:
+        snapshot = (
+            entries
+            if entries is not None
+            else scan_eve_log_entries(log_dir, self.should_stop)
+        )
+        for index, entry in enumerate(snapshot):
+            check_discovery_stop(self.should_stop, index)
             if not (
                 entry.name.startswith("Fleet_")
                 and entry.name.endswith(".txt")

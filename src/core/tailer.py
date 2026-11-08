@@ -12,6 +12,9 @@ class FleetLogTailer:
         self.filepath = Path(filepath)
         self.file_handle = None
         self.last_position = 0
+        # End of the snapshot read by read_last_n_lines(); seek_to_end()
+        # resumes there so a line written in between is never skipped.
+        self._pending_anchor = None
         self._open()
 
     def _open(self):
@@ -34,17 +37,55 @@ class FleetLogTailer:
             self.file_handle = None
 
     def seek_to_end(self):
-        """Move read pointer to end of file (skip existing content)."""
-        if self.file_handle:
+        """Skip existing content, continuing after the last complete line.
+
+        After :meth:`read_last_n_lines` this resumes exactly where that history
+        snapshot ended. A partially written last line is left for the next
+        poll instead of being skipped.
+        """
+        if self.file_handle is None:
+            if not self.filepath.exists():
+                return
+            self._open()
+            if self.file_handle is None:
+                return
+        anchor = self._pending_anchor
+        self._pending_anchor = None
+        if anchor is None:
+            try:
+                size = self.filepath.stat().st_size
+                anchor = self._last_line_end(size - (size % 2))
+            except OSError:
+                anchor = None
+        if anchor is None:
             self.file_handle.seek(0, os.SEEK_END)
             self.last_position = self.file_handle.tell()
-        else:
-            # If file not open, try to open and seek
-            if self.filepath.exists():
-                self._open()
-                if self.file_handle:
-                    self.file_handle.seek(0, os.SEEK_END)
-                    self.last_position = self.file_handle.tell()
+            return
+        # At a line boundary the UTF-16 decoder state is clean, so the byte
+        # offset is a valid text-mode seek cookie.
+        self.file_handle.seek(anchor)
+        self.last_position = anchor
+
+    def _last_line_end(self, end: int) -> int:
+        """Byte offset just after the last complete UTF-16 line before ``end``."""
+        newline = b"\n\x00"
+        position = end
+        with open(self.filepath, 'rb') as log_file:
+            while position > 0:
+                start = max(0, position - 8192)
+                start -= start % 2
+                log_file.seek(start)
+                chunk = log_file.read(position - start)
+                search_end = len(chunk)
+                while True:
+                    index = chunk.rfind(newline, 0, search_end)
+                    if index < 0:
+                        break
+                    if (start + index) % 2 == 0:
+                        return start + index + 2
+                    search_end = index + 1
+                position = start
+        return 0
 
     def read_new_lines(self) -> List[str]:
         """Read new lines since last call."""
@@ -132,6 +173,10 @@ class FleetLogTailer:
                 return self._read_all_message_lines()
 
             file_size = self.filepath.stat().st_size
+            # Read history only up to the last complete line, and remember
+            # that point for seek_to_end() (see _pending_anchor).
+            file_size = self._last_line_end(file_size - (file_size % 2))
+            self._pending_anchor = file_size
             if file_size == 0:
                 return []
 

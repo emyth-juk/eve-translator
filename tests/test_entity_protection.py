@@ -156,3 +156,14 @@ def test_localized_translation_views_use_one_bounded_lru_cache():
     assert set(index._translation_buckets) == set(index._lexicon_maps)
     assert ("l0", "en") in index._translation_buckets
     assert ("l1", "en") not in index._translation_buckets
+
+
+def test_latin_entity_glued_to_cjk_text_is_protected():
+    index = ProtectedEntityIndex([ProtectedEntity("Raven", "ship")])
+
+    for text in ("打Raven", "Raven来了", "在Raven门口"):
+        result = index.protect(text)
+        assert "Raven" not in result.text, text
+        assert list(result.tokens.values()) == ["Raven"], text
+
+    assert index.protect("Ravens").tokens == {}

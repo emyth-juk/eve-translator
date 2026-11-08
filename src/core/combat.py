@@ -151,8 +151,38 @@ _COMPILED_RULES = tuple(
     (code, re.compile(rf"^(?:{pattern})$", re.IGNORECASE | re.UNICODE))
     for code, pattern in _rules()
 )
-_CLAUSE_SEPARATOR = re.compile(r"\s*(?:[;；\n]|\s+[>|→]\s+|[,，]\s+(?=[A-Za-z\u3400-\u9fff]))\s*")
+_CLAUSE_SEPARATOR = re.compile(
+    r"\s*(?:[;；\n]|\s+[>|→]\s+|[,，]\s+(?=[A-Za-z\u3400-\u9fff])"
+    r"|\s+(?:and\s+)?then\s+|\s*(?:然后|接着|之后)\s*)\s*",
+    re.IGNORECASE,
+)
 _EDGE_PUNCTUATION = " \t\r.!?。！？,，;；:："
+# Calls addressed to the whole fleet ("全体对齐", "everyone align to gate").
+_ADDRESSEE_PREFIX = re.compile(
+    r"^(?:(?:全体|全队|全舰队|大家|所有人|各位)\s*[,，:：]?\s*"
+    r"|(?:all|everyone|everybody|fleet|guys|gang)\s*[,:]?\s+)",
+    re.IGNORECASE,
+)
+# Status reports about the current target are not new targets
+# ("primary dead", "primary is down", "主目标死了").
+_STATUS_ARGUMENTS = frozenset({
+    "dead", "down", "gone", "popped", "killed", "destroyed", "dying", "off",
+    "out", "done", "死了", "掉了", "没了", "爆了", "挂了",
+})
+_TARGET_CODES = frozenset({"PRIMARY", "SWITCH_PRIMARY", "LOCK"})
+
+
+def _match_rule(clause: str) -> tuple[str, str] | None:
+    """Return ``(code, argument)`` for the first rule matching a clause."""
+    for code, pattern in _COMPILED_RULES:
+        result = pattern.fullmatch(clause)
+        if not result:
+            continue
+        argument = (result.groupdict().get("argument") or "").strip(_EDGE_PUNCTUATION)
+        if code in _TARGET_CODES and argument.casefold() in _STATUS_ARGUMENTS:
+            return None
+        return code, argument
+    return None
 
 
 def _candidate_clauses(text: str) -> list[str]:
@@ -179,13 +209,24 @@ def classify_commands(
     if max_commands <= 0:
         return ()
     matches: list[CommandMatch] = []
-    for clause in _candidate_clauses(text):
+    for raw_clause in _candidate_clauses(text):
+        clause = _ADDRESSEE_PREFIX.sub("", raw_clause, count=1).strip() or raw_clause
         matched = False
-        for code, pattern in _COMPILED_RULES:
-            result = pattern.fullmatch(clause)
-            if not result:
-                continue
-            argument = (result.groupdict().get("argument") or "").strip(_EDGE_PUNCTUATION)
+        rule = _match_rule(clause)
+        if rule is not None:
+            code, argument = rule
+            # "跟随 align to gate": the argument is itself a complete call, so
+            # emit both commands instead of one card with a bogus argument.
+            nested = _match_rule(argument) if argument else None
+            if nested is not None:
+                head_clause = clause[: len(clause) - len(argument)].strip()
+                matches.append(CommandMatch(
+                    code=code,
+                    category=COMMAND_CATEGORY[code],
+                    source_clause=head_clause or clause,
+                ))
+                clause = argument
+                code, argument = nested
             matches.append(CommandMatch(
                 code=code,
                 category=COMMAND_CATEGORY[code],
@@ -193,7 +234,6 @@ def classify_commands(
                 source_clause=clause,
             ))
             matched = True
-            break
         if not matched and doctrine_pack is not None:
             lookup = getattr(doctrine_pack, 'command_for_phrase', None)
             code = lookup(clause) if callable(lookup) else None

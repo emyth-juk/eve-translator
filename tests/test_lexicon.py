@@ -51,3 +51,26 @@ def test_cjk_alias_does_not_require_latin_word_boundaries():
 
 def test_no_terms_leaves_whitespace_untouched():
     assert LongestLexiconMatcher().replace("keep   spacing") == "keep   spacing"
+
+
+def test_single_cjk_character_term_only_matches_when_standalone():
+    matcher = LongestLexiconMatcher([
+        LexiconTerm("收", "WTB", 10),  # 收
+        LexiconTerm("跳", "Jump", 10),  # 跳
+    ])
+
+    # 收到 ("roger") and 跳跃 are ordinary words, not the WTB/Jump shorthand.
+    assert matcher.replace("收到") == "收到"
+    assert matcher.replace("准备跳跃") == "准备跳跃"
+    assert matcher.replace("收 PLEX") == "WTB PLEX"
+    assert matcher.replace("收PLEX") == "WTB PLEX"
+    assert matcher.replace("跳！") == "Jump ！"
+
+
+def test_latin_alias_matches_next_to_cjk_text():
+    matcher = LongestLexiconMatcher([LexiconTerm("YST", "Ishtar", 10)])
+
+    assert matcher.replace("YST来了") == "Ishtar 来了"
+    assert matcher.replace("打YST") == "打 Ishtar"
+    # Latin neighbours still make the alias part of another word.
+    assert matcher.replace("XYST") == "XYST"

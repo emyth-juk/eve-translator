@@ -286,3 +286,68 @@ def test_foreign_fleet_commands_are_not_mistaken_for_english_patterns(message, d
             target_lang="en",
             ignored_langs={"en"},
         ) == (True, detected)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "GATE RED",
+        "dock up",
+        "good luck",
+        "need dps",
+        "lets kill it",
+        "never forget your bottle!",
+        "Nova Rage Heavy Assault Missile",
+        "Otsasai",
+    ],
+)
+def test_plain_english_chat_and_names_are_not_sent_for_english_target(message):
+    detector = LanguageDetector()
+
+    assert detector.should_translate(
+        message,
+        target_lang="en",
+        ignored_langs={"en"},
+    ) == (False, "en")
+
+
+@pytest.mark.parametrize("message", ["4-HWWF", "15W-GC*", "J123456 x3"])
+def test_system_codes_without_words_are_short_text(message):
+    detector = LanguageDetector()
+
+    assert detector.should_translate(
+        message,
+        target_lang="en",
+        ignored_langs={"en"},
+    ) == (False, "short_text")
+
+
+def test_plain_english_chat_still_translates_for_non_english_target():
+    detector = LanguageDetector()
+
+    assert detector.should_translate(
+        "need dps",
+        target_lang="zh",
+        ignored_langs=set(),
+    ) == (True, "en")
+
+
+@pytest.mark.parametrize(
+    ("message", "detected"),
+    [
+        ("necesito ayuda en el gate ahora", "es"),
+        ("wir brauchen hilfe am gate", "de"),
+        ("merci beaucoup pour le fleet", "fr"),
+    ],
+)
+def test_foreign_ascii_chat_with_few_english_words_uses_statistical_detection(
+    message,
+    detected,
+):
+    detector = LanguageDetector()
+
+    assert detector.should_translate(
+        message,
+        target_lang="en",
+        ignored_langs={"en"},
+    ) == (True, detected)

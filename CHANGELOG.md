@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Opt-in provider fallback that contacts the second cloud provider only after primary failure and explicit consent.
 - Schema-v2 doctrine correction packs and constrained custom command types with safe categories and display labels.
 - A third Any Chat overlay for one selected Corp, Alliance, intel, or custom channel, with stable per-character selection and relog recovery.
+- Global shortcuts can be changed in Settings and take effect on Save; a shortcut Windows refuses is marked in the tray menu.
+- Compose remembers the last outbound language, defaults to the fleet's recent language, accepts language names, and adds Cancel and Copy & close.
 
 ### Changed
 - Release automation now isolates build, VirusTotal scan, and publication permissions; scan failures stop publication, while malicious or suspicious classifications create a draft release for maintainer review.
@@ -50,6 +52,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Runtime and build dependencies were refreshed to patched versions, including Qt/PySide 6.11.1 and Requests 2.34.2, while CI actions are pinned to reviewed commits.
 - Google translation now uses a small internal, time-bounded mobile-web adapter instead of the historically compromised `deep-translator` package.
 - Local-system detection now scans only newly appended log bytes and keeps a bounded cache instead of rereading entire Local logs.
+- A DeepL request now gives up after one retry (about 21 s instead of up to 90 s); repeated failures pause the provider for 30 s (5 min for quota or key errors) and the reason is shown once in the overlay header instead of on every line.
+- Queued translations older than 30 s are skipped instead of building a backlog during an outage.
+- Combat mode no longer sends lines it hides to the cloud provider.
+- The opacity setting now applies to the overlay background only; text stays fully opaque, and secondary text scales with the font size.
+- Translation updates redraw a single message instead of the whole overlay, and resizing works on every edge with native Windows borders.
+- Chat-log discovery shares one header cache sized to the folder (about 4x faster on large Chatlogs folders), checks for shutdown inside long scans, and pauses while every session is off.
+- Settings now scrolls and fits small screens, saves only the values changed in the dialog, and opens once (a second request raises it).
+- The default log poll interval is 0.5 s.
 
 ### Fixed
 - Vanilla SDE names now outrank shorter player aliases by full span, including unchanged or ambiguous locale names that act as no-op guards.
@@ -81,6 +91,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Cancelling first-run log-folder selection now exits cleanly before worker threads start, and a regular file is no longer accepted as the chat-log directory.
 - Overlay geometry is preserved when a session is disabled, an inactive Any Chat source is selected, or the app exits.
 - Shutdown now cancels waits for in-flight provider calls and suppresses late results instead of waiting for the full provider deadline.
+- Single-character glossary terms no longer rewrite parts of ordinary Chinese words (for example 收到 -> "WTB 到"), and Latin EVE names written directly next to Chinese text are protected.
+- Translations into Chinese, Japanese or Korean are no longer discarded when the provider attaches a protected name directly to the surrounding text.
+- Short English chat ("GATE RED", "need dps") and system names are no longer detected as foreign languages and sent for translation.
+- An unquoted number in a custom glossary (for example `88: Bye`) no longer crashes startup.
+- A failed DeepL batch is no longer resent line by line to the same provider.
+- Resized overlays no longer snap back to their previous size, and overlays saved on a disconnected monitor are moved back on screen.
+- Saving or cancelling Settings no longer reverts changes made meanwhile by discovery or the tray (selected fleet, character or channel, system name, enabled sessions).
+- Pressing Enter in a Settings field saves instead of opening the folder picker; Reset Position works and previews immediately.
+- A settings file that cannot be read is preserved as `translator_config.json.corrupt-<time>` instead of being replaced with defaults; UTF-8 files with a byte-order mark are read.
+- Quitting during a long discovery pass no longer crashes the app, and the window probe no longer waits on the app's own windows.
+- At startup Fleet follows the selected fleet's log, and no longer scans the whole folder on the GUI thread while waiting for a fleet.
+- Stopped sessions, their overlays, and closed Settings dialogs are released instead of accumulating in memory.
+- Lines that contain only EVE names are resolved locally without a provider request.
+- Command cards recognise calls to the whole fleet ("全体对齐", "everyone align"), split chained calls ("然后", "then"), and no longer turn "primary dead" into a target.
+- DeepL target codes for regional Chinese and Norwegian (zh-TW, zh-CN, nb-NO) are mapped to the variants DeepL accepts.
+- The tray tooltip fits the Windows 127-character limit, and a persistent discovery error is announced once.
+- A second copy no longer starts when the first runs as administrator.
+- A chat line written while a session starts is no longer lost.
 
 ### Known limitations
 - VirusTotal findings are a point-in-time aggregation of independent engines, not a safety guarantee; the linked live report can change after publication.

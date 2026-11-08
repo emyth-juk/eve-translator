@@ -43,7 +43,7 @@ Real-time overlay translator for EVE Online Fleet, Local, and other logged chat 
    Tagged release notes include the executable's SHA-256 and an automated VirusTotal report. Treat the findings as a point-in-time multi-engine summary, not a guarantee of safety, and use `SHA256SUMS.txt` in the ZIP to verify the downloaded executable.
 3. Choose translation: open **Settings → Provider**, select Google or DeepL, and review the cloud-use notice.
 4. For DeepL, enter your API key and use **Test Provider** before saving.
-5. Point to your chat logs if needed: Settings → Log Directory (default is usually auto-detected).
+5. Point to your chat logs if needed: **Settings → General → EVE Logs** (usually auto-detected; choosing the `EVE\logs` folder picks its `Chatlogs` subfolder).
 6. Use it in game: position the overlays, adjust opacity/font size, and right-click for options (Settings, Export Logs, Toggle Sessions, Switch Chat).
 7. When positioned, use **Lock overlays** in the tray or **Ctrl+Shift+L** while EVE has focus to pass mouse input through all overlays.
 8. Use **Compose translation** in the tray or **Ctrl+Shift+T** to translate an outgoing call, review it, and copy it manually into EVE.

@@ -24,16 +24,33 @@ from src.core.languages import (
     normalize_locale as _normalize_language_code,
 )
 from src.core.lexicon import LexiconTerm, LongestLexiconMatcher
+from src.core.span_matching import NOT_AFTER_NON_CJK_WORD, NOT_BEFORE_NON_CJK_WORD
 
 logger = logging.getLogger(__name__)
 TRANSLATION_CACHE_SIZE = 512
 GLOSSARY_CACHE_SIZE = 16
 LEXICON_MATCHER_CACHE_SIZE = 32
 PROVIDER_CALL_TIMEOUT_SECONDS = 12.0
-DEEPL_CALL_TIMEOUT_SECONDS = 90.0
+# Chat translations are only useful while the conversation is current. The
+# DeepL SDK defaults to 5 retries with 10 s attempts (~90 s per call); keep one
+# retry so a failing call ends after roughly 21 s.
+DEEPL_MAX_NETWORK_RETRIES = 1
+DEEPL_CALL_TIMEOUT_SECONDS = 25.0
 GOOGLE_CALL_TIMEOUT_SECONDS = 15.0
 PROVIDER_USAGE_TIMEOUT_SECONDS = 20.0
 PROVIDER_ORPHAN_COOLDOWN_SECONDS = 120.0
+# Consecutive provider failures before calls pause, and how long they pause.
+PROVIDER_FAILURE_THRESHOLD = 3
+PROVIDER_FAILURE_COOLDOWN_SECONDS = 30.0
+# Quota and authentication failures will not fix themselves within seconds.
+PROVIDER_HARD_FAILURE_COOLDOWN_SECONDS = 300.0
+FAILURE_QUOTA = "quota exhausted"
+FAILURE_AUTH = "API key rejected"
+FAILURE_RATE_LIMIT = "rate limited"
+FAILURE_NETWORK = "network error"
+FAILURE_TIMEOUT = "timed out"
+FAILURE_PROTECTED_NAMES = "provider changed protected EVE names"
+HARD_PROVIDER_FAILURES = frozenset({FAILURE_QUOTA, FAILURE_AUTH})
 GOOGLE_CONNECT_TIMEOUT_SECONDS = 4.0
 GOOGLE_READ_TIMEOUT_SECONDS = 8.0
 GOOGLE_MOBILE_TRANSLATE_URL = "https://translate.google.com/m"
@@ -123,6 +140,104 @@ class ProviderCallTimeout(TimeoutError):
 
 class ProviderCallCancelled(ProviderCallTimeout):
     """Raised when shutdown stops waiting for an in-flight provider call."""
+
+
+_PROTECTED_MARKER_PATTERN = re.compile(r"_+EVE(?:DOCTRINE|ENTITY)_\d+_+", re.IGNORECASE)
+
+
+def _has_text_to_translate(request_text: str) -> bool:
+    """Return whether anything but protected names, codes and symbols remains.
+
+    Count/code tokens such as ``3x``, ``4-HWWF`` or ``J123456`` are not
+    language; a CJK word next to a digit ("3个") still is.
+    """
+    remainder = _PROTECTED_MARKER_PATTERN.sub(" ", request_text or "")
+    for token in remainder.split():
+        letters = [character for character in token if character.isalpha()]
+        if not letters:
+            continue
+        if any(character.isdigit() for character in token) and all(
+            letter.isascii() for letter in letters
+        ):
+            continue
+        return True
+    return False
+
+
+def describe_provider_failure(exc: BaseException) -> str:
+    """Return a short, message-free reason for a provider exception."""
+    if isinstance(exc, ProviderCallCancelled):
+        return "shutting down"
+    if isinstance(exc, (ProviderCallTimeout, requests.exceptions.Timeout)):
+        return FAILURE_TIMEOUT
+    if isinstance(exc, requests.exceptions.HTTPError):
+        status = getattr(getattr(exc, 'response', None), 'status_code', None)
+        if status == 429:
+            return FAILURE_RATE_LIMIT
+        return f"HTTP {status}" if status else "request failed"
+    if isinstance(exc, requests.exceptions.ConnectionError):
+        return FAILURE_NETWORK
+    # The DeepL SDK is imported lazily, so classify its exceptions by name.
+    by_name = {
+        'QuotaExceededException': FAILURE_QUOTA,
+        'AuthorizationException': FAILURE_AUTH,
+        'TooManyRequestsException': FAILURE_RATE_LIMIT,
+        'ConnectionException': FAILURE_NETWORK,
+    }
+    for cls in type(exc).__mro__:
+        reason = by_name.get(cls.__name__)
+        if reason:
+            return reason
+    return "request failed"
+
+
+class _SortedNames(tuple):
+    """Deduplicated protected names, longest first (precomputed once)."""
+
+    @classmethod
+    def of(cls, names) -> "_SortedNames":
+        return cls(sorted(set(names), key=len, reverse=True))
+
+
+class _ProviderCircuit:
+    """Pause calls to a provider after repeated or unrecoverable failures.
+
+    During an outage every queued chat line would otherwise wait for its own
+    network timeout on the single scheduler thread. Once open, calls fail
+    immediately with the recorded reason until the cooldown expires; the next
+    call after that is a normal probe.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._failures = 0
+        self._open_until = 0.0
+        self._reason = ""
+
+    def blocked_reason(self, now: float | None = None) -> str:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            if now >= self._open_until:
+                return ""
+            remaining = max(1, int(round(self._open_until - now)))
+            reason = self._reason or "repeated failures"
+        return f"{reason}; retrying in {remaining}s"
+
+    def record_success(self) -> None:
+        with self._lock:
+            self._failures = 0
+            self._open_until = 0.0
+            self._reason = ""
+
+    def record_failure(self, reason: str, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        with self._lock:
+            self._failures += 1
+            self._reason = reason or "request failed"
+            if self._reason in HARD_PROVIDER_FAILURES:
+                self._open_until = now + PROVIDER_HARD_FAILURE_COOLDOWN_SECONDS
+            elif self._failures >= PROVIDER_FAILURE_THRESHOLD:
+                self._open_until = now + PROVIDER_FAILURE_COOLDOWN_SECONDS
 
 
 @dataclass
@@ -311,10 +426,20 @@ class _BoundedCallRunner:
 
 
 class TranslationProvider(ABC):
+    # Short reason for the most recent failed call ("quota exhausted", ...).
+    # Providers swallow their own exceptions, so this carries the cause.
+    last_failure_reason: str = ""
+
     @property
     @abstractmethod
     def name(self) -> str:
         pass
+
+    def _note_failure(self, exc: BaseException) -> None:
+        self.last_failure_reason = describe_provider_failure(exc)
+
+    def _note_success(self) -> None:
+        self.last_failure_reason = ""
 
     @property
     def available(self) -> bool:
@@ -491,11 +616,14 @@ class GoogleTransProvider(TranslationProvider):
                     target_lang=normalized_target,
                 )
 
-            return self._call_runner.run(request)
+            translated = self._call_runner.run(request)
+            self._note_success()
+            return translated
         except Exception as exc:
             # Provider exceptions can contain request details. Keep logs useful
             # without risking credential or message disclosure.
             logger.error("Translation Error (Google): %s", type(exc).__name__)
+            self._note_failure(exc)
             return None
 
     def get_usage(self, *, refresh: bool = False) -> dict:
@@ -519,11 +647,17 @@ class DeepLProvider(TranslationProvider):
     def __init__(self, api_key: str):
         import deepl
 
+        try:
+            # Module-level SDK setting (documented): each attempt may take up
+            # to 10 s, so the default 5 retries could block chat for ~90 s.
+            deepl.http_client.max_network_retries = DEEPL_MAX_NETWORK_RETRIES
+        except Exception as exc:
+            logger.warning("Could not limit DeepL retries: %s", type(exc).__name__)
         self.translator = deepl.Translator(api_key)
         self._usage_translator = deepl.Translator(api_key)
-        # The SDK applies bounded 10-second socket attempts plus retry backoff.
-        # Keep our outer guard beyond that documented retry envelope so it does
-        # not orphan a healthy SDK call after the old 12-second deadline.
+        # The SDK applies bounded 10-second socket attempts plus one retry.
+        # Keep the outer guard beyond that envelope so it does not orphan a
+        # healthy SDK call that is still inside its own retry.
         self._call_runner = _BoundedCallRunner(
             "deepl", timeout_seconds=DEEPL_CALL_TIMEOUT_SECONDS
         )
@@ -566,13 +700,43 @@ class DeepLProvider(TranslationProvider):
         context: str = None,
     ) -> dict[str, str]:
         target_lang = _normalize_language_code(target_lang)
+        # DeepL target codes differ from common locale tags; unmapped regional
+        # Chinese or Norwegian codes are rejected by the API.
         lang_map = {
             'en': 'EN-US',
+            'en-us': 'EN-US',
             'gb': 'EN-GB',
+            'en-gb': 'EN-GB',
             'pt': 'PT-PT',
+            'pt-pt': 'PT-PT',
             'pt-br': 'PT-BR',
+            'zh': 'ZH-HANS',
+            'zh-cn': 'ZH-HANS',
+            'zh-sg': 'ZH-HANS',
+            'zh-hans': 'ZH-HANS',
+            'zh-tw': 'ZH-HANT',
+            'zh-hk': 'ZH-HANT',
+            'zh-mo': 'ZH-HANT',
+            'zh-hant': 'ZH-HANT',
+            'no': 'NB',
+            'nb': 'NB',
         }
-        target = lang_map.get(target_lang.lower(), target_lang.upper())
+        target = lang_map.get(target_lang.lower())
+        if target is None:
+            parts = target_lang.lower().replace('_', '-').split('-')
+            base, rest = parts[0], parts[1:]
+            if base == 'zh':
+                traditional = any(part in {'hant', 'tw', 'hk', 'mo'} for part in rest)
+                target = 'ZH-HANT' if traditional else 'ZH-HANS'
+            elif base in {'no', 'nb'}:
+                target = 'NB'
+            elif base == 'en':
+                target = 'EN-GB' if any(part in {'gb', 'uk'} for part in rest) else 'EN-US'
+            elif base == 'pt':
+                target = 'PT-BR' if 'br' in rest else 'PT-PT'
+            else:
+                # Other DeepL targets have no regional variants ("de-AT" -> DE).
+                target = base.upper()
         args = {'target_lang': target}
 
         normalized_source = _normalize_language_code(source_lang, default='auto')
@@ -600,9 +764,11 @@ class DeepLProvider(TranslationProvider):
             result = self._call_runner.run(
                 lambda: self.translator.translate_text(text, **args)
             )
+            self._note_success()
             return result.text
         except Exception as exc:
             logger.error("Translation Error (DeepL): %s", type(exc).__name__)
+            self._note_failure(exc)
             return None
 
     def translate_batch(
@@ -621,13 +787,16 @@ class DeepLProvider(TranslationProvider):
                 lambda: self.translator.translate_text(batch, **args)
             )
             if not isinstance(results, Sequence) or isinstance(results, (str, bytes)):
+                self.last_failure_reason = "unexpected response"
                 return None
+            self._note_success()
             return [
                 result.text if isinstance(getattr(result, 'text', None), str) else None
                 for result in results
             ]
         except Exception as exc:
             logger.error("Translation Error (DeepL batch): %s", type(exc).__name__)
+            self._note_failure(exc)
             return None
 
     def get_usage(self, *, refresh: bool = False) -> dict:
@@ -717,6 +886,9 @@ class TranslationService:
         self._fallback_provider: TranslationProvider | None = None
         self._fallback_mode = TRANSLATION_PROVIDER_DISABLED
         self._fallback_enabled = False
+        self._circuit_lock = threading.Lock()
+        # Reason for the most recent failed translation, for HUD/compose text.
+        self.last_failure_reason = ""
         self._translation_cache = OrderedDict()
         self._glossary_factory = glossary_factory
         self._glossaries: OrderedDict[
@@ -754,6 +926,23 @@ class TranslationService:
             provider = self.provider
         return bool(getattr(provider, 'available', True))
 
+    def _provider_circuit(self, provider) -> _ProviderCircuit:
+        """Return the failure circuit owned by one provider instance.
+
+        Storing it on the instance means a rebuilt provider (new key or mode)
+        starts closed without any explicit reset bookkeeping.
+        """
+        with self._circuit_lock:
+            circuit = getattr(provider, '_translation_circuit', None)
+            if isinstance(circuit, _ProviderCircuit):
+                return circuit
+            circuit = _ProviderCircuit()
+            try:
+                provider._translation_circuit = circuit
+            except (AttributeError, TypeError):
+                pass
+            return circuit
+
     def get_provider_status(self) -> dict:
         with self._provider_lock:
             mode = self._provider_mode
@@ -761,13 +950,23 @@ class TranslationService:
             fallback_enabled = self._fallback_enabled
             fallback_mode = self._fallback_mode
             fallback_provider = self._fallback_provider
-        primary_available = bool(getattr(provider, 'available', True))
+        primary_blocked = (
+            self._provider_circuit(provider).blocked_reason()
+            if provider is not None
+            else ""
+        )
+        primary_available = (
+            bool(getattr(provider, 'available', True)) and not primary_blocked
+        )
         fallback_available = bool(
             fallback_enabled
             and fallback_provider is not None
             and getattr(fallback_provider, 'available', True)
+            and not self._provider_circuit(fallback_provider).blocked_reason()
         )
         reason = getattr(provider, 'unavailable_reason', '')
+        if primary_blocked:
+            reason = f"{provider.name} paused: {primary_blocked}."
         if not primary_available and fallback_available:
             reason = (
                 f"{provider.name} is unavailable; consented "
@@ -858,6 +1057,11 @@ class TranslationService:
         self._clear_translation_cache()
 
     def set_entity_index(self, entity_index: Any) -> None:
+        # Every config apply re-sends the index. Cache keys already include
+        # the entity revision, so only a real change needs to drop the caches
+        # (rebuilding a lexicon matcher costs 40-80 ms).
+        if entity_index is getattr(self, 'entity_index', None):
+            return
         self.entity_index = entity_index
         self._clear_translation_cache()
 
@@ -879,7 +1083,14 @@ class TranslationService:
         self._clear_translation_cache()
 
     def set_doctrine_pack(self, doctrine_pack: Any) -> None:
+        current = getattr(self, 'doctrine_pack', None)
+        if doctrine_pack is current:
+            return
+        current_revision = self._doctrine_revision(current)
         self.doctrine_pack = doctrine_pack
+        if current_revision and current_revision == self._doctrine_revision(doctrine_pack):
+            # The same pack reloaded from disk by a config apply.
+            return
         self._clear_translation_cache()
 
     def set_fallback_authorizer(self, authorizer: Callable[[], bool] | None) -> None:
@@ -1192,12 +1403,34 @@ class TranslationService:
                 return str(value).strip()
         return ""
 
+    def _doctrine_memo_get(self, key, compute):
+        """Memoize doctrine-derived data per doctrine revision.
+
+        A large pack (thousands of terms/names) was re-filtered and re-sorted
+        for every uncached message.
+        """
+        memo = self.__dict__.setdefault('_doctrine_memo', {})
+        if key in memo:
+            return memo[key]
+        value = compute()
+        if len(memo) > 64:
+            memo.clear()
+        memo[key] = value
+        return value
+
     def _doctrine_terms(self, source_lang: str, target_lang: str) -> dict[str, str]:
         doctrine = self._active_doctrine()
         if doctrine is None:
             return {}
         source = _normalize_language_code(source_lang, default='auto')
         target = _normalize_language_code(target_lang)
+        key = ('terms', id(doctrine), self._doctrine_revision(doctrine), source, target)
+        return self._doctrine_memo_get(
+            key,
+            lambda: self._doctrine_terms_uncached(doctrine, source, target),
+        )
+
+    def _doctrine_terms_uncached(self, doctrine, source: str, target: str) -> dict[str, str]:
         for method_name in ('terms_for', 'get_terms', 'glossary_for'):
             method = getattr(doctrine, method_name, None)
             if not callable(method):
@@ -1247,6 +1480,14 @@ class TranslationService:
         doctrine = self._active_doctrine()
         if doctrine is None:
             return ()
+        key = ('names', id(doctrine), self._doctrine_revision(doctrine))
+        return self._doctrine_memo_get(
+            key,
+            lambda: _SortedNames.of(self._doctrine_protected_names_uncached(doctrine)),
+        )
+
+    @staticmethod
+    def _doctrine_protected_names_uncached(doctrine) -> tuple[str, ...]:
         for attribute in ('protected_names', 'protected_entities'):
             names = getattr(doctrine, attribute, None)
             if isinstance(names, Mapping):
@@ -1266,18 +1507,23 @@ class TranslationService:
     ) -> tuple[str, dict[str, str]]:
         protected = text
         tokens: dict[str, str] = {}
-        for name in sorted(set(names), key=len, reverse=True):
+        ordered = (
+            names
+            if isinstance(names, _SortedNames)
+            else sorted(set(names), key=len, reverse=True)
+        )
+        for name in ordered:
             if not name or name not in protected:
                 continue
             starts_cjk = '\u3400' <= name[0] <= '\u9fff'
             ends_cjk = '\u3400' <= name[-1] <= '\u9fff'
             prefix = (
-                r'(?<!\w)'
+                NOT_AFTER_NON_CJK_WORD
                 if not starts_cjk and (name[0].isalnum() or name[0] == '_')
                 else ''
             )
             suffix = (
-                r'(?!\w)'
+                NOT_BEFORE_NON_CJK_WORD
                 if not ends_cjk and (name[-1].isalnum() or name[-1] == '_')
                 else ''
             )
@@ -1325,6 +1571,13 @@ class TranslationService:
             _normalize_language_code(target_lang),
         )
         doctrine = self._active_doctrine()
+        if doctrine is not None:
+            # Doctrine terms are looked up by the exact regional pair first
+            # (zh-tw before zh), so the matcher key must not merge them.
+            pair = (
+                _normalize_language_code(source_lang, default='auto'),
+                pair[1],
+            )
         entity = self.entity_index
         entity_metadata = getattr(entity, 'metadata', {})
         if not isinstance(entity_metadata, Mapping):
@@ -1400,6 +1653,7 @@ class TranslationService:
     def _clear_translation_cache(self):
         self._translation_cache.clear()
         self._lexicon_matchers.clear()
+        self.__dict__.get('_doctrine_memo', {}).clear()
 
     def _cache_key(
         self,
@@ -1575,6 +1829,30 @@ class TranslationService:
             context,
         )
 
+    def _local_only_translation(self, prepared: _PreparedTranslation) -> str | None:
+        """Resolve lines that are only protected names, without a provider.
+
+        SDE names were already mapped to the target locale during
+        preparation, so "加达里海军雷神重型导弹*" needs no cloud request.
+        """
+        if _has_text_to_translate(prepared.request_text):
+            return None
+        return self._restore_protected_entities(
+            prepared.request_text,
+            prepared.tokens,
+        ) if prepared.tokens else prepared.request_text
+
+    def _restore_or_note_failure(
+        self,
+        translated: Any,
+        tokens: Mapping[str, str],
+    ) -> str | None:
+        """Restore markers and record why a provider response was discarded."""
+        restored = self._restore_protected_entities(translated, tokens)
+        if restored is None and isinstance(translated, str) and translated.strip():
+            self.last_failure_reason = FAILURE_PROTECTED_NAMES
+        return restored
+
     @staticmethod
     def _restore_protected_entities(
         translated: Any,
@@ -1614,14 +1892,17 @@ class TranslationService:
             ordinal_separator = rf"(?:\s*{underscore}+\s*|\s*-\s*|\s+)?"
             trailing_wrapper = rf"(?:\s*{underscore}+(?:\s*{underscore}+)*)?"
 
+            # CJK text has no spaces, so providers glue markers to the
+            # neighbouring characters ("主要目标__EVEENTITY_1__在网格上").
+            # Only Latin/number neighbours make a marker embedded.
             flexible_pattern = re.compile(
-                r"(?<!\w)"
+                NOT_AFTER_NON_CJK_WORD
                 + leading_wrapper
                 + re.escape(family)
                 + ordinal_separator
                 + re.escape(number)
                 + trailing_wrapper
-                + r"(?!\w)",
+                + NOT_BEFORE_NON_CJK_WORD,
                 flags=re.IGNORECASE,
             )
             matches = list(flexible_pattern.finditer(restored))
@@ -1655,6 +1936,19 @@ class TranslationService:
                 )
                 break
             last_provider_name = provider.name
+            if not bool(getattr(provider, 'available', True)):
+                # Disabled/unconfigured providers and pending timeouts are
+                # not transient call failures; report them as they are.
+                self.last_failure_reason = str(
+                    getattr(provider, 'unavailable_reason', '') or 'unavailable'
+                )
+                if isinstance(provider, (DisabledTranslationProvider, UnavailableTranslationProvider)):
+                    continue
+            circuit = self._provider_circuit(provider)
+            blocked_reason = circuit.blocked_reason()
+            if blocked_reason:
+                self.last_failure_reason = blocked_reason
+                continue
             try:
                 if (
                     isinstance(context, str)
@@ -1676,13 +1970,27 @@ class TranslationService:
                     type(exc).__name__,
                 )
                 translated = None
+                failure_reason = describe_provider_failure(exc)
+            else:
+                failure_reason = ""
             if isinstance(translated, str) and translated.strip():
+                circuit.record_success()
+                self.last_failure_reason = ""
                 if provider is fallback:
                     logger.warning(
                         "Primary translation failed; explicit fallback used %s",
                         provider.name,
                     )
                 return translated, provider.name
+            if not failure_reason:
+                provider_reason = getattr(provider, 'last_failure_reason', '')
+                failure_reason = (
+                    provider_reason
+                    if isinstance(provider_reason, str) and provider_reason
+                    else "no translation returned"
+                )
+            circuit.record_failure(failure_reason)
+            self.last_failure_reason = failure_reason
         return None, last_provider_name
 
     def _translate_prepared(
@@ -1695,13 +2003,16 @@ class TranslationService:
         cached = self._get_cached_translation(prepared.cache_key)
         if cached is not None:
             return cached.text, True, cached.provider_name
+        local = self._local_only_translation(prepared)
+        if local is not None:
+            return local, True, "Local"
         translated, provider_name = self._translate_via_provider(
             prepared.request_text,
             target_lang,
             source_lang,
             context,
         )
-        restored = self._restore_protected_entities(translated, prepared.tokens)
+        restored = self._restore_or_note_failure(translated, prepared.tokens)
         if restored is None:
             with self._provider_lock:
                 fallback_available = (
@@ -1716,7 +2027,7 @@ class TranslationService:
                     context,
                     skip_primary=True,
                 )
-                restored = self._restore_protected_entities(
+                restored = self._restore_or_note_failure(
                     translated,
                     prepared.tokens,
                 )
@@ -1826,10 +2137,18 @@ class TranslationService:
                 context,
                 cache_key,
             )
+            local = self._local_only_translation(prepared)
+            if local is not None:
+                results[index] = (local, True, "Local")
+                continue
             pending.append((index, prepared))
 
         batch_results: list[Any] | None = None
         batch_attempted = False
+        # The provider itself failed (error, timeout, paused circuit), as
+        # opposed to answering with a partial or mis-sized result. Resending
+        # each line to the same provider would multiply the outage delay.
+        batch_failed = False
         with self._provider_lock:
             primary_provider = self.provider
             fallback_configured = (
@@ -1837,8 +2156,15 @@ class TranslationService:
             )
         if pending and bool(getattr(primary_provider, 'supports_batch', False)):
             translate_batch = getattr(primary_provider, 'translate_batch', None)
-            if callable(translate_batch):
+            circuit = self._provider_circuit(primary_provider)
+            blocked_reason = circuit.blocked_reason()
+            if blocked_reason and callable(translate_batch):
                 batch_attempted = True
+                batch_failed = True
+                self.last_failure_reason = blocked_reason
+            elif callable(translate_batch):
+                batch_attempted = True
+                failure_reason = ""
                 try:
                     request_texts = [prepared.request_text for _, prepared in pending]
                     if (
@@ -1860,10 +2186,25 @@ class TranslationService:
                         and len(response) == len(pending)
                     ):
                         batch_results = list(response)
+                        circuit.record_success()
+                    elif response is None:
+                        provider_reason = getattr(
+                            primary_provider, 'last_failure_reason', ''
+                        )
+                        failure_reason = (
+                            provider_reason
+                            if isinstance(provider_reason, str) and provider_reason
+                            else "no translation returned"
+                        )
                     else:
                         logger.warning("Provider returned an invalid translation batch")
                 except Exception as exc:
                     logger.error("Translation batch failed: %s", type(exc).__name__)
+                    failure_reason = describe_provider_failure(exc)
+                if failure_reason:
+                    batch_failed = True
+                    circuit.record_failure(failure_reason)
+                    self.last_failure_reason = failure_reason
 
         for batch_index, (result_index, prepared) in enumerate(pending):
             translated = (
@@ -1871,16 +2212,17 @@ class TranslationService:
                 if batch_results is not None
                 else None
             )
-            restored = self._restore_protected_entities(translated, prepared.tokens)
+            restored = self._restore_or_note_failure(translated, prepared.tokens)
             if restored is None:
                 translated, provider_name = self._translate_via_provider(
                     prepared.request_text,
                     target,
                     source,
                     context,
-                    skip_primary=batch_attempted and fallback_configured,
+                    skip_primary=batch_attempted
+                    and (fallback_configured or batch_failed),
                 )
-                restored = self._restore_protected_entities(translated, prepared.tokens)
+                restored = self._restore_or_note_failure(translated, prepared.tokens)
             else:
                 provider_name = primary_provider.name
             if restored is None:

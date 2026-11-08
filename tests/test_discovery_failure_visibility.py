@@ -266,7 +266,8 @@ def test_persistent_failure_preserves_registries_and_surfaces_then_recovers():
         manager._session_runtime_errors["fleet"]
     )
     tray_tooltip = manager.tray_icon.setToolTip.call_args.args[0]
-    assert "Fleet Chat: Error" in tray_tooltip
+    assert "Fleet: Error" in tray_tooltip
+    assert len(tray_tooltip) <= 127
     assert "Access is denied" in tray_tooltip
     overlay_status = fleet_session.overlay.update_status.call_args.args[0]
     assert overlay_status.state == "Error"

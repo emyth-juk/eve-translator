@@ -30,7 +30,7 @@ class TestSharedConfigKeys(unittest.TestCase):
             'speaker_roles', 'global_hotkey', 'compose_hotkey',
             'entity_protection', 'entity_index_path', 'burst_optimization',
             'burst_batch_size', 'context_assist', 'context_messages',
-            'active_doctrine_pack',
+            'active_doctrine_pack', 'compose_target_language',
         }
         self.assertEqual(SHARED_CONFIG_KEYS, expected)
 
@@ -367,8 +367,20 @@ class TestSessionRuntimeState(unittest.TestCase):
         )
         self.assertIn('Active', mgr.fleet_action.setText.call_args.args[0])
 
-    def test_periodic_scan_dispatches_discovery_off_the_gui_thread(self):
+    def test_periodic_scan_is_paused_while_every_session_is_off(self):
         mgr = self._make_manager()
+        mgr._request_chat_discovery = MagicMock(return_value=True)
+        mgr._scan_characters = MagicMock()
+
+        mgr._periodic_scan()
+
+        mgr._request_chat_discovery.assert_not_called()
+        mgr._scan_characters.assert_not_called()
+        mgr._periodic_scan(force=True)
+        mgr._request_chat_discovery.assert_called_once_with()
+
+    def test_periodic_scan_dispatches_discovery_off_the_gui_thread(self):
+        mgr = self._make_manager(fleet_enabled=True)
         mgr.config['shared'].update({
             'log_dir': 'C:/logs',
             'fleet_inactive_threshold': 900,
@@ -618,11 +630,14 @@ class TestSessionRuntimeState(unittest.TestCase):
         )
         self.assertEqual(
             mgr.discovery_thread.wait.call_args_list,
-            [call(DISCOVERY_SHUTDOWN_TIMEOUT_MS), call(1_000)],
+            [call(DISCOVERY_SHUTDOWN_TIMEOUT_MS)],
         )
         mgr.discovery_worker.request_stop.assert_called_once_with()
         mgr.discovery_thread.quit.assert_called_once_with()
-        mgr.discovery_thread.terminate.assert_called_once_with()
+        # terminate() on a thread running Python crashed the process at exit;
+        # the stuck thread is left for the OS via os._exit instead.
+        mgr.discovery_thread.terminate.assert_not_called()
+        self.assertTrue(mgr._threads_still_running)
         mgr.thread.wait.assert_called_once_with(WORKER_SHUTDOWN_TIMEOUT_MS)
 
     def test_applying_scanner_config_requests_an_immediate_scan(self):

@@ -1,3 +1,4 @@
+import os
 import sys
 import time
 from collections import OrderedDict
@@ -11,6 +12,7 @@ from src.services.log_discovery import (
     EVELogEntry,
     EVE_LOG_FUTURE_MTIME_SKEW_SECONDS,
     UTF16HeaderCache,
+    check_discovery_stop,
     normalized_log_path,
     parse_eve_log_filename,
     scan_eve_log_entries,
@@ -44,6 +46,10 @@ class LocalChatDetector:
     def __init__(self):
         self._header_cache = UTF16HeaderCache()
         self._system_cache: OrderedDict[str, _SystemScanState] = OrderedDict()
+        # Optional shutdown probe installed by the discovery worker.
+        self.should_stop = None
+        # EVE window titles collected once per scan pass (None = not cached).
+        self._window_titles: set[str] | None = None
 
     def _file_cache_key(self, filepath: str):
         try:
@@ -180,31 +186,49 @@ class LocalChatDetector:
         """
         if not char_name or sys.platform != 'win32':
             return False
+        titles = self._window_titles
+        if titles is None:
+            titles = self._eve_window_names()
+        return char_name in titles
 
-        found = False
-        target_title = f"EVE - {char_name}"
-        
+    @staticmethod
+    def _eve_window_names() -> set[str]:
+        """Return character names from all ``EVE - <name>`` window titles.
+
+        Windows owned by this process are skipped: reading their titles sends
+        WM_GETTEXT to the GUI thread, which deadlocks while that thread waits
+        for discovery to stop. ``InternalGetWindowText`` never sends messages,
+        so a hung window in another program cannot block discovery either.
+        """
+        names: set[str] = set()
+        if sys.platform != 'win32':
+            return names
         try:
             user32 = ctypes.windll.user32
             WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-            
-            def enum_proc(hwnd, lParam):
-                nonlocal found
-                length = user32.GetWindowTextLengthW(hwnd)
-                if length > 0:
-                    buff = ctypes.create_unicode_buffer(length + 1)
-                    user32.GetWindowTextW(hwnd, buff, length + 1)
-                    title = buff.value
-                    if title == target_title:
-                        found = True
-                        return False # Stop enumeration
+            own_pid = os.getpid()
+            process_id = wintypes.DWORD()
+            buffer = ctypes.create_unicode_buffer(256)
+            read_title = getattr(user32, 'InternalGetWindowText', None)
+
+            def enum_proc(hwnd, _lparam):
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
+                if process_id.value == own_pid:
+                    return True
+                if read_title is not None:
+                    length = read_title(hwnd, buffer, len(buffer))
+                else:
+                    length = user32.GetWindowTextW(hwnd, buffer, len(buffer))
+                if length > 6:
+                    title = buffer.value
+                    if title.startswith("EVE - "):
+                        names.add(title[6:])
                 return True
-            
+
             user32.EnumWindows(WNDENUMPROC(enum_proc), 0)
         except Exception as e:
             logger.debug(f"Window enumeration failed: {e}")
-        
-        return found
+        return names
 
     def scan_active_characters(
         self,
@@ -218,9 +242,24 @@ class LocalChatDetector:
             Dict mapping CharacterID -> CharacterInfo
             Only includes the LATEST log per character.
         """
+        try:
+            return self._scan_active_characters(log_dir, entries)
+        finally:
+            self._window_titles = None
+
+    def _scan_active_characters(
+        self,
+        log_dir: str,
+        entries: Iterable[EVELogEntry] | None,
+    ) -> Dict[str, CharacterInfo]:
         character_logs: dict[str, list[EVELogEntry]] = {}
-        snapshot = entries if entries is not None else scan_eve_log_entries(log_dir)
-        for entry in snapshot:
+        snapshot = (
+            entries
+            if entries is not None
+            else scan_eve_log_entries(log_dir, self.should_stop)
+        )
+        for index, entry in enumerate(snapshot):
+            check_discovery_stop(self.should_stop, index)
             if not (
                 entry.name.startswith("Local_")
                 and entry.name.endswith(".txt")
@@ -237,7 +276,8 @@ class LocalChatDetector:
 
         # For each character, get latest log and extract info
         result = {}
-        for char_id, logs in character_logs.items():
+        for index, (char_id, logs) in enumerate(character_logs.items()):
+            check_discovery_stop(self.should_stop, index)
             # Preserve Local's mtime-first rotation behavior while making ties
             # deterministic across filesystem enumeration orders.
             logs.sort(
@@ -279,8 +319,18 @@ class LocalChatDetector:
             is_active_log = (
                 -EVE_LOG_FUTURE_MTIME_SKEW_SECONDS <= log_age <= 300
             )
-            is_window_open = self.is_character_window_open(char_name)
-            
+            if (
+                not is_active_log
+                and self._window_titles is None
+                and sys.platform == 'win32'
+            ):
+                # One window enumeration per pass, not one per character.
+                self._window_titles = self._eve_window_names()
+            # A recent write already proves activity; skip the window probe.
+            is_window_open = (
+                False if is_active_log else self.is_character_window_open(char_name)
+            )
+
             is_active = is_active_log or is_window_open
 
             result[char_id] = CharacterInfo(

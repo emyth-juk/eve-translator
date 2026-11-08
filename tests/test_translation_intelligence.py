@@ -317,6 +317,23 @@ def test_placeholder_restoration_rejects_mixed_duplicate_variants():
     assert restored is None
 
 
+def test_placeholder_restoration_accepts_cjk_neighbours():
+    # CJK targets are written without spaces, so providers glue markers to
+    # the surrounding characters. Only Latin/number neighbours are embedded.
+    cases = {
+        "主要目标__EVEENTITY_1__在网格上":
+            "主要目标Raven在网格上",
+        "__EVEENTITY_1__를 공격": "Raven를 공격",
+        "__EVEENTITY_1__を攻撃": "Ravenを攻撃",
+        "主要 _EVEENTITY-1_在": "主要 Raven在",
+    }
+    for translated, expected in cases.items():
+        assert TranslationService._restore_protected_entities(
+            translated,
+            {"__EVEENTITY_1__": "Raven"},
+        ) == expected
+
+
 def test_placeholder_restoration_rejects_word_embedded_variant():
     restored = TranslationService._restore_protected_entities(
         "x__eveentity_1__y",
@@ -413,16 +430,37 @@ def test_official_sde_names_canonicalize_before_yaml_ship_aliases():
     )
     service = TranslationService(provider=provider, entity_index=entity_index)
 
-    result = service.translate_message("灾难级 灾难 空堡 铁壁 星城", "en", "zh")
+    result = service.translate_message("灾难级 灾难 空堡 铁壁 星城 然后", "en", "zh")
 
     request = provider.calls[0][0]
     assert "级" not in request
     assert "灾难" not in request
     assert result == (
-        "translated:Apocalypse Apocalypse Astrahus Fortizar Keepstar",
+        "translated:Apocalypse Apocalypse Astrahus Fortizar Keepstar 然后",
         True,
         "Single",
     )
+
+
+def test_line_of_only_protected_names_is_resolved_without_a_provider():
+    provider = SingleProvider()
+    entity_index = ProtectedEntityIndex(
+        [
+            ProtectedEntity("Apocalypse", "ship"),
+            ProtectedEntity("灾难级", "ship", strict_case=False),
+        ],
+        localized_entities=[
+            LocalizedEntity(1, "ship", {"en": "Apocalypse", "zh": "灾难级"}),
+        ],
+    )
+    service = TranslationService(provider=provider, entity_index=entity_index)
+
+    single = service.translate_message("灾难级 *", "en", "zh")
+    batch = service.translate_batch_messages(["灾难级 3x"], "en", "zh")
+
+    assert single == ("Apocalypse *", True, "Local")
+    assert batch == [("Apocalypse 3x", True, "Local")]
+    assert provider.calls == []
 
 
 def test_exact_custom_glossary_can_override_equal_length_sde_name():
