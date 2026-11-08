@@ -97,7 +97,7 @@ def test_update_of_a_line_hidden_in_combat_mode_does_not_redraw():
     assert not overlay._flush_timer.isActive()
 
 
-def test_command_card_update_falls_back_to_a_full_refresh():
+def test_command_card_update_redraws_only_that_card():
     overlay = _overlay()
     commands = classify_commands("align to gate")
     overlay.upsert_processed_message(
@@ -112,5 +112,13 @@ def test_command_card_update_falls_back_to_a_full_refresh():
         _message(1, TranslationState.FAILED, text="align to gate", commands=commands, revision=2)
     )
     _flush(overlay)
+    in_place_text = overlay.text_browser.toPlainText()
+    card_state = overlay.text_browser.document().lastBlock().userState()
+    original_refresh()
 
-    assert refreshes == [True]
+    # Cards are single blocks too, so updates no longer rebuild the view.
+    assert refreshes == []
+    # toPlainText() turns the marker's non-breaking spaces into spaces.
+    assert "not translated" in in_place_text
+    assert in_place_text == overlay.text_browser.toPlainText()
+    assert card_state & 0xF == 3

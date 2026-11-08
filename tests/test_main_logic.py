@@ -30,7 +30,7 @@ class TestSharedConfigKeys(unittest.TestCase):
             'speaker_roles', 'global_hotkey', 'compose_hotkey',
             'entity_protection', 'entity_index_path', 'burst_optimization',
             'burst_batch_size', 'context_assist', 'context_messages',
-            'active_doctrine_pack', 'compose_target_language',
+            'active_doctrine_pack', 'compose_target_language', 'overlay_palette',
         }
         self.assertEqual(SHARED_CONFIG_KEYS, expected)
 

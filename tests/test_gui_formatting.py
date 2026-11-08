@@ -62,7 +62,9 @@ class TestGuiFormatting(unittest.TestCase):
         }
         html = overlay._format_message_html(msg_data)
         
-        self.assertIn("[12:00:00]", html)
+        # The time column shows minutes; the full time stays on hover.
+        self.assertIn(">12:00<", html)
+        self.assertIn("title='12:00:00'", html)
         self.assertIn("PilotA", html)
         self.assertIn("#cccccc", html) # Default color
         self.assertIn("Hello", html)

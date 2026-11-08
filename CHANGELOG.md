@@ -5,6 +5,27 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Right-click a chat line for actions on that line: copy the translation or original, improve that translation, and set the speaker's role.
+- Reading older lines no longer jumps to the bottom when new lines arrive; a "new messages" pill jumps back to the latest line.
+- Click the display-mode chip in the overlay header to cycle Mirror, Bilingual, and Combat.
+- **Lock overlays** in the overlay menu. Locked overlays hide the scroll bar and always follow the newest line.
+- Empty-state hints explain what Combat and Bilingual modes will show.
+
+### Changed
+- Redesigned overlay: a rounded translucent glass panel, a painted status header (health light, session name, context, mode chip, lock state), Segoe UI and Bahnschrift typography, a slim scroll bar, dark rounded menus and tooltips, and a subtle resize grip.
+- Chat lines use a compact minute time column (full time on hover) with wrapped text hanging under the speaker, speaker role badges and accents, and a language-tagged original line that is omitted when it matches the translation.
+- Command cards are drawn as two-line cards with a category-coloured accent: FC-verified cards are vivid, unverified cards are muted.
+- Refined default text colours (soft cyan translations, amber highlights). Untouched original defaults (`#00ffff`, `yellow`) migrate once; custom colours are kept.
+- Rebuilding an overlay (mode switches, showing it again, style changes) is about 2.5 times faster, and status updates are faster; new lines cost no more than before.
+
+### Fixed
+- Command cards were rendered without their card styling.
+- Context menus are released after use instead of accumulating on the overlay.
+- Speaker roles changed in another overlay now refresh badges and Combat filtering immediately.
+
 ## [1.4] - 2026-07-12
 
 ### Added

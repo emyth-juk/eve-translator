@@ -68,21 +68,34 @@ Real-time overlay translator for EVE Online Fleet, Local, and other logged chat 
 ## Controls & Interactions
 
 ### Moving & Resizing
-- **Move**: **Right-Click and Drag** anywhere on the overlay to move it.
+- **Move**: drag the **header**, or **Right-Click and Drag** anywhere on the overlay.
 - **Resize**: 
     - Drag any **edge** or **corner** of the window.
     - Use the **Resize Grip** in the bottom-right corner.
     - Windows can be resized down to very compact dimensions (120x80px).
 
+### Header
+- The light shows readiness: green when live, amber while waiting or when the translation provider is unavailable (the reason replaces the context text), red on errors.
+- Click the **mode chip** (Mirror, Bilingual, Combat) to switch modes; hover it for what each mode shows.
+- The padlock turns gold while overlays are locked (click-through).
+
+### Reading
+- Scroll up to read older lines; new lines no longer move the view. A **new messages** pill jumps back to the latest line.
+- The time column shows minutes; hover a time for the seconds.
+
 ### Context Menu
-- **Right-Click** (release without dragging) to open the menu:
-    - **Settings**: Configure API keys, colors, fonts, and opacity.
-    - **Toggle Chat**: Enable or disable Fleet, Local, and Any Chat overlays.
-    - **Export Recent History**: Save the overlay's latest 100 message states to a file.
-    - **Switch Character/Fleet/Chat**: Manually choose the Local character, Fleet, or arbitrary chat source.
+- **Right-Click a chat line** (release without dragging) for that line:
+    - **Copy translation / Copy message / Copy original**.
+    - **Improve this translation**: Save an exact local correction for that line.
+    - **Speaker role**: Mark the speaker as FC, Scout, Starred, or remove the role.
+- **Right-Click elsewhere** for the overlay menu:
     - **Display Mode**: Switch Combat, Bilingual, and Mirror instantly without retranslating history.
-    - **Speaker Role**: Mark the latest speaker as FC, Scout, Starred, or remove the role.
-    - **Improve Last Translation**: Save an exact local correction for the latest translated line.
+    - **Overlays**: Enable or disable Fleet, Local, and Any Chat overlays.
+    - **Switch Character/Fleet/Chat**: Manually choose the Local character, Fleet, or arbitrary chat source.
+    - **Speaker / Improve Last Translation**: The same actions for the latest speaker and translated line.
+    - **Lock overlays**: Make every overlay click-through; unlock with the shortcut or the tray.
+    - **Settings**: Configure API keys, colors, fonts, and opacity.
+    - **Export Recent History**: Save the overlay's latest 100 message states to a file.
 
 ### HUD Modes
 - **Combat**: trusted exact-command cards plus messages from explicitly starred FC/scout speakers.

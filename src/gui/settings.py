@@ -14,6 +14,9 @@ from PySide6.QtWidgets import (QApplication, QDialog, QVBoxLayout, QHBoxLayout, 
 from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor
 from src.app_config import (
+    DEFAULT_COLOR_DEFAULT,
+    DEFAULT_COLOR_HIGHLIGHT,
+    DEFAULT_COLOR_TRANSLATED,
     DISPLAY_MODE_BILINGUAL,
     DISPLAY_MODE_COMBAT,
     DISPLAY_MODE_MIRROR,
@@ -181,13 +184,13 @@ class SettingsDialog(QDialog):
         grp_colors = QGroupBox("Text Colors")
         form_col = QFormLayout(grp_colors)
         
-        self.btn_col_def = self._make_color_btn('color_default', self.config['shared'].get('color_default', '#e0e0e0'))
+        self.btn_col_def = self._make_color_btn('color_default', self.config['shared'].get('color_default', DEFAULT_COLOR_DEFAULT))
         form_col.addRow("Default Text:", self.btn_col_def)
-        
-        self.btn_col_trans = self._make_color_btn('color_translated', self.config['shared'].get('color_translated', '#00ffff'))
+
+        self.btn_col_trans = self._make_color_btn('color_translated', self.config['shared'].get('color_translated', DEFAULT_COLOR_TRANSLATED))
         form_col.addRow("Translated:", self.btn_col_trans)
-        
-        self.btn_col_high = self._make_color_btn('color_highlight', self.config['shared'].get('color_highlight', 'yellow'))
+
+        self.btn_col_high = self._make_color_btn('color_highlight', self.config['shared'].get('color_highlight', DEFAULT_COLOR_HIGHLIGHT))
         form_col.addRow("Highlights:", self.btn_col_high)
         
         layout.addWidget(grp_colors)

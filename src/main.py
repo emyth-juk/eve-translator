@@ -1325,6 +1325,8 @@ class TranslatorManager(QObject):
                 session.overlay.fleet_selected.connect(self.switch_fleet)
             if hasattr(session.overlay, 'channel_selected'):
                 session.overlay.channel_selected.connect(self.switch_channel)
+            if hasattr(session.overlay, 'lock_requested'):
+                session.overlay.lock_requested.connect(self.set_overlay_locked)
 
             self.sessions[session_id] = session
             session.overlay.set_interaction_locked(
@@ -1667,6 +1669,11 @@ class TranslatorManager(QObject):
         if hasattr(session.overlay, 'channel_selected'):
             try:
                 session.overlay.channel_selected.disconnect(self.switch_channel)
+            except RuntimeError:
+                pass
+        if hasattr(session.overlay, 'lock_requested'):
+            try:
+                session.overlay.lock_requested.disconnect(self.set_overlay_locked)
             except RuntimeError:
                 pass
 

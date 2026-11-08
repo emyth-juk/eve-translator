@@ -33,6 +33,23 @@ DISPLAY_MODES = frozenset({
     DISPLAY_MODE_BILINGUAL,
     DISPLAY_MODE_COMBAT,
 })
+# Overlay text colours, tuned for a dark translucent panel.
+DEFAULT_COLOR_DEFAULT = '#e0e0e0'
+DEFAULT_COLOR_TRANSLATED = '#67e8f9'
+DEFAULT_COLOR_HIGHLIGHT = '#fcd34d'
+# Marker for the one-time swap of the original neon defaults; see
+# _migrate_overlay_palette.
+OVERLAY_PALETTE_VERSION = 2
+_LEGACY_OVERLAY_COLORS = {
+    'color_translated': (
+        frozenset({'#00ffff', '#0ff', 'cyan', 'aqua'}),
+        DEFAULT_COLOR_TRANSLATED,
+    ),
+    'color_highlight': (
+        frozenset({'yellow', '#ffff00', '#ff0'}),
+        DEFAULT_COLOR_HIGHLIGHT,
+    ),
+}
 
 SHARED_CONFIG_KEYS = frozenset({
     'opacity', 'font_size', 'auto_scroll',
@@ -44,7 +61,7 @@ SHARED_CONFIG_KEYS = frozenset({
     'speaker_roles', 'global_hotkey', 'compose_hotkey',
     'entity_protection', 'entity_index_path', 'burst_optimization',
     'burst_batch_size', 'context_assist', 'context_messages',
-    'active_doctrine_pack', 'compose_target_language',
+    'active_doctrine_pack', 'compose_target_language', 'overlay_palette',
 })
 
 
@@ -239,6 +256,23 @@ def _migrate_config_document(
     return migrated, origin, confirmation, changed
 
 
+def _migrate_overlay_palette(shared: dict) -> None:
+    """Swap untouched original neon overlay colours for the refined palette.
+
+    Only exact former default values change, and only until the marker is
+    stored, so a colour picked deliberately afterwards is kept. No schema bump:
+    older builds simply read the new colour values.
+    """
+    marker = shared.get('overlay_palette')
+    if type(marker) is int and marker >= OVERLAY_PALETTE_VERSION:
+        return
+    for key, (legacy_values, replacement) in _LEGACY_OVERLAY_COLORS.items():
+        value = shared.get(key)
+        if isinstance(value, str) and value.strip().lower() in legacy_values:
+            shared[key] = replacement
+    shared['overlay_palette'] = OVERLAY_PALETTE_VERSION
+
+
 def normalize_config(config: dict) -> dict:
     """Normalize user-editable values to safe runtime types and UI ranges."""
     config['schema_version'] = CONFIG_SCHEMA_VERSION
@@ -280,14 +314,15 @@ def normalize_config(config: dict) -> dict:
         shared['provider_fallback_enabled'] = False
     shared['deepl_api_key'] = _config_text(shared.get('deepl_api_key')).strip()
 
+    _migrate_overlay_palette(shared)
     shared['color_default'] = _config_text(
-        shared.get('color_default'), '#e0e0e0'
+        shared.get('color_default'), DEFAULT_COLOR_DEFAULT
     )
     shared['color_translated'] = _config_text(
-        shared.get('color_translated'), '#00ffff'
+        shared.get('color_translated'), DEFAULT_COLOR_TRANSLATED
     )
     shared['color_highlight'] = _config_text(
-        shared.get('color_highlight'), 'yellow'
+        shared.get('color_highlight'), DEFAULT_COLOR_HIGHLIGHT
     )
     shared['log_dir'] = _config_text(
         shared.get('log_dir'),
@@ -426,9 +461,13 @@ def get_default_config(legacy_overlay: Mapping[str, Any] | None = None) -> dict:
             'provider_choice_confirmed': False,
             'provider_fallback_enabled': False,
             'deepl_api_key': legacy_overlay.get('deepl_api_key', ''),
-            'color_default': legacy_overlay.get('color_default', '#e0e0e0'),
-            'color_translated': legacy_overlay.get('color_translated', '#00ffff'),
-            'color_highlight': legacy_overlay.get('color_highlight', 'yellow'),
+            'color_default': legacy_overlay.get('color_default', DEFAULT_COLOR_DEFAULT),
+            'color_translated': legacy_overlay.get(
+                'color_translated', DEFAULT_COLOR_TRANSLATED
+            ),
+            'color_highlight': legacy_overlay.get(
+                'color_highlight', DEFAULT_COLOR_HIGHLIGHT
+            ),
             'log_dir': os.path.expanduser("~/Documents/EVE/logs/Chatlogs"),
             'fleet_inactive_threshold': 1800,
             'fleet_auto_switch': True,

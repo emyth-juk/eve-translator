@@ -63,9 +63,9 @@ def test_resized_overlay_keeps_its_size_when_the_manager_pushes_config(tmp_path)
     session.update_config(dict(manager_config, opacity=0.6))
 
     assert (session.overlay.width(), session.overlay.height()) == (520, 300)
-    # Opacity now applies to the background only; text stays opaque.
+    # Opacity now applies to the painted background only; text stays opaque.
     assert session.overlay.windowOpacity() == 1.0
-    assert ", 153)" in session.overlay.text_browser.styleSheet()
+    assert session.overlay.central_container.fill_color().alpha() == 153
     session.stop()
 
 
