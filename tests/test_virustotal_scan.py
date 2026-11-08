@@ -124,15 +124,32 @@ def test_small_file_uses_direct_upload_endpoint(tmp_path):
     assert session.requests[0]["allow_redirects"] is False
 
 
-def test_large_file_uses_single_use_upload_url(tmp_path):
+@pytest.mark.parametrize(
+    ("returned_url", "expected_post_url"),
+    (
+        # The documented form is upgraded to HTTPS.
+        (
+            "http://www.virustotal.com/_ah/upload/one-use-token",
+            "https://www.virustotal.com/_ah/upload/one-use-token",
+        ),
+        # Live large-file URLs come from a dedicated upload host.
+        (
+            "https://bigfiles.virustotal.com/_ah/upload/one-use-token/",
+            "https://bigfiles.virustotal.com/_ah/upload/one-use-token/",
+        ),
+        (
+            "https://BigFiles.VirusTotal.com:443/upload?token=one-use",
+            "https://bigfiles.virustotal.com/upload?token=one-use",
+        ),
+    ),
+)
+def test_large_file_uses_single_use_upload_url(tmp_path, returned_url, expected_post_url):
     executable = tmp_path / "release.exe"
     with executable.open("wb") as target:
         target.truncate(DIRECT_UPLOAD_LIMIT + 1)
-    documented_upload_url = "http://www.virustotal.com/_ah/upload/one-use-token"
-    secure_upload_url = "https://www.virustotal.com/_ah/upload/one-use-token"
     session = FakeSession(
         [
-            FakeResponse(200, {"data": documented_upload_url}),
+            FakeResponse(200, {"data": returned_url}),
             FakeResponse(200, {"data": {"type": "analysis", "id": "a-large"}}),
         ]
     )
@@ -141,8 +158,9 @@ def test_large_file_uses_single_use_upload_url(tmp_path):
     assert client.submit_file(executable, deadline=float("inf")) == "a-large"
     assert [(call["method"], call["url"]) for call in session.requests] == [
         ("GET", f"{API_ROOT}/files/upload_url"),
-        ("POST", secure_upload_url),
+        ("POST", expected_post_url),
     ]
+    assert session.requests[1]["headers"]["x-apikey"] == "secret"
 
 
 @pytest.mark.parametrize(
@@ -150,6 +168,9 @@ def test_large_file_uses_single_use_upload_url(tmp_path):
     (
         "http://evil.example/_ah/upload/token",
         "https://virustotal.example/_ah/upload/token",
+        "https://other.virustotal.com/_ah/upload/token",
+        "https://bigfiles.virustotal.com.example.net/_ah/upload/token",
+        "https://bigfiles.virustotal.com@example.net/_ah/upload/token",
         "https://attacker@www.virustotal.com/_ah/upload/token",
         "https://www.virustotal.com:444/_ah/upload/token",
         "https://www.virustotal.com/_ah/upload/token#fragment",
@@ -159,13 +180,13 @@ def test_large_file_rejects_unsafe_upload_url(tmp_path, upload_url):
     executable = tmp_path / "release.exe"
     with executable.open("wb") as target:
         target.truncate(DIRECT_UPLOAD_LIMIT + 1)
-    client = VirusTotalClient(
-        "secret",
-        session=FakeSession([FakeResponse(200, {"data": upload_url})]),
-    )
+    session = FakeSession([FakeResponse(200, {"data": upload_url})])
+    client = VirusTotalClient("secret", session=session)
 
-    with pytest.raises(VirusTotalError, match="unsafe"):
+    with pytest.raises(VirusTotalError, match="unsafe") as raised:
         client.submit_file(executable, deadline=float("inf"))
+    assert "_ah/upload" not in str(raised.value)
+    assert [call["method"] for call in session.requests] == ["GET"]
 
 
 def test_polling_waits_30_seconds_and_retries_rate_limit():

@@ -26,6 +26,10 @@ DEFAULT_POLL_INTERVAL_SECONDS = 30.0
 DEFAULT_SCAN_TIMEOUT_SECONDS = 15 * 60.0
 DEFAULT_RETRY_DELAY_SECONDS = 30.0
 MAX_TRANSIENT_ATTEMPTS = 3
+# The API documents large-file upload URLs on www.virustotal.com, but live
+# responses (observed November 2026) use a dedicated upload host. The API key
+# travels with the upload, so only these VirusTotal hosts are accepted.
+UPLOAD_HOSTS = frozenset({"www.virustotal.com", "bigfiles.virustotal.com"})
 REPORT_START = "<!-- virustotal-report:start -->"
 REPORT_END = "<!-- virustotal-report:end -->"
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -138,11 +142,15 @@ def _validate_upload_url(raw_url: object) -> str:
         or parsed.username is not None
         or parsed.password is not None
         or port not in (None, 443)
-        or hostname != "www.virustotal.com"
+        or hostname not in UPLOAD_HOSTS
         or parsed.fragment
     ):
-        raise VirusTotalError("VirusTotal returned an unsafe large-file upload URL")
-    return urlunsplit(("https", "www.virustotal.com", parsed.path, parsed.query, ""))
+        # Name only the origin: the path and query carry the one-time upload token.
+        origin = f"{parsed.scheme}://{hostname}" + (f":{port}" if port is not None else "")
+        raise VirusTotalError(
+            f"VirusTotal returned an unsafe large-file upload URL on {origin}"
+        )
+    return urlunsplit(("https", hostname, parsed.path, parsed.query, ""))
 
 
 class VirusTotalClient:
