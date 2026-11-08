@@ -24,7 +24,7 @@ def test_current_version_has_a_dated_top_level_changelog_section():
     )
 
     assert headings
-    assert headings[0] == (__version__, "2026-07-12")
+    assert headings[0] == (__version__, "2026-11-08")
 
 
 def test_windows_build_metadata_matches_app_version_and_is_wired_everywhere():

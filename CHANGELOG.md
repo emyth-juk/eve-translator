@@ -5,35 +5,13 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Added
-- Right-click a chat line for actions on that line: copy the translation or original, improve that translation, and set the speaker's role.
-- Reading older lines no longer jumps to the bottom when new lines arrive; a "new messages" pill jumps back to the latest line.
-- Click the display-mode chip in the overlay header to cycle Mirror, Bilingual, and Combat.
-- **Lock overlays** in the overlay menu. Locked overlays hide the scroll bar and always follow the newest line.
-- Empty-state hints explain what Combat and Bilingual modes will show.
-- A README screenshot gallery, regenerated from the app's own windows by `scripts/render_screenshots.py`.
-
-### Changed
-- Redesigned overlay: a rounded translucent glass panel, a painted status header (health light, session name, context, mode chip, lock state), Segoe UI and Bahnschrift typography, a slim scroll bar, dark rounded menus and tooltips, and a subtle resize grip.
-- Chat lines use a compact minute time column (full time on hover) with wrapped text hanging under the speaker, speaker role badges and accents, and a language-tagged original line that is omitted when it matches the translation.
-- Command cards are drawn as two-line cards with a category-coloured accent: FC-verified cards are vivid, unverified cards are muted.
-- Refined default text colours (soft cyan translations, amber highlights). Untouched original defaults (`#00ffff`, `yellow`) migrate once; custom colours are kept.
-- Rebuilding an overlay (mode switches, showing it again, style changes) is about 2.5 times faster, and status updates are faster; new lines cost no more than before.
-
-### Fixed
-- Command cards were rendered without their card styling.
-- Context menus are released after use instead of accumulating on the overlay.
-- Speaker roles changed in another overlay now refresh badges and Combat filtering immediately.
-
-## [1.4] - 2026-07-12
+## [1.4] - 2026-11-08
 
 ### Added
 - Tagged Windows releases now submit the exact packaged executable to VirusTotal and include its SHA-256, completed aggregate findings, and live report link in the GitHub release notes.
-- Combat, Bilingual, and Mirror overlay modes with a compact status header.
-- Explicit FC, Scout, and Starred speaker roles plus deterministic source-text command cards.
-- True Windows click-through interaction lock with a system-tray action and global `Ctrl+Shift+L` shortcut.
+- Combat, Bilingual, and Mirror overlay modes with a compact status header; click the header's display-mode chip to cycle them.
+- Explicit FC, Scout, and Starred speaker roles plus deterministic source-text command cards, drawn as two-line cards with a category-coloured accent: FC-verified cards are vivid, unverified cards are muted.
+- True Windows click-through interaction lock with a system-tray action, a **Lock overlays** entry in the overlay menu, and global `Ctrl+Shift+L` shortcut. Locked overlays hide the scroll bar and always follow the newest line.
 - Language-pair glossary selection, exact local correction memory, and safe importable doctrine packs.
 - A generated multilingual EVE entity index sourced from NoirSoldats' converted CCP SDE SQLite release.
 - ID-linked SDE locale mappings that distinguish official type names from fleet shorthand and player nicknames.
@@ -50,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - A third Any Chat overlay for one selected Corp, Alliance, intel, or custom channel, with stable per-character selection and relog recovery.
 - Global shortcuts can be changed in Settings and take effect on Save; a shortcut Windows refuses is marked in the tray menu.
 - Compose remembers the last outbound language, defaults to the fleet's recent language, accepts language names, and adds Cancel and Copy & close.
+- Right-click a chat line for actions on that line: copy the translation or original, improve that translation, and set the speaker's role.
+- Reading older lines no longer jumps to the bottom when new lines arrive; a "new messages" pill jumps back to the latest line.
+- Empty-state hints explain what Combat and Bilingual modes will show.
+- A README screenshot gallery, regenerated from the app's own windows by `scripts/render_screenshots.py`.
 
 ### Changed
 - Release automation now isolates build, VirusTotal scan, and publication permissions; scan failures stop publication, while malicious or suspicious classifications create a draft release for maintainer review.
@@ -79,6 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Combat mode no longer sends lines it hides to the cloud provider.
 - The opacity setting now applies to the overlay background only; text stays fully opaque, and secondary text scales with the font size.
 - Translation updates redraw a single message instead of the whole overlay, and resizing works on every edge with native Windows borders.
+- Redesigned overlay: a rounded translucent glass panel, a painted status header (health light, session name, context, mode chip, lock state), Segoe UI and Bahnschrift typography, a slim scroll bar, dark rounded menus and tooltips, and a subtle resize grip.
+- Chat lines use a compact minute time column (full time on hover) with wrapped text hanging under the speaker, speaker role badges and accents, and a language-tagged original line that is omitted when it matches the translation.
+- Refined default text colours (soft cyan translations, amber highlights). Untouched original defaults (`#00ffff`, `yellow`) migrate once; custom colours are kept.
+- Rebuilding an overlay (mode switches, showing it again, style changes) is about 2.5 times faster, and status updates are faster; new lines cost no more than before.
 - Chat-log discovery shares one header cache sized to the folder (about 4x faster on large Chatlogs folders), checks for shutdown inside long scans, and pauses while every session is off.
 - Settings now scrolls and fits small screens, saves only the values changed in the dialog, and opens once (a second request raises it).
 - The default log poll interval is 0.5 s.
@@ -131,6 +117,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The tray tooltip fits the Windows 127-character limit, and a persistent discovery error is announced once.
 - A second copy no longer starts when the first runs as administrator.
 - A chat line written while a session starts is no longer lost.
+- Context menus are released after use instead of accumulating on the overlay.
 
 ### Known limitations
 - VirusTotal findings are a point-in-time aggregation of independent engines, not a safety guarantee; the linked live report can change after publication.
