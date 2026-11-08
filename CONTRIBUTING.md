@@ -27,11 +27,11 @@ The most common way to contribute is by adding or correcting EVE terms in the gl
 
 ## Development Setup
 
-Development is supported and CI-tested on 64-bit Windows with Python 3.10,
-3.11, and 3.12. Release builds use Python 3.10.
+Development is supported and CI-tested on 64-bit Windows with Python 3.11
+through 3.15. Release builds use Python 3.15.
 
 1. Clone the repository.
-2. Create a virtual environment: `py -3.10 -m venv .venv`.
+2. Create a virtual environment: `py -3.15 -m venv .venv`.
 3. Install the development dependencies: `.venv\Scripts\python -m pip install -r requirements-dev.txt`.
 4. Run the app: `.venv\Scripts\python -m src.main`.
 5. Run the tests: `.venv\Scripts\python -m pytest`.

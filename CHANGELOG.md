@@ -49,7 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Release builds now pin runtime and top-level build/test dependencies, validate tag/version consistency, run Ruff and the full test suite before packaging, and embed Windows version metadata.
 - Windows releases now publish one `windows_x64` ZIP that keeps the executable, project and third-party notices, checksums, component manifest, and exact license texts together.
 - Packaging now includes only the Qt plugins the Windows Widgets app needs, excluding unused PDF, SVG, network, image-codec, alternate-platform, and GPL-only Qt Virtual Keyboard components.
-- Runtime and build dependencies were refreshed to patched versions, including Qt/PySide 6.11.1 and Requests 2.34.2, while CI actions are pinned to reviewed commits.
+- Release builds use Python 3.15, and runtime and build dependencies were refreshed, including Qt/PySide 6.12.0 (now `PySide6-Essentials` only, without the unused Addons, WebEngine and Pdf wheels), PyInstaller 6.22.3, DeepL SDK 1.33.0 and certifi 2026.10.23, while CI actions are pinned to reviewed commits. CI tests Python 3.11 through 3.15.
 - Google translation now uses a small internal, time-bounded mobile-web adapter instead of the historically compromised `deep-translator` package.
 - Local-system detection now scans only newly appended log bytes and keeps a bounded cache instead of rereading entire Local logs.
 - A DeepL request now gives up after one retry (about 21 s instead of up to 90 s); repeated failures pause the provider for 30 s (5 min for quota or key errors) and the reason is shown once in the overlay header instead of on every line.

@@ -11,7 +11,13 @@ if not defined VERSION (
 
 echo Building EVE Fleet Chat Translator v%VERSION%...
 
-python -m pip install --upgrade pip==26.1.2 || exit /b 1
+rem Release builds embed Python 3.15; run this from a Python 3.15 environment.
+python -c "import sys; sys.exit(0 if sys.version_info[:2] == (3, 15) else 1)" || (
+    echo Release builds use Python 3.15. Activate a Python 3.15 virtual environment first.
+    exit /b 1
+)
+
+python -m pip install --upgrade pip==26.3 || exit /b 1
 python -m pip install -r requirements-build.txt || exit /b 1
 python -m PyInstaller --clean --noconfirm --onefile --windowed ^
   --name "EVETranslator_v%VERSION%" ^

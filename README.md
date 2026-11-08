@@ -122,7 +122,7 @@ Speaker roles are exact, local mappings. The app never infers authority from a n
 - Logs for support: `%USERPROFILE%\.eve_translator\logs\translator.log`.
 
 ## For Developers (optional)
-- Supported development interpreters: Python 3.10, 3.11, and 3.12 on Windows; release builds use Python 3.10.
+- Supported development interpreters: Python 3.11 through 3.15 on Windows; release builds use Python 3.15.
 - Runtime install: `python -m pip install -r requirements.txt`
 - Development install: `python -m pip install -r requirements-dev.txt`
 - Run: `python -m src.main`

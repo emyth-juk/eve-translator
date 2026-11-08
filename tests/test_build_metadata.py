@@ -40,7 +40,7 @@ def test_windows_build_metadata_matches_app_version_and_is_wired_everywhere():
     assert '--version-file="packaging\\windows_version_info.txt"' in release_workflow
     assert '--additional-hooks-dir "packaging\\hooks"' in build_script
     assert '--additional-hooks-dir="packaging\\hooks"' in release_workflow
-    assert "python -m pip install --upgrade pip==26.1.2" in build_script
+    assert "python -m pip install --upgrade pip==26.3" in build_script
     for excluded in (
         "PySide6.QtNetwork",
         "setuptools",
@@ -69,7 +69,7 @@ def test_release_validates_tag_and_runs_quality_checks_before_build():
     assert "-r requirements-build.txt -r requirements-dev.txt" in release_workflow
     assert "python -m ruff check src tests scripts packaging" in release_workflow
     assert "python -m pytest -q" in release_workflow
-    assert "python -m pip install --upgrade pip==26.1.2" in release_workflow
+    assert "python -m pip install --upgrade pip==26.3" in release_workflow
     assert validate_position < checks_position < build_position
 
 

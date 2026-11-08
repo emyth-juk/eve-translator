@@ -27,7 +27,7 @@ by, sponsored by, or affiliated with CCP hf.
 Qt for Python
 -------------
 
-The executable contains PySide6, Shiboken6, and dynamically loaded Qt 6.11.1
+The executable contains PySide6, Shiboken6, and dynamically loaded Qt 6.12.0
 libraries from the Qt for Python community distribution. These components are
 available under the GNU Lesser General Public License version 3 (LGPLv3), the
 GNU General Public License, or a commercial Qt license. This distribution uses
@@ -42,16 +42,16 @@ Full GPLv3 text: LICENSES/GPL-3.0-only.txt
 Qt licensing: https://doc.qt.io/qt-6/licensing.html
 Qt third-party code and SBOM: https://doc.qt.io/qt-6/licenses-used-in-qt.html
 
-Complete corresponding source for the exact, unmodified PySide6 and Qt 6.11.1
+Complete corresponding source for the exact, unmodified PySide6 and Qt 6.12.0
 library binaries used in this distribution is available on request for at
 least three years after the last distribution of this release. Request it at
-https://github.com/emyth-juk/eve-translator/issues with the title "Qt 6.11.1
+https://github.com/emyth-juk/eve-translator/issues with the title "Qt 6.12.0
 LGPL source request". It will be provided at no charge other than the
 reasonable cost of physical media and delivery, if requested on physical
 media. Upstream source locations are also provided for convenience:
 
-Qt sources: https://download.qt.io/archive/qt/6.11/6.11.1/submodules/
-PySide sources: https://code.qt.io/cgit/pyside/pyside-setup.git/tag/?h=v6.11.1
+Qt sources: https://download.qt.io/archive/qt/6.12/6.12.0/submodules/
+PySide sources: https://code.qt.io/cgit/pyside/pyside-setup.git/tag/?h=v6.12.0
 
 The Corresponding Application Code is the EVE Translator source for the same
 release tag, including its requirements and Windows build scripts, at

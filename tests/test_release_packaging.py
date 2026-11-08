@@ -16,10 +16,11 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_release_dependency_tree_is_exact_and_excludes_retired_scraper():
     pins = load_release_requirements(ROOT)
 
-    assert pins["pyside6"] == "6.11.1"
+    assert pins["pyside6-essentials"] == "6.12.0"
+    assert "pyside6" not in pins  # meta package pulls in unused WebEngine
     assert pins["requests"] == "2.34.2"
-    assert pins["pyinstaller"] == "6.21.0"
-    assert pins["certifi"] == "2026.6.17"
+    assert pins["pyinstaller"] == "6.22.3"
+    assert pins["certifi"] == "2026.10.23"
     assert "deep-translator" not in pins
     assert "beautifulsoup4" not in pins
 
@@ -82,7 +83,7 @@ def test_windows_release_zip_keeps_binary_and_notices_together(tmp_path):
         package_licenses.mkdir(parents=True)
         (package_licenses / "LICENSE.txt").write_text("example", encoding="utf-8")
         return {
-            "python": {"name": "Python", "version": "3.10.0"},
+            "python": {"name": "Python", "version": "3.15.2"},
             "packages": [{"name": "example", "version": "1.0"}],
         }
 
