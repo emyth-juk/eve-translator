@@ -1,5 +1,12 @@
 # EVE Translator
 
+[![Latest release](https://img.shields.io/github/v/release/emyth-juk/eve-translator?label=latest%20release)](https://github.com/emyth-juk/eve-translator/releases/latest)
+[![Download for Windows x64](https://img.shields.io/badge/download-Windows%20x64-2ea44f)](https://github.com/emyth-juk/eve-translator/releases/latest)
+[![Total downloads](https://img.shields.io/github/downloads/emyth-juk/eve-translator/total)](https://github.com/emyth-juk/eve-translator/releases)
+[![VirusTotal: scanned on release](https://img.shields.io/badge/VirusTotal-scanned%20on%20release-394EFF)](https://github.com/emyth-juk/eve-translator/releases/latest)
+[![Tests](https://img.shields.io/github/actions/workflow/status/emyth-juk/eve-translator/run_tests.yml?branch=main&label=tests)](https://github.com/emyth-juk/eve-translator/actions/workflows/run_tests.yml)
+[![License: MIT](https://img.shields.io/github/license/emyth-juk/eve-translator)](LICENSE)
+
 Real-time overlay translator for EVE Online Fleet, Local, and other logged chat channels. Built for everyday EVE pilots with guided log and translation-provider setup.
 
 <p align="center">
@@ -63,7 +70,7 @@ The screenshots are rendered from the app's own windows with fictional sample ch
 6. Keep the key private; it’s tied to your account and monthly quota.
 
 ## Quick Start (Players)
-1. Download: grab the latest `EVETranslator_vX.Y_windows_x64.zip` from the GitHub [Releases Page](https://github.com/emyth-juk/eve-translator/releases).
+1. Download: grab `EVETranslator_vX.Y_windows_x64.zip` from the [latest release](https://github.com/emyth-juk/eve-translator/releases/latest).
 2. Extract the ZIP, then run `EVETranslator_vX.Y.exe` from the extracted folder. Keep the accompanying notices and license files with it.
    The current Windows builds are unsigned, so Microsoft Defender SmartScreen may show an unrecognized-app warning.
    Tagged release notes include the executable's SHA-256 and an automated VirusTotal report. Treat the findings as a point-in-time multi-engine summary, not a guarantee of safety, and use `SHA256SUMS.txt` in the ZIP to verify the downloaded executable.
