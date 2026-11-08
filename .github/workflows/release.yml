@@ -45,6 +45,11 @@ jobs:
       run: |
         import os
         import subprocess
+        import sys
+
+        # GitHub runs `shell: python` bodies from a temporary file, so the
+        # workspace is the working directory but is not on the import path.
+        sys.path.insert(0, os.getcwd())
         from src.version import __version__
 
         actual_tag = os.environ["RELEASE_TAG"]
