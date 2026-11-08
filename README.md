@@ -21,6 +21,32 @@ Real-time overlay translator for EVE Online Fleet, Local, and other logged chat 
 - Always-on-top windows you can drag, resize, and right-click for quick actions.
 - Readiness states show whether Fleet, Local, and Any Chat are off, waiting for a log, active, or in error.
 
+## Screenshots
+
+<p align="center">
+  <img src="docs/screenshots/overlay_sessions.png" width="860" alt="Fleet, Local and Any Chat overlays, each with its own accent colour">
+</p>
+
+| Mirror: every chat line, translations with their original | Combat: FC-verified command cards and starred speakers |
+| :---: | :---: |
+| <img src="docs/screenshots/overlay_mirror.png" width="420" alt="Fleet overlay in Mirror mode with translated, pending and failed lines, speaker roles and command cards"> | <img src="docs/screenshots/overlay_combat.png" width="420" alt="Fleet overlay in Combat mode showing only verified command cards and starred speakers"> |
+| **Right-click a line** for actions on that line | **Header states**: live, waiting, provider outage, error, locked |
+| <img src="docs/screenshots/overlay_context_menu.png" width="420" alt="Context menu for a translated line with copy, improve and speaker-role actions"> | <img src="docs/screenshots/overlay_header_states.png" width="420" alt="Overlay headers for the live, waiting, provider unavailable, error and locked states"> |
+| **Reading back**: new lines wait behind a pill | **Compose** an outbound translation to copy into EVE |
+| <img src="docs/screenshots/overlay_new_messages.png" width="420" alt="Overlay scrolled up with a 3 new messages pill"> | <img src="docs/screenshots/compose.png" width="420" alt="Compose window translating an English fleet message into Chinese"> |
+
+<details>
+<summary>Settings</summary>
+
+<p align="center">
+  <img src="docs/screenshots/settings_general.png" width="290" alt="Settings, General tab">
+  <img src="docs/screenshots/settings_overlay.png" width="290" alt="Settings, Fleet Overlay tab">
+  <img src="docs/screenshots/settings_intelligence.png" width="290" alt="Settings, Translation Intelligence tab">
+</p>
+</details>
+
+The screenshots are rendered from the app's own windows with fictional sample chat over a generated backdrop; regenerate them with `python scripts/render_screenshots.py` after interface changes.
+
 ## Requirements
 - Windows PC running EVE Online.
 - Choose a provider in Settings. DeepL requires a Free or Pro API key; Google does not require a key.

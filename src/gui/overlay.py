@@ -1467,7 +1467,7 @@ class OverlayWindow(QMainWindow):
             "QToolTip { background-color: #151a23; color: #e4e9f0; "
             "border: 1px solid rgba(255, 255, 255, 40); border-radius: 5px; "
             f"padding: 5px 8px; font-family: \"{family}\"; font-size: {point_size}pt; }}"
-            "QMenu { background-color: rgba(17, 21, 29, 248); color: #e2e7ee; "
+            "QMenu { background-color: #11151d; color: #e2e7ee; "
             "border: 1px solid rgba(255, 255, 255, 36); border-radius: 9px; padding: 5px; "
             f"font-family: \"{family}\"; font-size: {point_size}pt; }}"
             "QMenu::item { background: transparent; padding: 5px 28px 5px 26px; "

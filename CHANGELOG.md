@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Click the display-mode chip in the overlay header to cycle Mirror, Bilingual, and Combat.
 - **Lock overlays** in the overlay menu. Locked overlays hide the scroll bar and always follow the newest line.
 - Empty-state hints explain what Combat and Bilingual modes will show.
+- A README screenshot gallery, regenerated from the app's own windows by `scripts/render_screenshots.py`.
 
 ### Changed
 - Redesigned overlay: a rounded translucent glass panel, a painted status header (health light, session name, context, mode chip, lock state), Segoe UI and Bahnschrift typography, a slim scroll bar, dark rounded menus and tooltips, and a subtle resize grip.
